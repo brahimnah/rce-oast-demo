@@ -4,7 +4,7 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "1776188862"
+    ai.sap.com/version: "1776189055"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
