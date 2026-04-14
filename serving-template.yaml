@@ -1,13 +1,13 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: rce-probe
+  name: rce-probe-1776189428
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "1776189055"
+    ai.sap.com/version: "1776189428"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/name: "rce-probe"
+    executables.ai.sap.com/name: "rce-probe-1776189428"
     executables.ai.sap.com/description: "rce-poc"
 spec:
   template:
