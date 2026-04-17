@@ -4,7 +4,7 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.17.0"
+    ai.sap.com/version: "4.18.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/description: "sa-token-diag-altpath-mountinfo"
