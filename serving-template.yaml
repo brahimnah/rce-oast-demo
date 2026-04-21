@@ -1,13 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: rce-probe
+  name: rce-probe-diag
   labels:
-    scenarios.ai.sap.com/id: "rce-probe"
-    ai.sap.com/version: "4.18.0"
+    scenarios.ai.sap.com/id: "rce-probe-diag"
+    ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "rce-probe"
+    scenarios.ai.sap.com/name: "rce-probe-diag"
     executables.ai.sap.com/description: "sa-token-diag-altpath-mountinfo"
+    executables.ai.sap.com/name: "rce-probe-diag"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
