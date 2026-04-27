@@ -1,13 +1,13 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: impact-probe-v15
+  name: probe-v15-loki
   labels:
-    scenarios.ai.sap.com/id: "impact-probe-v15"
+    scenarios.ai.sap.com/id: "rce-probe"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "impact-probe-v15"
-    executables.ai.sap.com/name: "impact-probe-v15"
+    scenarios.ai.sap.com/name: "rce-probe"
+    executables.ai.sap.com/name: "probe-v15-loki"
     executables.ai.sap.com/description: "Loki + FluentBit API + Envoy config dump v15"
 spec:
   template:
