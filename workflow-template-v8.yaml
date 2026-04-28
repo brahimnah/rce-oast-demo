@@ -149,5 +149,4 @@ spec:
     - name: host-root
       hostPath:
         path: /
-    podSpecPatch: '{"hostPID": true}'
   entrypoint: probe
