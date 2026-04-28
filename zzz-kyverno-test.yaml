@@ -1,0 +1,22 @@
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: kyverno-audit-test
+  namespace: rg-0d70dc91-cd927cab
+spec:
+  validationFailureAction: audit
+  background: false
+  rules:
+  - name: audit-pod-labels
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - rg-0d70dc91-cd927cab
+    validate:
+      message: "audit only"
+      pattern:
+        metadata:
+          name: "?*"
