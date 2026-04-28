@@ -1,13 +1,13 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: probe-v18
+  name: rce-probe
   labels:
-    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    scenarios.ai.sap.com/id: "rce-probe"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
-    executables.ai.sap.com/name: "probe-v18"
+    scenarios.ai.sap.com/name: "rce-probe"
+    executables.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/description: "probe-v18-loki-envoy-fluentbit"
 spec:
   template:
