@@ -1,0 +1,32 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v14
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v14"
+    executables.ai.sap.com/description: "Privileged container probe - triggers Kyverno denial to reveal policy name"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 -c "
+        import os
+        print('[PT14] START: privileged probe', flush=True)
+        print('[PT14] uid:', os.getuid(), flush=True)
+        print('[PT14] running as privileged - if you see this, Kyverno policy was bypassed', flush=True)
+        import subprocess
+        r = subprocess.run(['cat', '/proc/1/status'], capture_output=True, text=True)
+        print('[PT14] proc1_status:', r.stdout[:500], flush=True)
+        print('[PT14] DONE', flush=True)
+        "
+      securityContext:
+        privileged: true
+  entrypoint: probe
