@@ -1,14 +1,14 @@
 apiVersion: ai.sap.com/v1alpha1
 kind: ServingTemplate
 metadata:
-  name: rce-probe
+  name: probe-v18
   labels:
-    scenarios.ai.sap.com/id: "rce-probe"
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "probe-v16-loki-envoy-fluentbit"
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-v18"
+    executables.ai.sap.com/description: "probe-v18-loki-envoy-fluentbit"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -32,7 +32,7 @@ spec:
             import urllib.request, urllib.error
 
             def report(k, v):
-                print(f"[P16] {k}: {str(v)[:8000]}", flush=True)
+                print(f"[P18] {k}: {str(v)[:8000]}", flush=True)
 
             def http_get(url, headers=None, timeout=10):
                 try:
