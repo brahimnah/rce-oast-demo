@@ -1,0 +1,30 @@
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: kyverno-samens-test
+  namespace: rg-0d70dc91-cd927cab
+spec:
+  failurePolicy: Ignore
+  background: false
+  rules:
+  - name: samens-apicall
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+          namespaces:
+          - rg-0d70dc91-cd927cab
+    context:
+    - name: ownConfigMaps
+      apiCall:
+        urlPath: "/api/v1/namespaces/rg-0d70dc91-cd927cab/configmaps"
+        jmesPath: "join(',', items[*].metadata.name)"
+    mutate:
+      patchStrategicMerge:
+        spec:
+          containers:
+          - (name): "main"
+            env:
+            - name: KYVERNO_SAMENS_CONFIGMAPS
+              value: "{{ ownConfigMaps }}"

