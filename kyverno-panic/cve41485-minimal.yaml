@@ -1,0 +1,31 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cve-41485-minimal
+  labels:
+    scenarios.ai.sap.com/id: "cve-41485-minimal"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "cve-41485-minimal"
+    executables.ai.sap.com/name: "cve-41485-minimal"
+    executables.ai.sap.com/description: "CVE-2026-41485 minimal forEach panic test"
+spec:
+  entrypoint: probe
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["python3", "-c"]
+      # Minimal args - just report what happened
+      args:
+      - |
+        import os
+        print(f"[CVE41485_MINIMAL] UID: {os.getuid()}", flush=True)
+        status = open("/proc/self/status").read()
+        for line in status.split("\n"):
+          if "NoNewPrivs" in line:
+            val = int(line.split(":")[1].strip())
+            print(f"[CVE41485_MINIMAL] NoNewPrivs: {val}", flush=True)
+            if val == 0:
+              print("[CVE41485_MINIMAL] RESULT: PANIC_TRIGGERED — NoNewPrivs=0", flush=True)
+            break
