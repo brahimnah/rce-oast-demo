@@ -1,0 +1,23 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: cve41485-canary-cluster
+  annotations:
+    description: "Audit-only no-op ClusterPolicy canary - tests if tenant can sync cluster-scoped Kyverno resources"
+spec:
+  validationFailureAction: Audit
+  background: false
+  rules:
+  - name: noop-never-matches
+    match:
+      any:
+      - resources:
+          kinds:
+          - ConfigMap
+          names:
+          - nonexistent-cve41485-canary-cluster-target-zzzzzzzzzzz
+    validate:
+      message: "noop"
+      pattern:
+        metadata:
+          name: "*"
