@@ -4,7 +4,7 @@ metadata:
   name: cve31431-nnpbypass
   labels:
     scenarios.ai.sap.com/id: "cve31431-exploit"
-    ai.sap.com/version: "1.1.0"
+    ai.sap.com/version: "1.2.0"
   annotations:
     scenarios.ai.sap.com/name: "cve31431-exploit"
     executables.ai.sap.com/name: "cve31431-nnpbypass"
@@ -21,14 +21,11 @@ spec:
       predictor:
         minReplicas: 1
         maxReplicas: 1
-        hostPID: true
         containers:
         - name: kserve-container
           image: python:3.11
           securityContext:
             allowPrivilegeEscalation: true
-            runAsNonRoot: false
-            runAsUser: 0
           command: ["/bin/sh", "-c"]
           args:
           - |
