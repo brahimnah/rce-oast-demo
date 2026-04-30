@@ -1,0 +1,26 @@
+apiVersion: kyverno.io/v1
+kind: Policy
+metadata:
+  name: cve41485-canary
+  labels:
+    scenarios.ai.sap.com/id: "cve41485-canary-test"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    description: "Audit-only no-op canary to test if tenant can sync kyverno.io/v1 Policy resources via ArgoCD. No mutation, no deny, no forEach."
+spec:
+  validationFailureAction: Audit
+  background: false
+  rules:
+  - name: noop-never-matches
+    match:
+      any:
+      - resources:
+          kinds:
+          - ConfigMap
+          names:
+          - nonexistent-cve41485-canary-target-zzzzzzzzzzzzz
+    validate:
+      message: "noop canary - this rule should never fire"
+      pattern:
+        metadata:
+          name: "*"
