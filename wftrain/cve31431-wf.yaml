@@ -4,12 +4,13 @@ metadata:
   name: cve31431-wf
   labels:
     scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
-    ai.sap.com/version: "1.1.0"
+    ai.sap.com/version: "1.2.0"
   annotations:
     scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
     executables.ai.sap.com/name: "cve31431-wf"
     executables.ai.sap.com/description: "CVE-2026-31431 training job LPE probe (rootsecdev method)"
 spec:
+  entrypoint: exploit
   templates:
   - name: exploit
     container:
