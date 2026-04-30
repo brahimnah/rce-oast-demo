@@ -1,0 +1,35 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cve-41485-panic-v2
+  labels:
+    scenarios.ai.sap.com/id: "kyverno-panic-v2"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "kyverno-panic-v2"
+    executables.ai.sap.com/name: "cve-41485-panic-v2"
+spec:
+  entrypoint: test
+  templates:
+  - name: test
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 << 'PYEOF'
+        import os, json
+        def r(k, v): print(f"[KYVERNO_PANIC_V2] {k}: {str(v)[:2000]}", flush=True)
+        r("UID", f"uid={os.getuid()}")
+        status = open("/proc/self/status").read()
+        nnp = [l for l in status.split("\n") if "NoNewPrivs" in l]
+        r("NoNewPrivs", nnp[0].split(":")[1].strip() if nnp else "unknown")
+        PYEOF
+      # Try with only partial securityContext to trigger forEach on missing fields
+      securityContext:
+        runAsUser: 65534
+      livenessProbe:
+        httpGet:
+          path: /
+          port: 8080
+        initialDelaySeconds: 60

