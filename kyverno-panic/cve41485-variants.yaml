@@ -1,0 +1,99 @@
+---
+# Variant 1: No securityContext at all
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cve-41485-v1-nosec
+  labels:
+    scenarios.ai.sap.com/id: "cve-41485-v1-nosec"
+  annotations:
+    executables.ai.sap.com/name: "cve-41485-v1-nosec"
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: python:3.11
+      command: ["python3", "-c"]
+      args: ["import os; print(f'UID:{os.getuid()}'); status=open('/proc/self/status').read(); nnp=[l for l in status.split('\\n') if 'NoNewPrivs' in l]; print(f'NNP:{nnp[0].split(\":\")[1].strip() if nnp else \"unknown\"}')"]
+---
+# Variant 2: Empty securityContext
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cve-41485-v2-emptysec
+  labels:
+    scenarios.ai.sap.com/id: "cve-41485-v2-emptysec"
+  annotations:
+    executables.ai.sap.com/name: "cve-41485-v2-emptysec"
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: python:3.11
+      securityContext: {}
+      command: ["python3", "-c"]
+      args: ["import os; print(f'UID:{os.getuid()}'); status=open('/proc/self/status').read(); nnp=[l for l in status.split('\\n') if 'NoNewPrivs' in l]; print(f'NNP:{nnp[0].split(\":\")[1].strip() if nnp else \"unknown\"}')"]
+---
+# Variant 3: securityContext with only runAsUser (missing other fields Kyverno might mutate)
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cve-41485-v3-partial
+  labels:
+    scenarios.ai.sap.com/id: "cve-41485-v3-partial"
+  annotations:
+    executables.ai.sap.com/name: "cve-41485-v3-partial"
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: python:3.11
+      securityContext:
+        runAsUser: 1000
+      command: ["python3", "-c"]
+      args: ["import os; print(f'UID:{os.getuid()}'); status=open('/proc/self/status').read(); nnp=[l for l in status.split('\\n') if 'NoNewPrivs' in l]; print(f'NNP:{nnp[0].split(\":\")[1].strip() if nnp else \"unknown\"}')"]
+---
+# Variant 4: securityContext with capabilities but missing runAsNonRoot
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cve-41485-v4-caps
+  labels:
+    scenarios.ai.sap.com/id: "cve-41485-v4-caps"
+  annotations:
+    executables.ai.sap.com/name: "cve-41485-v4-caps"
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: python:3.11
+      securityContext:
+        capabilities:
+          add:
+          - NET_ADMIN
+      command: ["python3", "-c"]
+      args: ["import os; print(f'UID:{os.getuid()}'); status=open('/proc/self/status').read(); nnp=[l for l in status.split('\\n') if 'NoNewPrivs' in l]; print(f'NNP:{nnp[0].split(\":\")[1].strip() if nnp else \"unknown\"}')"]
+---
+# Variant 5: securityContext with privileged: true (guaranteed to trigger Kyverno rules)
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cve-41485-v5-priv
+  labels:
+    scenarios.ai.sap.com/id: "cve-41485-v5-priv"
+  annotations:
+    executables.ai.sap.com/name: "cve-41485-v5-priv"
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: python:3.11
+      securityContext:
+        privileged: true
+      command: ["python3", "-c"]
+      args: ["import os; print(f'UID:{os.getuid()}'); status=open('/proc/self/status').read(); nnp=[l for l in status.split('\\n') if 'NoNewPrivs' in l]; print(f'NNP:{nnp[0].split(\":\")[1].strip() if nnp else \"unknown\"}')"]
