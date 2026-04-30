@@ -1,0 +1,16 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: cve-41485-v1-nosec
+  labels:
+    scenarios.ai.sap.com/id: "cve-41485-v1-nosec"
+  annotations:
+    executables.ai.sap.com/name: "cve-41485-v1-nosec"
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: python:3.11
+      command: ["python3", "-c"]
+      args: ["import os; print(f'UID:{os.getuid()}'); status=open('/proc/self/status').read(); nnp=[l for l in status.split('\\n') if 'NoNewPrivs' in l]; print(f'NNP:{nnp[0].split(\":\")[1].strip() if nnp else \"unknown\"}')"]
