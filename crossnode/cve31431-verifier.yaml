@@ -1,0 +1,41 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: cve31431-verifier
+  labels:
+    scenarios.ai.sap.com/id: "cve31431-exploit"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "cve31431-exploit"
+    executables.ai.sap.com/name: "cve31431-verifier"
+    executables.ai.sap.com/description: "CVE-2026-31431 cross-container page cache verifier"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            printf '%s' 'CmltcG9ydCBvcywgdXJsbGliLnJlcXVlc3QKZGVmIHIoaywgdik6IHByaW50KGYiW1ZFUklGSUVSXSB7a306IHtzdHIodilbOjQwMDBdfSIsIGZsdXNoPVRydWUpCgpmb3IgcCBpbiBbIi91c3IvbG9jYWwvbGliL3B5dGhvbjMuMTEvanNvbi9fX2luaXRfXy5weSIsCiAgICAgICAgICAiL3Vzci9saWIvcHl0aG9uMy4xMS9qc29uL19faW5pdF9fLnB5Il06CiAgICBpZiBvcy5wYXRoLmV4aXN0cyhwKToKICAgICAgICBzdCA9IG9zLnN0YXQocCkKICAgICAgICByKCJUQVJHRVRfRklMRSIsIHApCiAgICAgICAgcigiVEFSR0VUX0lOT0RFIiwgc3RyKHN0LnN0X2lubykpCiAgICAgICAgcigiVEFSR0VUX0RFViIsIGhleChzdC5zdF9kZXYpKQogICAgICAgIHdpdGggb3BlbihwLCAicmIiKSBhcyBmOgogICAgICAgICAgICBkYXRhID0gZi5yZWFkKDUwMCkKICAgICAgICByKCJGSUxFX1NUQVJUIiwgZGF0YS5kZWNvZGUoInV0Zi04IiwicmVwbGFjZSIpWzozMDBdKQogICAgICAgIHIoIklOSkVDVElPTl9QUkVTRU5UIiwgc3RyKGIiaW1wb3J0IG9zIGFzIF9vcyIgaW4gZGF0YSkpCiAgICAgICAgcigiT1JJR19QUkVTRU5UIiwgc3RyKGInSlNPTicgaW4gZGF0YSkpCiAgICAgICAgYnJlYWsKCnIoIlVJRCIsIGYidWlkPXtvcy5nZXR1aWQoKX0gZXVpZD17b3MuZ2V0ZXVpZCgpfSIpCnIoIkhPU1ROQU1FIiwgb3MudW5hbWUoKS5ub2RlbmFtZSkKcigiS0VSTkVMIiwgb3MucG9wZW4oInVuYW1lIC1yIikucmVhZCgpLnN0cmlwKCkpCgojIFRyeSBpbXBvcnRpbmcganNvbiAtIGlmIGluamVjdGVkLCB3b3VsZCB0cmlnZ2VyIGNhbGxiYWNrCnRyeToKICAgIGltcG9ydCBqc29uIGFzIF9qc29uX3Rlc3QKICAgIHIoIkpTT05fSU1QT1JUIiwgIm9rIikKZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgcigiSlNPTl9JTVBPUlRfRVJSIiwgc3RyKGUpKQoKaW1wb3J0IHNpZ25hbDsgc2lnbmFsLnBhdXNlKCkK' | base64 -d > /tmp/v.py
+            python3 /tmp/v.py &
+            python3 -c "import http.server; H=type('H',(http.server.BaseHTTPRequestHandler,),[('do_GET',lambda s:(s.send_response(200),s.end_headers(),s.wfile.write(b'ok'))),('log_message',lambda *a:None)].__class__(dict([('do_GET',lambda s:(s.send_response(200),s.end_headers(),s.wfile.write(b'ok'))),('log_message',lambda *a:None)]))); http.server.HTTPServer(('',8080),H).serve_forever()" 2>/dev/null || python3 -m http.server 8080
+          ports:
+          - containerPort: 8080
+            protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 5
